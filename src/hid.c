@@ -1,5 +1,18 @@
 // hid.c
  
+// How much mouse movement is passed on, see mouse_parse(). Eight turns an
+// 800cpi mouse into the ~100cpi an original ST mouse delivered, which is both
+// the right feel and the rate the ikbd link can actually carry.
+#define MOUSE_SCALE 8
+
+#ifdef ESP_PLATFORM
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#else
+#include <FreeRTOS.h>
+#include <task.h>
+#endif
+
 #include "hid.h"
 #include "debug.h"
 #include "sysctrl.h"
@@ -327,12 +340,66 @@ void mouse_parse(const hid_report_t *report, __attribute__((unused)) struct hid_
        report->joystick_mouse.button[i].bitmask)
       btns |= (1<<i);
 
+  // collect_bits() sign extends within 16 bits but returns uint16_t, so the
+  // sign only survives a cast of that width. What goes to the core has to fit
+  // a signed byte as well: it adds the value to an 8 bit counter, so 200
+  // arrives as -56 and moves the pointer the other way. High resolution mice
+  // reach those magnitudes easily, ordinary ones never do, which is why this
+  // only ever showed up as "fast movement goes backwards".
+  int32_t dx = (int16_t)a[0];
+  int32_t dy = (int16_t)a[1];
+
+  // Scale to what the ikbd link can carry. It clocks out about 979 quadrature
+  // steps per second, and raising that rate makes the emulated 6301 misread
+  // the direction, so the surplus has to go here instead. The remainder is
+  // carried, so slow movement keeps its full resolution rather than moving in
+  // jumps.
+  static int32_t rem_x = 0, rem_y = 0;
+  dx += rem_x; rem_x = dx % MOUSE_SCALE; dx /= MOUSE_SCALE;
+  dy += rem_y; rem_y = dy % MOUSE_SCALE; dy /= MOUSE_SCALE;
+
+  // Meter the result out below the rate the ikbd drains, so a burst cannot
+  // drive the core's 8 bit pending counter past 127 and wrap it. Without this
+  // fast movement stalls on the spot: the counter keeps flipping sign instead
+  // of counting down. What cannot be passed on right away is carried, not
+  // dropped, so the pointer follows through instead of losing the movement.
+  static int32_t acc_x = 0, acc_y = 0, credit = 0;
+  static TickType_t last_tick = 0;
+
+  TickType_t now = xTaskGetTickCount();
+  uint32_t ms = (last_tick == 0) ? 1 : (uint32_t)((now - last_tick) * portTICK_PERIOD_MS);
+  last_tick = now;
+
+  acc_x += dx;
+  acc_y += dy;
+  // Keep the carry short. Anything beyond this is dropped rather than played
+  // back later: a real mouse that is moved faster than its rate simply does
+  // not travel that far, it does not keep coasting afterwards.
+  if(acc_x >  64) acc_x =  64;
+  if(acc_x < -64) acc_x = -64;
+  if(acc_y >  64) acc_y =  64;
+  if(acc_y < -64) acc_y = -64;
+
+  credit += (int32_t)ms * 7;          // 7/8 step per ms, below the core's 979/s
+  if(credit > 8 * 100) credit = 8 * 100;
+  int32_t budget = credit / 8;
+  if(budget > 100) budget = 100;      // and never more than a signed byte holds
+  credit -= budget * 8;
+
+  dx = acc_x; dy = acc_y;
+  if(dx >  budget) dx =  budget;
+  if(dx < -budget) dx = -budget;
+  if(dy >  budget) dy =  budget;
+  if(dy < -budget) dy = -budget;
+  acc_x -= dx;
+  acc_y -= dy;
+
   mcu_hw_spi_begin();
   mcu_hw_spi_tx_u08(SPI_TARGET_HID);
   mcu_hw_spi_tx_u08(SPI_HID_MOUSE);
   mcu_hw_spi_tx_u08(btns);
-  mcu_hw_spi_tx_u08(a[0]);
-  mcu_hw_spi_tx_u08(a[1]);
+  mcu_hw_spi_tx_u08((uint8_t)dx);
+  mcu_hw_spi_tx_u08((uint8_t)dy);
   if(report->joystick_mouse.axis[2].size)
     mcu_hw_spi_tx_u08(a[2]);
   mcu_hw_spi_end();

@@ -201,7 +201,20 @@ static void mcu_hw_jtag_init(void);
 #include <queue.h>
 #include <hardware/bl616.h>
 
-#define MAX_REPORT_SIZE   8
+// Long enough for report protocol devices, not just boot protocol ones. A
+// mouse with 16 bit axes reports nine bytes including its report id, and the
+// URB below is filled with the length the device asks for, so a smaller
+// buffer is written past its end.
+#define MAX_REPORT_SIZE   64
+
+// How long to wait for a report, which is not the same thing as how often the
+// device offers one. Passing the endpoint's bInterval here made the wait as
+// short as the polling period: a 1000Hz mouse reports bInterval=1, so every
+// transfer timed out after a millisecond and no report ever arrived, while an
+// ordinary 125Hz mouse got eight times as long and worked. The wait only has
+// to keep an idle device from spinning; a transfer completes as soon as data
+// arrives.
+#define HID_URB_TIMEOUT_MS 1000
 #define XBOX_REPORT_SIZE 20
 
 #define STATE_NONE      0 
@@ -309,7 +322,10 @@ static struct usb_config {
 
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t hid_buffer[CONFIG_USBHOST_MAX_HID_CLASS][MAX_REPORT_SIZE];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t xbox_buffer[CONFIG_USBHOST_MAX_XBOX_CLASS][XBOX_REPORT_SIZE];
-USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t report_desc[CONFIG_USBHOST_MAX_HID_CLASS][128];
+// Must match the length passed to usbh_hid_get_report_descriptor() below,
+// which asked for 1024 bytes into a 128 byte buffer.
+#define MAX_REPORT_DESC_SIZE 512
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t report_desc[CONFIG_USBHOST_MAX_HID_CLASS][MAX_REPORT_DESC_SIZE];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t dummy_report[20];
 
 uint8_t byteScaleAnalog(int16_t xbox_val)
@@ -481,7 +497,7 @@ static void usbh_hid_client_thread(void *argument) {
                     hid->class->hport,
                     hid->class->intin,
                     hid->buffer, len,
-                    hid_interval_ms,
+                    HID_URB_TIMEOUT_MS,
                     usbh_hid_callback, hid);
 
   if (hid->class->hport->device_desc.idVendor == 0x2dc8 && hid->class->hport->device_desc.idProduct == 0x3105) {
@@ -515,7 +531,7 @@ static void usbh_hid_client_thread(void *argument) {
                       hid->class->hport,
                       hid->class->intin,
                       hid->buffer, len,
-                      hid_interval_ms,
+                      HID_URB_TIMEOUT_MS,
                       usbh_hid_callback, hid);
 
     int ret = usbh_submit_urb(&hid->class->intin_urb);
@@ -815,7 +831,7 @@ void usbh_hid_run(struct usbh_hid *hid_class)
     usb_debugf("NEW HID %d", i);
     memset(&usb->hid_info[i].report, 0, sizeof(usb->hid_info[i].report));
 
-    int rep_desc = usbh_hid_get_report_descriptor(hid_class, report_desc[i], 1024);
+    int rep_desc = usbh_hid_get_report_descriptor(hid_class, report_desc[i], MAX_REPORT_DESC_SIZE);
     if (rep_desc < 0)
     {
       usb_debugf("usbh_hid_get_report_descriptor issue");
