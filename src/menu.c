@@ -509,16 +509,6 @@ static char *menuentry_get_label(config_menu_entry_t *entry) {
   return NULL;
 }
 
-static int menu_get_list_length(config_menu_entry_t *entry) {
-  int len = 0;
-  config_listentry_t *le = entry->list->listentries;
-  while(le) {
-    len++;
-    le = le->next;
-  }
-  return len;
-}
-  
 static char *menu_get_listentry(config_menu_entry_t *entry, int value) {
   if(!entry || entry->type != CONFIG_MENU_ENTRY_LIST) return NULL;
 
@@ -1029,9 +1019,15 @@ static void menu_select(void) {
 
   case CONFIG_MENU_ENTRY_LIST: {
     // user has choosen a selection list
-    int value = menu_variable_get(entry->list->id) + 1;
-    int list_length = menu_get_list_length(entry);
-    if(value >= list_length) value = 0;    
+    // Step to the next list entry rather than counting the value up. Both are
+    // the same as long as a list numbers its entries from zero, which every
+    // list did so far, but the label lookup already matches on the value. A
+    // list whose values mean something -- a resolution, a divisor -- would
+    // otherwise walk through numbers that have no entry and show a blank.
+    int value = menu_variable_get(entry->list->id);
+    config_listentry_t *le = entry->list->listentries;
+    while(le && le->value != value) le = le->next;
+    value = (le && le->next) ? le->next->value : entry->list->listentries->value;
     menu_variable_set(entry->list->id, value);
 
     // check if there's an action connected to changing this
