@@ -354,9 +354,15 @@ void mouse_parse(const hid_report_t *report, __attribute__((unused)) struct hid_
   // the direction, so the surplus has to go here instead. The remainder is
   // carried, so slow movement keeps its full resolution rather than moving in
   // jumps.
+  // Variable 'X' from the ini file overrides the default, so the scale can be
+  // matched to the mouse without rebuilding anything: 4 for a 400cpi mouse,
+  // 8 for 800, 16 for 1600. Values outside a sensible range are ignored.
+  int scale = menu_variable_get('X');
+  if(scale < 1 || scale > 64) scale = MOUSE_SCALE;
+
   static int32_t rem_x = 0, rem_y = 0;
-  dx += rem_x; rem_x = dx % MOUSE_SCALE; dx /= MOUSE_SCALE;
-  dy += rem_y; rem_y = dy % MOUSE_SCALE; dy /= MOUSE_SCALE;
+  dx += rem_x; rem_x = dx % scale; dx /= scale;
+  dy += rem_y; rem_y = dy % scale; dy /= scale;
 
   // Meter the result out below the rate the ikbd drains, so a burst cannot
   // drive the core's 8 bit pending counter past 127 and wrap it. Without this

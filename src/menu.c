@@ -115,7 +115,9 @@ menu_variable_t *menu_get_variables(void) {
   return variables;
 }
 
-static int menu_variable_get(char id) {
+// Also used outside the menu, e.g. by the mouse code to pick up a scale set
+// in the ini file, so this is not static anymore.
+int menu_variable_get(char id) {
   menu_variable_t *v = variables;
 
   while(v) {

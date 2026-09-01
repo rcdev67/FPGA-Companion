@@ -44,6 +44,7 @@ extern TaskHandle_t menu_handle;
 
 void menu_init(void);
 menu_variable_t *menu_get_variables(void);
+int menu_variable_get(char id);   // -1 if the variable is not set
 void menu_set_value(unsigned char id, int8_t value);
 void menu_do(int);
 void menu_notify(unsigned long msg);
