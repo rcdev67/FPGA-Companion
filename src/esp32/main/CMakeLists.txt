@@ -11,6 +11,7 @@ idf_component_register(SRCS
 	"../../inifile.c"
 	"../../config.c"
         "../../at_wifi.c"
+        "../../net.c"
 	"../../xml.c"
 	"../mcu_hw.c"
 	"../../puff.c"

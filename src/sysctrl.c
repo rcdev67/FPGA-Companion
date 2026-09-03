@@ -18,6 +18,7 @@
 #include "config.h"
 #include "mcu_hw.h"
 #include "at_wifi.h"
+#include "net.h"
 
 // we are using "puff" to decompress a gzip'd FPGA config as this is a slow, yet
 // very small and memory efficient implementation of the deflate de-compression
@@ -212,6 +213,24 @@ static uint8_t sys_port_rx_available(unsigned char port) {
   return rx_available;
 }
   
+// read up to max bytes from a port in one transaction. The core pops a
+// byte for every 1 sent after the port index and returns each popped byte
+// with the following transfer, so n bytes take n+1 transfers.
+int sys_port_read(unsigned char port, unsigned char *buf, int max) {
+  int avail = sys_port_rx_available(port);
+  if(avail <= 0) return 0;
+  if(avail > max) avail = max;
+
+  sys_port_begin(SPI_SYS_PORT_GET);
+  mcu_hw_spi_tx_u08(port);
+  mcu_hw_spi_tx_u08(1);              // pop the first byte, reply is the port type
+  for(int i=0;i<avail;i++)
+    buf[i] = mcu_hw_spi_tx_u08((i < avail-1) ? 1 : 0);
+  mcu_hw_spi_end();
+
+  return avail;
+}
+
 // read status and byte from port out
 static int16_t sys_port_get(unsigned char port) {
   uint8_t rx_avail = sys_port_rx_available(port);
@@ -244,6 +263,9 @@ static void sys_reboot(__attribute__((unused)) TimerHandle_t arg) {
 }
 #endif
 
+// a few counters for the OSD, to see what the core reports
+struct sys_stats_S sys_stats;
+
 static void sys_handle_event(bool ignore_coldboot) {
   // the FPGAs cold boot flag was set indicating that the
   // FPGA has be reloaded while the MCU was running. Reset
@@ -256,12 +278,28 @@ static void sys_handle_event(bool ignore_coldboot) {
   unsigned char irq_src = mcu_hw_spi_tx_u08(0);
   mcu_hw_spi_end();
 
+  sys_stats.events++;
+  sys_stats.last_src = irq_src;
+
   if(irq_src & 2) {
     // read port 0 data for wifi emulation
     int16_t byte = sys_port_get(0);
     while(byte >= 0) {
       at_wifi_port_byte(byte);
       byte = sys_port_get(0);
+    }
+  }
+
+  if(irq_src & 8) {
+    // port 1 carries the companion's own modem, see net.c. Its FIFO in
+    // the core holds 15 bytes, so drain it in as few transfers as possible
+    unsigned char buf[16];
+    sys_stats.net_irqs++;
+    int len = sys_port_read(1, buf, sizeof(buf));
+    while(len > 0) {
+      sys_stats.net_bytes += len;
+      netdl_port_bytes(buf, len);
+      len = sys_port_read(1, buf, sizeof(buf));
     }
   }
   

@@ -16,6 +16,7 @@
 #include "../telnetd.h"
 #include "../xml.h"
 #include "../at_wifi.h"
+#include "../net.h"
 
 /*-----------------------------------------------------------*/
 /*---            main FPGA communication task            ----*/
@@ -96,6 +97,9 @@ static void com_task(__attribute__((unused)) void *p ) {
     
     // finally prepare for wifi communication
     at_wifi_init();
+
+    // and for the companion's own modem on port 1
+    netdl_init();
 
     debugf("Entering main loop");
   

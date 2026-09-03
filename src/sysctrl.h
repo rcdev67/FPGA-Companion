@@ -34,7 +34,17 @@ void sys_run_action(config_action_t *);
 void sys_run_action_by_name(char *);
 const char *sys_get_config_name(void);
 
+// counters shown in the OSD while the network port is being brought up
+struct sys_stats_S {
+  unsigned long events;     // interrupt events handled
+  unsigned long net_irqs;   // of which port 1 had data
+  unsigned long net_bytes;  // bytes read from port 1
+  unsigned char last_src;   // last interrupt source byte
+};
+extern struct sys_stats_S sys_stats;
+
 void sys_port_write(unsigned char, const unsigned char*, int);
+int  sys_port_read(unsigned char, unsigned char*, int);
 bool sys_port_get_status(unsigned char);
 
 #define SYS_TIME_FLAGS_NTP   (1<<0)

@@ -30,6 +30,7 @@
 #include "inifile.h"
 #include "menu.h"
 #include "sysctrl.h"
+#include "net.h"
 #include "debug.h"
 #include "mcu_hw.h"
 
@@ -72,8 +73,12 @@ typedef struct config_custom_S {
   int (*length)(void); 
   
   // Pointer to function that draws the custom contents
-  void (*draw)(void); 
-  
+  void (*draw)(void);
+
+  // Pointer to function called when an entry (1..length) is selected.
+  // May be NULL for dialogs that only display something
+  void (*select)(int);
+
 } config_custom_t;
 
 /* new menu state */
@@ -1004,6 +1009,14 @@ static void menu_select(void) {
     menu_fileselector_select(dir_entry(menu_state->dir, menu_state->selected-1));
     return;
   }
+
+  // in a custom dialog: the dialog decides what selecting means. The
+  // config entry lookup below must not run here, custom dialogs have none
+  if(menu_state->type == MENU_TYPE_CUSTOM) {
+    if(menu_state->custom->select)
+      menu_state->custom->select(menu_state->selected);
+    return;
+  }
   
   menu_debugf("Selected: %s '%s'", config_menuentry_get_type_str(entry), menuentry_get_label(entry));
 
@@ -1205,6 +1218,8 @@ static void menu_handle_latin1(uint8_t code) {
   else          menu_debugf("menu_handle_latin1(%d)", code);
 }
 
+static void net_dialog_update(void);
+
 static void menu_task(__attribute__((unused)) void *parms) {
   menu_debugf("task running");
 
@@ -1244,6 +1259,9 @@ static void menu_task(__attribute__((unused)) void *parms) {
     } else
 #endif
 
+    if(cmd == MENU_EVENT_NET_UPDATE) {
+      net_dialog_update();
+    } else
     if(cmd == MENU_EVENT_NETWORK_GOT_IP) {
       char message[32];
       snprintf(message, sizeof(message), "IP: %s", network_ipaddr);
@@ -1565,11 +1583,141 @@ static const config_menu_entry_t system_menu_usb_core_fsel = {
 #endif
 };
 
+/* ---- the download dialog: files from a web server onto the SD card ----
+   The companion reaches the server through the modem on the core's port 1,
+   see net.c. The dialog shows the server's file list and, while a file is
+   loading, a progress bar. */
+
+static const config_custom_t net_dialog;
+
+static int net_dialog_length(void) {
+  // the file list, or the single entry that loads it
+  int n = netdl_entry_count();
+  return n ? n : 1;
+}
+
+static void net_dialog_draw(void) {
+  int width = u8g2_GetDisplayWidth(&u8g2);
+  int st = netdl_state();
+
+  if(st == NET_STATE_BUSY) {
+    // message, byte count and a bar
+    char str[32];
+    uint32_t total = netdl_bytes_total(), done = netdl_bytes_done();
+    u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 1*MENU_ENTRY_H, netdl_message());
+    if(total) snprintf(str, sizeof(str), "%lu / %lu KB", (unsigned long)(done/1024), (unsigned long)(total/1024));
+    else      snprintf(str, sizeof(str), "%lu KB", (unsigned long)(done/1024));
+    u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H, str);
+    int y = MENU_LINE_Y + 2*MENU_ENTRY_H + 4;
+    u8g2_DrawFrame(&u8g2, 2, y, width-4, 8);
+    if(total) u8g2_DrawBox(&u8g2, 3, y+1, (int)(((uint64_t)(width-6) * done) / total), 6);
+    return;
+  }
+
+  int n = netdl_entry_count();
+  if(!n) {
+    // no list yet: the entry that fetches it, and what happened last time
+    int y = MENU_LINE_Y + 1*MENU_ENTRY_H;
+    u8g2_DrawStr(&u8g2, 2, y, "Load file list");
+    if(menu_state->selected == 1)
+      u8g2_DrawButtonFrame(&u8g2, 0, y, U8G2_BTN_INV, width, 1, 1);
+    if(st == NET_STATE_IDLE)
+      u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H,
+		   netdl_get_server()[0] ? netdl_get_server() : "no server= in ini");
+    else
+      u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H, netdl_message());
+
+    // the last characters exchanged with the modem, two rows, and the
+    // number of bytes the core delivered from port 1 so far
+    {
+      const char *t = netdl_tail();
+      int len = strlen(t);
+      char row[25];
+      const char *a = (len > 48) ? t + len - 48 : t;
+      int alen = strlen(a);
+      if(alen > 24) {
+        snprintf(row, sizeof(row), "%.24s", a);
+        u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
+        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
+        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, a + 24);
+      } else {
+        u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
+        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, a);
+      }
+      snprintf(row, sizeof(row), "b%lu", sys_stats.net_bytes);
+      u8g2_DrawStr(&u8g2, 100, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
+      u8g2_SetFont(&u8g2, font_helvR08_te);
+    }
+    return;
+  }
+
+  // the list, four lines, scrolled like a menu
+  for(int i=0;i<4 && i+menu_state->scroll < n;i++) {
+    int y = MENU_LINE_Y + (i+1)*MENU_ENTRY_H;
+    u8g2_DrawStr(&u8g2, 2, y, netdl_entry_name(i + menu_state->scroll));
+    if(i + menu_state->scroll == menu_state->selected - 1)
+      u8g2_DrawButtonFrame(&u8g2, 0, y, U8G2_BTN_INV, width, 1, 1);
+  }
+}
+
+static void net_dialog_select(int selected) {
+  if(netdl_state() == NET_STATE_BUSY) return;
+  if(!netdl_entry_count()) netdl_request_list();
+  else                   netdl_request_download(selected - 1);
+}
+
+static const config_custom_t net_dialog = {
+  .label = "Download",
+  .length = net_dialog_length,
+  .draw = net_dialog_draw,
+  .select = net_dialog_select
+};
+
+static void net_dialog_func(void) {
+  menu_push();
+  menu_state->type = MENU_TYPE_CUSTOM;
+  menu_state->custom = &net_dialog;
+  menu_state->selected = 1;
+  menu_state->scroll = 0;
+}
+
+static const config_action_command_t net_exec = {
+  .code = CONFIG_ACTION_COMMAND_EXEC,
+  .exec = net_dialog_func
+};
+
+static const config_action_t net_action = {
+  .name = "download",
+  .commands = (config_action_command_t*)&net_exec
+};
+
+static const config_button_t net_btn = {
+  .label = "Download...",
+  .action = (config_action_t*)&net_action
+};
+
+// redraw the download dialog if it is on screen
+static void net_dialog_update(void) {
+  int st = netdl_state();
+  if(st == NET_STATE_DONE || st == NET_STATE_ERROR)
+    menu_draw_dialog_for("Download", (char*)netdl_message(), pdMS_TO_TICKS(3000));
+  else if(osd_is_visible() && !menu_dialog_is_open() && menu_state &&
+	  menu_state->type == MENU_TYPE_CUSTOM && menu_state->custom == &net_dialog)
+    menu_do(MENU_EVENT_NONE);
+}
+
+// second entry in main system menu
+static const config_menu_entry_t system_menu_net = {
+  .type = CONFIG_MENU_ENTRY_BUTTON,
+  .button = (config_button_t*)&net_btn,
+  .next = (config_menu_entry_t*)&system_menu_usb_core_fsel
+};
+
 // first entry in main system menu
 static const config_menu_entry_t system_menu_about = {
   .type = CONFIG_MENU_ENTRY_BUTTON,
   .button = (config_button_t*)&about_btn,
-  .next = (config_menu_entry_t*)&system_menu_usb_core_fsel
+  .next = (config_menu_entry_t*)&system_menu_net
 };
 
 // the main system menu

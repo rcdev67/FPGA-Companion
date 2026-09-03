@@ -44,6 +44,7 @@ target_sources(app PRIVATE
     $ENV{BL_SDK_BASE}/components/net/lwip/lwip/src/apps/sntp/sntp.c
     ../ftpd.c
     ../telnetd.c
+    ../net.c
     ../hidparser.c
    	../hid.c
    	../inifile.c

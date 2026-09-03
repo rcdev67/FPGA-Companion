@@ -80,6 +80,7 @@ add_executable(${PROJECT}
 	../menu.c
 	../inifile.c
 	../at_wifi.c
+	../net.c
 	../puff.c
 	../fatfs/source/ff.c
 	../fatfs/source/ffunicode.c

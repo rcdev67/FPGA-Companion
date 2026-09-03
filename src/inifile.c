@@ -10,6 +10,7 @@
 #include "sdc.h"      // for CARD_MOUNTPOINT
 #include "menu.h"     // to access menu variables
 #include "config.h"
+#include "net.h"      // the download server line
 #include "debug.h"
 
 static int iswhite(char c) {
@@ -126,6 +127,16 @@ int inifile_read(char *name) {
 	}
       }
 
+      // the web server the companion loads files from, see net.c
+      if(strncasecmp(buffer, "server=", 7) == 0) {
+	char *p = buffer+7;
+	while(*p && iswhite(*p)) p++;
+	char *e = p;
+	while(*e && !iswhite(*e)) e++;
+	*e = '\0';
+	netdl_set_server(p);
+      }
+
       // check for firmware options
       if(strncasecmp(buffer, "option ", 7) == 0) {
 	// skip "option"
@@ -206,6 +217,14 @@ void inifile_write(char *name) {
       f_puts(str, &file);
     }
     
+    // the download server, kept if one was set
+    if(netdl_get_server()[0]) {
+      f_puts("\n; web server for the companion's downloads (host:port)\n", &file);
+      f_puts("server=", &file);
+      f_puts(netdl_get_server(), &file);
+      f_puts("\n", &file);
+    }
+
     // write disk and ROM image file names
     f_puts("\n; image files\n", &file);
 
