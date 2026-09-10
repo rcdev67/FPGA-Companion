@@ -295,6 +295,45 @@ static bool net_server_parse(char *host, int max, int *port) {
   return host[0] != '\0';
 }
 
+// --------------------------------------------------------- bit rate ----
+// The modem talks 19200 for the ST. For a file it is worth switching to
+// 115200 for the duration: Zimodem changes its rate the moment it sees
+// ATB and already answers at the new one, so the core's port follows
+// right behind the command. Whatever happens, the request loop puts
+// 19200 back at the end.
+static bool fast = false;
+
+static bool net_baud_fast(void) {
+  if(modem != MODEM_ZIMODEM) return false;
+  net_flush();
+  net_puts("ATB115200\r");
+  vTaskDelay(pdMS_TO_TICKS(80));         // the command must leave the port at 19200
+  sys_set_val('N', 3);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  net_flush();
+  fast = true;
+  if(modem_cmd("AT", NULL, 1500)) return true;
+  // no answer at 115200: go back and stay slow
+  sys_set_val('N', 0);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  net_flush();
+  fast = false;
+  modem_cmd("AT", NULL, 1500);
+  return false;
+}
+
+static void net_baud_slow(void) {
+  if(!fast) return;
+  net_flush();
+  net_puts("ATB19200\r");
+  vTaskDelay(pdMS_TO_TICKS(40));
+  sys_set_val('N', 0);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  net_flush();
+  fast = false;
+  modem_cmd("AT", NULL, 1500);
+}
+
 // ------------------------------------------------------------ XMODEM ----
 // Zimodem fetches the resource itself ("ATGxmodem:<url>") and hands it
 // over in 128 or 1024 byte blocks, each with a CRC and an acknowledge.
@@ -434,7 +473,10 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
   if(!modem_detect()) return false;
 
   // Zimodem has the block wise way, no raw stream needed
-  if(modem == MODEM_ZIMODEM) return xmodem_get(host, port, path, sink);
+  if(modem == MODEM_ZIMODEM) {
+    net_baud_fast();                     // best effort, the transfer works at 19200 too
+    return xmodem_get(host, port, path, sink);
+  }
 
   net_set_message("Connecting...");
   if(!modem_connect(host, port)) {
@@ -700,6 +742,9 @@ static void net_task(__attribute__((unused)) void *parms) {
 
       if(req == REQ_LIST) fetch_list();
       else                download(req);
+
+      // the ST expects its modem at 19200 again
+      net_baud_slow();
 
       int e = menu_variable_get('E');
       sys_set_val('E', (e < 0) ? 0 : e);
