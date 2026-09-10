@@ -94,20 +94,52 @@ static int sdc_read_sector_once(unsigned long sector, unsigned char *buffer) {
     return -1;
   }
 
-  sdc_spi_begin();  
+  // Ask for the sector and let go of the bus. The core reads the card on
+  // its own and reports in status byte 6 bit 2 when the data is in its
+  // buffer. Waiting inside the command would hold the SPI bus for as
+  // long as the card takes, and the serial ports cannot afford that.
+  sdc_spi_begin();
+  mcu_hw_spi_tx_u08(SPI_SDC_MCU_READ);
+  mcu_hw_spi_tx_u08((sector >> 24) & 0xff);
+  mcu_hw_spi_tx_u08((sector >> 16) & 0xff);
+  mcu_hw_spi_tx_u08((sector >> 8) & 0xff);
+  mcu_hw_spi_tx_u08(sector & 0xff);
+  mcu_hw_spi_end();
+
+  t0 = xTaskGetTickCount();
+  while(1) {
+    // the core answers one transfer late, so byte 6 comes with the eighth
+    sdc_spi_begin();
+    mcu_hw_spi_tx_u08(SPI_SDC_STATUS);
+    for(int i=0;i<7;i++) mcu_hw_spi_tx_u08(0);
+    unsigned char st = mcu_hw_spi_tx_u08(0);
+    mcu_hw_spi_end();
+    if(st & 0x04) break;                     // data is in the buffer
+
+    if((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(SDC_READY_TIMEOUT_MS)) {
+      sdc_last_error = 2;
+      sdc_debugf("SDC: read timeout on sector %lu", sector);
+      return -1;
+    }
+    vTaskDelay(1);
+  }
+
+  // repeat the command: the core keeps its request while the data waits,
+  // and hands the buffer over after the sector bytes
+  sdc_spi_begin();
   mcu_hw_spi_tx_u08(SPI_SDC_MCU_READ);
   mcu_hw_spi_tx_u08((sector >> 24) & 0xff);
   mcu_hw_spi_tx_u08((sector >> 16) & 0xff);
   mcu_hw_spi_tx_u08((sector >> 8) & 0xff);
   mcu_hw_spi_tx_u08(sector & 0xff);
 
-  // wait for ready, bounded so a stalled fpga can't hang the mcu forever
-  t0 = xTaskGetTickCount();
+  // the core sends 0x00 once it hands the buffer over, 0xff/0x01 before
+  int guard = 16;
   while(mcu_hw_spi_tx_u08(0)) {
-    if((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(SDC_READY_TIMEOUT_MS)) {
+    if(!--guard) {
       mcu_hw_spi_end();
       sdc_last_error = 2;
-      sdc_debugf("SDC: read timeout on sector %lu", sector);
+      sdc_debugf("SDC: read handover failed on sector %lu", sector);
       return -1;
     }
   }

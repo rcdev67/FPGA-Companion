@@ -208,13 +208,13 @@ static bool modem_detect(void) {
   if(ok && wifi_down && modem == MODEM_ZIMODEM) {
     // Zimodem has lost its WiFi and would wait a while before trying
     // again. ATZ reloads its settings and joins right away.
+    // One reset only and then patience: repeated resets interrupt the
+    // join in progress and the link flaps instead of coming up.
     net_set_message("Modem joining WiFi...");
-    for(int attempt = 0; attempt < 3 && wifi_down; attempt++) {
-      net_flush();
-      net_puts("ATZ\r");
-      vTaskDelay(pdMS_TO_TICKS(12000));
-      ok = modem_ati();
-    }
+    net_flush();
+    net_puts("ATZ\r");
+    vTaskDelay(pdMS_TO_TICKS(25000));
+    ok = modem_ati();
     if(wifi_down) { net_set_message("Modem has no WiFi"); return false; }
   }
 
@@ -235,6 +235,7 @@ static bool modem_detect(void) {
   if(!ok) { net_set_message("No modem on port 1"); return false; }
   if(modem == MODEM_UNKNOWN) modem = MODEM_ESPAT;   // OK without a banner
   debugf("NET: modem is %s", (modem == MODEM_ZIMODEM)?"Zimodem":"ESP-AT");
+
   return true;
 }
 
@@ -294,6 +295,133 @@ static bool net_server_parse(char *host, int max, int *port) {
   return host[0] != '\0';
 }
 
+// ------------------------------------------------------------ XMODEM ----
+// Zimodem fetches the resource itself ("ATGxmodem:<url>") and hands it
+// over in 128 or 1024 byte blocks, each with a CRC and an acknowledge.
+// A byte lost on the serial line costs one repeated block, not the file.
+
+#define XM_SOH 0x01
+#define XM_STX 0x02
+#define XM_EOT 0x04
+#define XM_ACK 0x06
+#define XM_NAK 0x15
+#define XM_CAN 0x18
+#define XM_CRC 'C'
+
+static uint16_t crc16_xmodem(const unsigned char *d, int len) {
+  uint16_t crc = 0;
+  for(int i=0;i<len;i++) {
+    crc ^= (uint16_t)d[i] << 8;
+    for(int b=0;b<8;b++) crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+  }
+  return crc;
+}
+
+static void xm_put(unsigned char c) { net_write((const char*)&c, 1); }
+
+// read exactly n bytes into buf, false on timeout
+static bool xm_read(unsigned char *buf, int n, int timeout_ms) {
+  TickType_t start = xTaskGetTickCount();
+  int got = 0;
+  while(got < n) {
+    int left = timeout_ms - (xTaskGetTickCount() - start) * portTICK_PERIOD_MS;
+    if(left <= 0) return false;
+    size_t r = xStreamBufferReceive(rx_stream, buf + got, n - got, pdMS_TO_TICKS(left));
+    got += r;
+  }
+  return true;
+}
+
+static bool xmodem_get(const char *host, int port, const char *path, bool (*sink)(const unsigned char*, int)) {
+  char line[NET_LINE_LEN];
+  static unsigned char blk[1024 + 4];
+
+  // the modem fetches the whole resource first, that takes a while
+  net_set_message("Modem fetching...");
+  snprintf(line, sizeof(line), "AT&G\"xmodem:http://%s:%d/%s\"", host, port, path);   // AT&G is the web get; quoted, unquoted text ends at the first letter
+  net_flush();
+  net_puts(line);
+  net_puts("\r");
+
+  bytes_total = 0;
+  bool announced = false;
+  while(net_read_line(line, sizeof(line), 60000)) {
+    debugf("NET: xmodem '%s'", line);
+    if(!strncmp(line, "XMODEM ", 7)) { bytes_total = strtoul(line + 7, NULL, 10); announced = true; break; }
+    if(!strcmp(line, "ERROR") || !strncmp(line, "NO CARRIER", 10)) break;
+  }
+  if(!announced) { net_set_message("Modem could not fetch"); return false; }
+
+  snprintf(line, sizeof(line), "Receiving %lu bytes", (unsigned long)bytes_total);
+  net_set_message(line);
+  bytes_done = 0;
+  in_body = true;
+
+  unsigned char expect = 1;
+  int errors = 0;
+  bool ok = false;
+  TickType_t last_report = xTaskGetTickCount();
+
+  // ask for CRC mode until the first block header shows up
+  net_flush();
+  xm_put(XM_CRC);
+  while(1) {
+    unsigned char h;
+    if(!xm_read(&h, 1, 3000)) {
+      if(++errors > 10) { net_set_message("Modem does not send"); break; }
+      xm_put(bytes_done ? XM_NAK : XM_CRC);
+      continue;
+    }
+
+    if(h == XM_EOT) { xm_put(XM_ACK); ok = true; break; }
+    if(h == XM_CAN) { net_set_message("Modem cancelled"); break; }
+    if(h != XM_SOH && h != XM_STX) continue;   // noise between blocks
+
+    int size = (h == XM_SOH) ? 128 : 1024;
+    if(!xm_read(blk, size + 4, 3000)) {        // number, ~number, data, crc
+      if(++errors > 10) { net_set_message("Block timed out"); break; }
+      net_flush();
+      xm_put(XM_NAK);
+      continue;
+    }
+
+    unsigned char num = blk[0];
+    uint16_t crc = ((uint16_t)blk[size + 2] << 8) | blk[size + 3];
+    if((unsigned char)(blk[1] ^ 0xff) != num || crc16_xmodem(blk + 2, size) != crc) {
+      if(++errors > 10) { net_set_message("Too many bad blocks"); break; }
+      net_flush();
+      xm_put(XM_NAK);
+      continue;
+    }
+
+    if(num == expect) {
+      // the last block is padded, keep only what the file has
+      uint32_t left = bytes_total - bytes_done;
+      int take = (left < (uint32_t)size) ? (int)left : size;
+      if(take > 0 && !sink(blk + 2, take)) break;   // sink set the message
+      bytes_done += take;
+      expect++;
+      errors = 0;
+    }
+    // a repeated block (num == expect-1) is simply acknowledged again
+    xm_put(XM_ACK);
+
+    if((xTaskGetTickCount() - last_report) > pdMS_TO_TICKS(250)) {
+      last_report = xTaskGetTickCount();
+      menu_notify(MENU_EVENT_NET_UPDATE);
+    }
+  }
+  in_body = false;
+
+  // the modem closes with OK, wait for it so the next command is not
+  // swallowed by the transfer's tail
+  while(net_read_line(line, sizeof(line), 3000)) if(!strcmp(line, "OK") || !strcmp(line, "ERROR")) break;
+  net_flush();
+
+  if(ok && bytes_done != bytes_total) { net_set_message("Short transfer"); ok = false; }
+  return ok;
+}
+
 // Fetch /path from the server. Every body byte goes to sink(); a sink
 // returning false aborts. Returns true when the whole body arrived.
 static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) {
@@ -305,12 +433,21 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
 
   if(!modem_detect()) return false;
 
+  // Zimodem has the block wise way, no raw stream needed
+  if(modem == MODEM_ZIMODEM) return xmodem_get(host, port, path, sink);
+
   net_set_message("Connecting...");
   if(!modem_connect(host, port)) {
     net_set_message("Connect failed");
     net_flush();
     return false;
   }
+
+  // Zimodem rearranges its serial side when it enters the stream, and
+  // bytes that arrive during that moment are lost: requests came in as
+  // "GET /DIS_A.ST" or "GET /ind.tt". Give it a moment before talking.
+  vTaskDelay(pdMS_TO_TICKS(400));
+  net_flush();
 
   // the request. HTTP/1.0 and Connection: close keep it simple: no
   // chunked encoding, and the server closes when it is done
