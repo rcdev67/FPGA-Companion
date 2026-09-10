@@ -12,6 +12,10 @@ DEV25K, and Console 60k/138k. A built-in FTP server allows files to be copied
 to the SD card. A Telnet server is also built in, allowing clients to monitor
 debug messages.
 
+This fork adds a way to load files from a PC onto the SD card over WiFi
+on the Tang Nano 20K, using an ESP32-C3 as the network: see
+[DOWNLOAD.md](DOWNLOAD.md).
+
 The FPGA Companion replaces the MiSTeryNano firmware that was
 formerly part of the [MiSTeryNano
 project](https://github.com/MiSTle-Dev/MiSTeryNano). It is also
