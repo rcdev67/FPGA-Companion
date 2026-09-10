@@ -63,6 +63,7 @@ static uint32_t bytes_done = 0, bytes_total = 0;
 static int modem = MODEM_UNKNOWN;
 static bool wifi_down = false;      // the modem reported no WiFi on the last ATI
 static bool in_body = false;        // file data is streaming, keep it out of the tail
+static bool fast = false;           // the port and the modem run at 115200 for a transfer
 
 // ------------------------------------------------------------ plumbing ----
 
@@ -232,6 +233,25 @@ static bool modem_detect(void) {
     ok = modem_ati();
   }
 
+  if(!ok) {
+    // still nothing: the modem may have been left at 115200 when a
+    // request was cut short (a reset from the OSD, for instance). Look
+    // for it there and bring it back to 19200.
+    debugf("NET: no answer at 19200, looking at 115200");
+    sys_set_val('N', 3);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    net_flush();
+    if(modem_cmd("AT", NULL, 1500)) {
+      net_puts("ATB19200\r");
+      vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    sys_set_val('N', 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    net_flush();
+    fast = false;
+    ok = modem_ati();
+  }
+
   if(!ok) { net_set_message("No modem on port 1"); return false; }
   if(modem == MODEM_UNKNOWN) modem = MODEM_ESPAT;   // OK without a banner
   debugf("NET: modem is %s", (modem == MODEM_ZIMODEM)?"Zimodem":"ESP-AT");
@@ -301,7 +321,6 @@ static bool net_server_parse(char *host, int max, int *port) {
 // ATB and already answers at the new one, so the core's port follows
 // right behind the command. Whatever happens, the request loop puts
 // 19200 back at the end.
-static bool fast = false;
 
 static bool net_baud_fast(void) {
   if(modem != MODEM_ZIMODEM) return false;
