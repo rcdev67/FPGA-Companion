@@ -136,6 +136,19 @@ static bool net_read_line(char *line, int max, int timeout_ms) {
   }
 }
 
+// keep a record on the card: the OSD message is gone once the dialog is
+// closed, this stays until it is read on a PC
+static void net_log(const char *line) {
+  FIL f;
+  sdc_lock();
+  if(f_open(&f, CARD_MOUNTPOINT "/NETLOG.TXT", FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
+    f_puts(line, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+  sdc_unlock();
+}
+
 static void net_set_message(const char *msg) {
   strncpy(message, msg, sizeof(message)-1);
   message[sizeof(message)-1] = '\0';
@@ -366,6 +379,11 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
       // silence: with a known length that is a broken transfer,
       // without one it is the end of the file
       complete = (bytes_total == 0);
+      if(!complete) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Stream stalled @%lu of %lu", (unsigned long)bytes_done, (unsigned long)bytes_total);
+        net_set_message(msg);
+      }
       break;
     }
     fill += got;
@@ -410,6 +428,9 @@ static void fetch_list(void) {
 
   if(!http_get(NET_INDEX_FILE, index_sink)) {
     state = NET_STATE_ERROR;
+    char line[80];
+    snprintf(line, sizeof(line), "FAIL list: %s", message);
+    net_log(line);
     menu_notify(MENU_EVENT_NET_UPDATE);
     return;
   }
@@ -437,6 +458,7 @@ static void fetch_list(void) {
     snprintf(message, sizeof(message), "%d files", name_count);
     state = NET_STATE_LIST;
   }
+  net_log(message);
   menu_notify(MENU_EVENT_NET_UPDATE);
 }
 
@@ -516,6 +538,13 @@ static void download(int index) {
     state = NET_STATE_DONE;
   } else
     state = NET_STATE_ERROR;
+
+  {
+    char line[96];
+    snprintf(line, sizeof(line), "%s %s (%lu/%lu) %s", ok ? "OK  " : "FAIL", name,
+             (unsigned long)bytes_done, (unsigned long)bytes_total, message);
+    net_log(line);
+  }
   menu_notify(MENU_EVENT_NET_UPDATE);
 }
 
@@ -526,8 +555,17 @@ static void net_task(__attribute__((unused)) void *parms) {
   while(1) {
     int req;
     if(xQueueReceive(req_queue, &req, 0xffffffffUL)) {
+      // Port 1 only exists while the core routes the M0S connector to it
+      // ("Serial: Netz"). Switch it on for the request regardless of the
+      // menu, and put the user's setting back afterwards.
+      sys_set_val('E', 2);
+      vTaskDelay(pdMS_TO_TICKS(50));
+
       if(req == REQ_LIST) fetch_list();
       else                download(req);
+
+      int e = menu_variable_get('E');
+      sys_set_val('E', (e < 0) ? 0 : e);
     }
   }
 }

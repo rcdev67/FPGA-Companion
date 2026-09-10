@@ -261,7 +261,12 @@ static SDC_RESULT sdc_ioctl(BYTE cmd, void *buff) {
   case GET_SECTOR_SIZE:
     *((WORD*) buff) = 512;
     return RES_OK;
-    break;
+
+  case CTRL_SYNC:
+    // every sector write above waits for the card, so there is nothing
+    // left to flush. f_sync and f_close ask for this and report a disk
+    // error when it is refused, even though everything has been written
+    return RES_OK;
   }
   
   return RES_ERROR;
