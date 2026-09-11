@@ -57,20 +57,18 @@ stays untouched.
    Python may accept connections: allow it for private networks. The window
    shows every request the Atari makes, which is handy when something does
    not work.
-4. Write a file `index.txt` in that folder with one file name per line:
+4. Put the files into that folder. That is all: the companion reads the
+   folder listing the server shows for `/`. Names may be long and may
+   contain spaces, they arrive on the card as they are. `.ST` disk images
+   are what the OSD's disk selector lists afterwards.
 
-       ARKANOID.ST
-       FLASH2.ST
-       HELLO.TXT
-
-   Names without spaces or brackets, at most 31 characters, `.ST` for disk
-   images so the OSD's disk selector lists them. Keep a copy under a short
-   name if the original is called `Arkanoid (1987)(Imagine)[cr].st`.
+   If you would rather hand out a fixed list, serve a plain text file
+   instead of the listing: one file name per line, `;` starts a comment.
 
 ## Using it
 
 1. Open the companion menu with Shift+F12 and choose `Download...`.
-2. `Load file list` fetches `index.txt` and shows the names.
+2. `Load file list` fetches the folder listing and shows the names.
 3. Pick a file. A bar shows the progress, the end says how many bytes
    arrived. The file lands in the root of the card.
 4. F12, `Disk A:`, pick the new image. Games usually want a cold start:

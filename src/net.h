@@ -13,7 +13,8 @@
 #include <stdbool.h>
 
 #define NET_MAX_ENTRIES   32
-#define NET_NAME_LEN      32
+#define NET_NAME_LEN      48      // the name as shown and as written to the card
+#define NET_HREF_LEN      96      // the name as the server wants it in the URL
 #define NET_SERVER_LEN    64
 
 // states shown by the OSD

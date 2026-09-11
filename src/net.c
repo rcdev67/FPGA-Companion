@@ -57,7 +57,8 @@ static QueueHandle_t req_queue;
 static char server[NET_SERVER_LEN] = "";
 static int state = NET_STATE_IDLE;
 static char message[48] = "";
-static char names[NET_MAX_ENTRIES][NET_NAME_LEN];
+static char names[NET_MAX_ENTRIES][NET_NAME_LEN];   // shown, and the name on the card
+static char hrefs[NET_MAX_ENTRIES][NET_HREF_LEN];   // as the server wants it in the URL
 static int name_count = 0;
 static uint32_t bytes_done = 0, bytes_total = 0;
 static int modem = MODEM_UNKNOWN;
@@ -607,7 +608,9 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
 
 // ------------------------------------------------------------ requests ----
 
-static char index_text[NET_MAX_ENTRIES * NET_NAME_LEN];
+// the server's answer to "/": a directory listing as HTML from python's
+// http.server, or a plain text list if someone serves one instead
+static char index_text[4096];
 static int index_len;
 
 static bool index_sink(const unsigned char *data, int len) {
@@ -618,13 +621,42 @@ static bool index_sink(const unsigned char *data, int len) {
   return true;
 }
 
+// "%20" and friends back into characters, for the name on the card
+static void url_decode(const char *in, char *out, int max) {
+  int o = 0;
+  for(const char *p = in; *p && o < max-1; p++) {
+    if(*p == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+      char hex[3] = { p[1], p[2], 0 };
+      out[o++] = (char)strtol(hex, NULL, 16);
+      p += 2;
+    } else
+      out[o++] = *p;
+  }
+  out[o] = '\0';
+}
+
+static void add_entry(const char *href) {
+  if(name_count >= NET_MAX_ENTRIES) return;
+  int hl = strlen(href);
+  if(hl == 0 || hl >= NET_HREF_LEN) return;
+  if(href[hl-1] == '/') return;                 // a directory
+  if(strchr(href, '/') || strchr(href, '?')) return;   // links elsewhere
+  char name[NET_NAME_LEN];
+  url_decode(href, name, sizeof(name));
+  if(!name[0]) return;
+  strcpy(hrefs[name_count], href);
+  strcpy(names[name_count], name);
+  name_count++;
+}
+
 static void fetch_list(void) {
   state = NET_STATE_BUSY;
   name_count = 0;
   index_len = 0;
   net_set_message("Fetching list...");
 
-  if(!http_get(NET_INDEX_FILE, index_sink)) {
+  // the folder itself; python's http.server answers with a listing
+  if(!http_get("", index_sink)) {
     state = NET_STATE_ERROR;
     char line[80];
     snprintf(line, sizeof(line), "FAIL list: %s", message);
@@ -632,21 +664,32 @@ static void fetch_list(void) {
     menu_notify(MENU_EVENT_NET_UPDATE);
     return;
   }
-
-  // one file name per line, comments and blanks skipped
   index_text[index_len] = '\0';
-  char *p = index_text;
-  while(*p && name_count < NET_MAX_ENTRIES) {
-    char *e = p;
-    while(*e && *e != '\n') e++;
-    char *end = e;
-    if(*e) e++;
-    while(end > p && (end[-1] == '\r' || end[-1] == ' ')) end--;
-    *end = '\0';
-    if(*p && *p != ';' && *p != '#' && strlen(p) < NET_NAME_LEN) {
-      strcpy(names[name_count++], p);
+
+  if(strstr(index_text, "href=")) {
+    // HTML: every <a href="name"> is a file, directories end with a slash
+    char *p = index_text;
+    while((p = strstr(p, "href=\"")) != NULL && name_count < NET_MAX_ENTRIES) {
+      p += 6;
+      char *e = strchr(p, '"');
+      if(!e) break;
+      *e = '\0';
+      add_entry(p);
+      p = e + 1;
     }
-    p = e;
+  } else {
+    // plain text: one file name per line, comments and blanks skipped
+    char *p = index_text;
+    while(*p && name_count < NET_MAX_ENTRIES) {
+      char *e = p;
+      while(*e && *e != '\n') e++;
+      char *end = e;
+      if(*e) e++;
+      while(end > p && (end[-1] == '\r' || end[-1] == ' ')) end--;
+      *end = '\0';
+      if(*p && *p != ';' && *p != '#') add_entry(p);
+      p = e;
+    }
   }
 
   if(!name_count) {
@@ -718,7 +761,7 @@ static void download(int index) {
   }
   dl_open = true;
 
-  bool ok = http_get(name, file_sink);
+  bool ok = http_get(hrefs[index], file_sink);   // the URL form, spaces and all encoded
 
   sdc_lock();
   FRESULT cr = f_close(&dl_file);
