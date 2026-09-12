@@ -13,8 +13,10 @@ to the SD card. A Telnet server is also built in, allowing clients to monitor
 debug messages.
 
 This fork adds a way to load files from a PC onto the SD card over WiFi
-on the Tang Nano 20K, using an ESP32-C3 as the network: see
-[DOWNLOAD.md](DOWNLOAD.md).
+on the Tang Nano 20K, using an ESP32-C3 or ESP32-S3 running Zimodem as
+the network: see [DOWNLOAD.md](DOWNLOAD.md). It needs the matching core
+from the [MiSTeryNano fork](https://github.com/rcdev67/MiSTeryNano),
+branch `nano20k-running`.
 
 The FPGA Companion replaces the MiSTeryNano firmware that was
 formerly part of the [MiSTeryNano
