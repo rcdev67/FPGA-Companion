@@ -231,6 +231,17 @@ int sys_port_read(unsigned char port, unsigned char *buf, int max) {
   return avail;
 }
 
+// both fill levels of a port in one transaction, for diagnostics
+bool sys_port_status(unsigned char port, unsigned char *rx_avail, unsigned char *tx_space) {
+  sys_port_begin(SPI_SYS_PORT_STATUS);
+  uint8_t ports = mcu_hw_spi_tx_u08(port);
+  uint8_t type  = mcu_hw_spi_tx_u08(0);
+  *rx_avail = mcu_hw_spi_tx_u08(0);
+  *tx_space = mcu_hw_spi_tx_u08(0);
+  mcu_hw_spi_end();
+  return ports && type == 0;
+}
+
 // read status and byte from port out
 static int16_t sys_port_get(unsigned char port) {
   uint8_t rx_avail = sys_port_rx_available(port);

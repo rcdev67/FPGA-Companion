@@ -180,6 +180,29 @@ static bool modem_cmd(const char *cmd, const char *expect, int timeout_ms) {
 }
 
 // ask the modem who it is: true on a final OK
+// The receive path from the modem has been seen to go quiet while the
+// modem kept sending, and only a reset of the port FIFOs in the core
+// (Serial switched away from Netz and back) brought it back. Record what
+// the core reports at that moment, then do the switch from here.
+static void net_snapshot(const char *why) {
+  unsigned char rx = 0, tx = 0;
+  bool port = sys_port_status(NET_PORT, &rx, &tx);
+  char line[96];
+  snprintf(line, sizeof(line), "STAT %s: port %d rx %u tx %u irqs %lu bytes %lu events %lu src %02x",
+           why, port, rx, tx, sys_stats.net_irqs, sys_stats.net_bytes, sys_stats.events, sys_stats.last_src);
+  debugf("NET: %s", line);
+  net_log(line);
+}
+
+static void net_port_reset(void) {
+  sys_set_val('E', 1);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  sys_set_val('E', 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  net_flush();
+  net_log("port reset");
+}
+
 static bool modem_ati(void) {
   char line[NET_LINE_LEN];
 
@@ -218,6 +241,14 @@ static bool modem_detect(void) {
     vTaskDelay(pdMS_TO_TICKS(25000));
     ok = modem_ati();
     if(wifi_down) { net_set_message("Modem has no WiFi"); return false; }
+  }
+
+  if(!ok) {
+    // no answer: first suspect the port itself, see net_snapshot()
+    net_snapshot("no answer");
+    net_port_reset();
+    ok = modem_ati();
+    net_snapshot(ok ? "answer after port reset" : "still no answer");
   }
 
   if(!ok) {
@@ -428,6 +459,11 @@ static bool xmodem_get(const char *host, int port, const char *path, bool (*sink
     unsigned char h;
     if(!xm_read(&h, 1, 3000)) {
       if(++errors > 10) { net_set_message("Modem does not send"); break; }
+      if(errors == 2 || errors == 4) {
+        snprintf(line, sizeof(line), "quiet %d at %lu", errors, (unsigned long)bytes_done);
+        net_snapshot(line);
+      }
+      if(errors == 3) net_port_reset();   // the sender retries for a while, give it a clean port
       xm_put(bytes_done ? XM_NAK : XM_CRC);
       continue;
     }

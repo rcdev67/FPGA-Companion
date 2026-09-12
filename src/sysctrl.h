@@ -45,6 +45,7 @@ extern struct sys_stats_S sys_stats;
 
 void sys_port_write(unsigned char, const unsigned char*, int);
 int  sys_port_read(unsigned char, unsigned char*, int);
+bool sys_port_status(unsigned char, unsigned char *rx_avail, unsigned char *tx_space);
 bool sys_port_get_status(unsigned char);
 
 #define SYS_TIME_FLAGS_NTP   (1<<0)
