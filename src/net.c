@@ -386,6 +386,9 @@ static bool net_baud_fast(void) {
 static void net_baud_slow(void) {
   if(!fast) return;
   net_flush();
+  net_puts("\r");                       // the modem lost the first character right after a transfer
+  vTaskDelay(pdMS_TO_TICKS(100));
+  net_flush();
   net_puts("ATB19200\r");
   vTaskDelay(pdMS_TO_TICKS(40));
   sys_set_val('N', 0);
@@ -793,9 +796,13 @@ static void download(int index) {
 
   char path[NET_NAME_LEN + 8];
   snprintf(path, sizeof(path), "%s/%s", CARD_MOUNTPOINT, name);
+  // written under a temporary name and renamed at the end, so a copy
+  // already on the card survives a failed attempt
+  static const char tmp_path[] = CARD_MOUNTPOINT "/NETDL.TMP";
 
   sdc_lock();
-  FRESULT r = f_open(&dl_file, path, FA_CREATE_ALWAYS | FA_WRITE);
+  f_unlink(tmp_path);
+  FRESULT r = f_open(&dl_file, tmp_path, FA_CREATE_ALWAYS | FA_WRITE);
   sdc_unlock();
   if(r != FR_OK) {
     char msg[48];
@@ -816,7 +823,15 @@ static void download(int index) {
     snprintf(message, sizeof(message), "SD close f%d e%d", cr, sdc_get_last_error());
     ok = false;
   }
-  if(!ok) f_unlink(path);      // no half files on the card
+  if(ok) {
+    f_unlink(path);            // replace an older copy
+    FRESULT rr = f_rename(tmp_path, path);
+    if(rr != FR_OK) {
+      snprintf(message, sizeof(message), "SD rename f%d e%d", rr, sdc_get_last_error());
+      ok = false;
+    }
+  }
+  if(!ok) f_unlink(tmp_path);  // no half files on the card
   sdc_unlock();
   dl_open = false;
 
