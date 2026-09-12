@@ -303,8 +303,8 @@ static void sys_handle_event(bool ignore_coldboot) {
 
   if(irq_src & 8) {
     // port 1 carries the companion's own modem, see net.c. Its FIFO in
-    // the core holds 15 bytes, so drain it in as few transfers as possible
-    unsigned char buf[16];
+    // the core holds 255 bytes, drain it in as few transfers as possible
+    unsigned char buf[64];
     sys_stats.net_irqs++;
     int len = sys_port_read(1, buf, sizeof(buf));
     while(len > 0) {

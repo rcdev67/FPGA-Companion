@@ -64,6 +64,13 @@ static uint32_t bytes_done = 0, bytes_total = 0;
 static int modem = MODEM_UNKNOWN;
 static bool wifi_down = false;      // the modem reported no WiFi on the last ATI
 static bool in_body = false;        // file data is streaming, keep it out of the tail
+// The core's network UART: system value N selects 0=19200 1=38400 2=57600
+// 3=115200 4=460800. Transfers run at the fastest one; the port FIFOs in
+// the core hold 255 bytes, enough for the few milliseconds the companion
+// may be busy with the card while a block arrives.
+#define NET_FAST_BAUD   "460800"
+#define NET_FAST_N      4
+
 static bool fast = false;           // the port and the modem run at 115200 for a transfer
 
 // ------------------------------------------------------------ plumbing ----
@@ -266,22 +273,25 @@ static bool modem_detect(void) {
   }
 
   if(!ok) {
-    // still nothing: the modem may have been left at 115200 when a
+    // still nothing: the modem may have been left at a fast rate when a
     // request was cut short (a reset from the OSD, for instance). Look
-    // for it there and bring it back to 19200.
-    debugf("NET: no answer at 19200, looking at 115200");
-    sys_set_val('N', 3);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    net_flush();
-    if(modem_cmd("AT", NULL, 1500)) {
-      net_puts("ATB19200\r");
-      vTaskDelay(pdMS_TO_TICKS(40));
+    // for it at the rates we use and bring it back to 19200.
+    static const int8_t fast_n[] = { NET_FAST_N, 3 };
+    for(unsigned i = 0; i < sizeof(fast_n) && !ok; i++) {
+      debugf("NET: no answer at 19200, looking at N=%d", fast_n[i]);
+      sys_set_val('N', fast_n[i]);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      net_flush();
+      if(modem_cmd("AT", NULL, 1500)) {
+        net_puts("ATB19200\r");
+        vTaskDelay(pdMS_TO_TICKS(40));
+      }
+      sys_set_val('N', 0);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      net_flush();
+      fast = false;
+      ok = modem_ati();
     }
-    sys_set_val('N', 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    net_flush();
-    fast = false;
-    ok = modem_ati();
   }
 
   if(!ok) { net_set_message("No modem on port 1"); return false; }
@@ -357,9 +367,9 @@ static bool net_server_parse(char *host, int max, int *port) {
 static bool net_baud_fast(void) {
   if(modem != MODEM_ZIMODEM) return false;
   net_flush();
-  net_puts("ATB115200\r");
+  net_puts("ATB" NET_FAST_BAUD "\r");
   vTaskDelay(pdMS_TO_TICKS(80));         // the command must leave the port at 19200
-  sys_set_val('N', 3);
+  sys_set_val('N', NET_FAST_N);
   vTaskDelay(pdMS_TO_TICKS(50));
   net_flush();
   fast = true;
