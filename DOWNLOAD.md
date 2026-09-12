@@ -3,7 +3,7 @@
 This fork lets the companion pull files from a web server on your PC
 straight onto the SD card in the Tang Nano 20K, chosen from the OSD. A
 disk image for the Atari ST goes from a folder on the PC to drive A in
-well under a minute, no card swapping.
+about half a minute, no card swapping.
 
 The Tang Nano 20K's onboard BL616 has no antenna, so the network comes
 from an ESP32 on the free M0S connector, an ESP32-C3 SuperMini or an
@@ -103,8 +103,10 @@ a second UART in the FPGA on the M0S pins. It sends
 hands it over straight from the connection in XMODEM blocks, each one
 checked and acknowledged, so a byte lost on the serial line costs a
 repeated block, not the file. Nothing is staged in the modem, so the
-size is not limited by its flash. For the transfer both sides switch to 115200 and
-back to 19200 afterwards, so the ST finds its modem as it left it.
+size is not limited by its flash. For the transfer both sides switch to
+460800 and back to 19200 afterwards, so the ST finds its modem as it
+left it. The core's port FIFOs hold 255 bytes for that, which is why the
+companion and the core from the branches named above belong together.
 
 Every result is appended to `NETLOG.TXT` in the root of the card. If a
 download fails, that line says why. Should the modem ever go quiet, the
