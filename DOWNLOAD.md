@@ -1,4 +1,4 @@
-# Loading files onto the SD card over WiFi (ESP32-C3 SuperMini)
+# Loading files onto the SD card over WiFi (ESP32-C3 or ESP32-S3 as modem)
 
 This fork lets the companion pull files from a web server on your PC
 straight onto the SD card in the Tang Nano 20K, chosen from the OSD. A
@@ -6,9 +6,10 @@ disk image for the Atari ST goes from a folder on the PC to drive A in
 well under a minute, no card swapping.
 
 The Tang Nano 20K's onboard BL616 has no antenna, so the network comes
-from an ESP32-C3 SuperMini on the free M0S connector. It runs Zimodem
-and serves two masters: the ST uses it as a Hayes modem on the serial
-port, and the companion uses it to fetch files. Both are just AT commands.
+from an ESP32 on the free M0S connector, an ESP32-C3 SuperMini or an
+ESP32-S3 DevKitC. It runs Zimodem and serves two masters: the ST uses it
+as a Hayes modem on the serial port, and the companion uses it to fetch
+files. Both are just AT commands.
 
 ## What you need
 
@@ -16,8 +17,9 @@ port, and the companion uses it to fetch files. Both are just AT commands.
   https://github.com/rcdev67/MiSTeryNano, branch `nano20k-running`
   (second serial port on the M0S connector, SD controller fixes)
 - this companion, branch `net-download`, built for `TANG_BOARD=nano20k`
-- an ESP32-C3 SuperMini with Zimodem from
-  https://github.com/rcdev67/Zimodem/releases (release `c3-supermini-v1`)
+- an ESP32-C3 SuperMini or an ESP32-S3 DevKitC-1 with Zimodem from
+  https://github.com/rcdev67/Zimodem (branch `c3-supermini-misterynano`,
+  images on the release page)
 - a PC on the same WiFi with Python 3
 
 ## Wiring
@@ -32,6 +34,19 @@ port, and the companion uses it to fetch files. Both are just AT commands.
 Power the C3 from the Tang only, plug it in or out with the board off,
 and keep the 5V lead short: a thin jumper sags under WiFi bursts. Pin 56
 stays untouched.
+
+| ESP32-S3 DevKitC-1 | Tang Nano 20K |
+|---|---|
+| GPIO16 (TX) | 41 |
+| GPIO15 (RX) | 51 |
+| GND | GND |
+
+The S3 draws more when its radio starts than a jumper from the Tang's 5V
+pin delivers; on that lead it reset at every WiFi join. Power it through
+its "UART" USB socket instead, from the PC or a USB supply, and share
+only ground with the Tang. That socket also shows the modem's debug
+output at 115200 baud. Its bigger antenna gives a steadier link than
+the C3's.
 
 ## One-time setup
 
@@ -84,19 +99,22 @@ the one moment the two masters cannot share it.
 
 The companion talks to the modem over port 1 of the core's port protocol,
 a second UART in the FPGA on the M0S pins. It sends
-`AT&G"xmodem:http://server:port/name"`. Zimodem fetches the resource
-into its own flash and hands it over in XMODEM blocks, each one checked
-and acknowledged, so a byte lost on the serial line costs a repeated
-block, not the file. For the transfer both sides switch to 115200 and
+`AT&G"xmodem:http://server:port/name"`. Zimodem opens the resource and
+hands it over straight from the connection in XMODEM blocks, each one
+checked and acknowledged, so a byte lost on the serial line costs a
+repeated block, not the file. Nothing is staged in the modem, so the
+size is not limited by its flash. For the transfer both sides switch to 115200 and
 back to 19200 afterwards, so the ST finds its modem as it left it.
 
 Every result is appended to `NETLOG.TXT` in the root of the card. If a
-download fails, that line says why.
+download fails, that line says why. Should the modem ever go quiet, the
+companion writes the port's state into the log and resets the port, the
+same as switching `Serial:` away from `Netz` and back by hand.
 
 ## Other hardware
 
 The same companion runs on the M0S Dock and, with its own port, on an
 ESP32-S3. Both have WiFi of their own, so no modem is needed there and
 the maintainer's FTP server is available as well. This document covers
-the Tang Nano 20K with its onboard BL616, where the C3 is the way to get
-a network at all.
+the Tang Nano 20K with its onboard BL616, where an ESP32 modem is the
+way to get a network at all.
