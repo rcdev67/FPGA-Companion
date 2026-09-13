@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="16">
+  <rect width="1000" height="640" fill="#ffffff"/>
+  <text x="500" y="38" text-anchor="middle" font-size="24" font-weight="bold" fill="#222">ESP32-S3 DevKitC-1 as modem and controller receiver for the Tang Nano 20K</text>
+
+  <!-- ESP32-S3 DevKitC-1 -->
+  <rect x="70" y="90" width="250" height="420" rx="10" fill="#1d3b5a" stroke="#0e2238" stroke-width="3"/>
+  <text x="195" y="120" text-anchor="middle" fill="#ffffff" font-size="18" font-weight="bold">ESP32-S3 DevKitC-1</text>
+  <text x="195" y="142" text-anchor="middle" fill="#cfe0f0" font-size="13">N16R8, Zimodem with Bluepad32</text>
+  <!-- module / antenna -->
+  <rect x="120" y="160" width="150" height="120" rx="6" fill="#8a97a3" stroke="#5c6770" stroke-width="2"/>
+  <text x="195" y="225" text-anchor="middle" fill="#ffffff" font-size="14">ESP32-S3-WROOM-1</text>
+  <rect x="120" y="160" width="150" height="26" fill="#c9d3da"/>
+  <text x="195" y="178" text-anchor="middle" fill="#3a444c" font-size="12">antenna</text>
+  <!-- pin header right side -->
+  <g fill="#e8c84a" stroke="#8c7a1e" stroke-width="1.5">
+    <rect x="304" y="300" width="20" height="20"/>
+    <rect x="304" y="340" width="20" height="20"/>
+    <rect x="304" y="380" width="20" height="20"/>
+    <rect x="304" y="420" width="20" height="20"/>
+  </g>
+  <g fill="#ffffff" font-size="15" text-anchor="end">
+    <text x="296" y="315">GPIO16 (TX)</text>
+    <text x="296" y="355">GPIO15 (RX)</text>
+    <text x="296" y="395">GPIO17 (joystick)</text>
+    <text x="296" y="435">GND</text>
+  </g>
+  <!-- USB sockets at the bottom -->
+  <rect x="105" y="470" width="70" height="28" rx="6" fill="#c0c8cf" stroke="#5c6770" stroke-width="2"/>
+  <text x="140" y="489" text-anchor="middle" font-size="13" fill="#222">USB</text>
+  <rect x="215" y="470" width="70" height="28" rx="6" fill="#c0c8cf" stroke="#5c6770" stroke-width="2"/>
+  <text x="250" y="489" text-anchor="middle" font-size="13" fill="#222">UART</text>
+
+  <!-- USB cable from the UART socket -->
+  <path d="M250 498 L250 560" stroke="#333" stroke-width="5" fill="none"/>
+  <rect x="200" y="560" width="100" height="40" rx="6" fill="#eeeeee" stroke="#555" stroke-width="2"/>
+  <text x="250" y="578" text-anchor="middle" font-size="13" fill="#222">PC or USB supply</text>
+  <text x="250" y="594" text-anchor="middle" font-size="12" fill="#444">5 V, debug 115200</text>
+
+  <!-- Tang Nano 20K -->
+  <rect x="640" y="90" width="290" height="420" rx="10" fill="#2f6b3a" stroke="#1d4424" stroke-width="3"/>
+  <text x="785" y="120" text-anchor="middle" fill="#ffffff" font-size="18" font-weight="bold">Tang Nano 20K</text>
+  <text x="785" y="142" text-anchor="middle" fill="#d6ecd9" font-size="13">MiSTeryNano, onboard BL616 companion</text>
+  <rect x="700" y="165" width="170" height="110" rx="6" fill="#4a4a4a" stroke="#222" stroke-width="2"/>
+  <text x="785" y="225" text-anchor="middle" fill="#ffffff" font-size="14">GW2AR-18</text>
+  <!-- header pins, left side, the M0S connector side -->
+  <g fill="#e8c84a" stroke="#8c7a1e" stroke-width="1.5">
+    <rect x="646" y="300" width="20" height="20"/>
+    <rect x="646" y="340" width="20" height="20"/>
+    <rect x="646" y="380" width="20" height="20"/>
+    <rect x="646" y="420" width="20" height="20"/>
+    <rect x="646" y="460" width="20" height="20"/>
+  </g>
+  <g fill="#ffffff" font-size="15">
+    <text x="674" y="315">41</text>
+    <text x="674" y="355">51</text>
+    <text x="674" y="395">54</text>
+    <text x="674" y="435">GND</text>
+    <text x="674" y="475">56  (stays free)</text>
+  </g>
+  <rect x="740" y="470" width="90" height="28" rx="6" fill="#c0c8cf" stroke="#5c6770" stroke-width="2"/>
+  <text x="785" y="489" text-anchor="middle" font-size="13" fill="#222">USB-C</text>
+
+  <!-- wires -->
+  <g stroke-width="5" fill="none" stroke-linecap="round">
+    <path d="M324 310 L646 310" stroke="#2e9e4f"/>
+    <path d="M324 350 L646 350" stroke="#2a6fd6"/>
+    <path d="M324 390 L646 390" stroke="#e08a1e"/>
+    <path d="M324 430 L646 430" stroke="#222222"/>
+  </g>
+  <g font-size="14" fill="#222" text-anchor="middle">
+    <text x="485" y="302">modem to ST / companion, S3 sends</text>
+    <text x="485" y="342">modem to ST / companion, S3 receives</text>
+    <text x="485" y="382">Bluetooth controller, one byte per change</text>
+    <text x="485" y="422">ground</text>
+  </g>
+
+  <!-- notes -->
+  <g font-size="14" fill="#333">
+    <text x="70" y="625">Power the S3 only through its "UART" socket. No 5 V lead from the Tang: on that jumper the S3 browns out when the radio starts.</text>
+  </g>
+</svg>

@@ -39,7 +39,10 @@ stays untouched.
 |---|---|
 | GPIO16 (TX) | 41 |
 | GPIO15 (RX) | 51 |
+| GPIO17 (joystick, Bluetooth build) | 54 |
 | GND | GND |
+
+![Wiring of the ESP32-S3 DevKitC-1 to the Tang Nano 20K](doc/s3_wiring.svg)
 
 The S3 draws more when its radio starts than a jumper from the Tang's 5V
 pin delivers; on that lead it reset at every WiFi join. Power it through
