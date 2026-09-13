@@ -18,6 +18,13 @@ the network: see [DOWNLOAD.md](DOWNLOAD.md). It needs the matching core
 from the [MiSTeryNano fork](https://github.com/rcdev67/MiSTeryNano),
 branch `nano20k-running`.
 
+It also raises the USB hub limits of the BL616 build to four hubs with up
+to 16 ports each; the stock limit of four ports turned a 7-port hub away
+at the door. A plain hub works without its own supply, keyboard and mouse
+on it. A USB-C dock that delivers power (tested: Anker, with LAN and card
+reader inside) works too, but then it has to be the Tang's only supply:
+fed from the 5V pins at the same time, the USB host does not come up.
+
 The FPGA Companion replaces the MiSTeryNano firmware that was
 formerly part of the [MiSTeryNano
 project](https://github.com/MiSTle-Dev/MiSTeryNano). It is also

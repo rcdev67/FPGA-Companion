@@ -157,8 +157,8 @@
 /* ================ USB HOST Stack Configuration ================== */
 
 #define CONFIG_USBHOST_MAX_RHPORTS          1
-#define CONFIG_USBHOST_MAX_EXTHUBS          2
-#define CONFIG_USBHOST_MAX_EHPORTS          4
+#define CONFIG_USBHOST_MAX_EXTHUBS          4   /* a 7 port hub is two hubs in one box, a dock adds a tier */
+#define CONFIG_USBHOST_MAX_EHPORTS          16  /* the hub class rejects a hub with more ports than this; a dock reports 9 */
 #define CONFIG_USBHOST_MAX_INTERFACES       8
 #define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 2
 #define CONFIG_USBHOST_MAX_ENDPOINTS        8
