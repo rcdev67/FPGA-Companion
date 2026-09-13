@@ -127,6 +127,17 @@ int inifile_read(char *name) {
 	}
       }
 
+      // the WiFi the modem should join, "Net,Password" (a password may hold
+      // spaces, so only the line end is trimmed), see net.c
+      if(strncasecmp(buffer, "wifi=", 5) == 0) {
+	char *p = buffer+5;
+	while(*p && iswhite(*p)) p++;
+	char *e = p + strlen(p);
+	while(e > p && iswhite(e[-1])) e--;
+	*e = '\0';
+	netdl_set_wifi(p);
+      }
+
       // the web server the companion loads files from, see net.c
       if(strncasecmp(buffer, "server=", 7) == 0) {
 	char *p = buffer+7;
@@ -217,6 +228,14 @@ void inifile_write(char *name) {
       f_puts(str, &file);
     }
     
+    // the modem's network, kept if one was set
+    if(netdl_get_wifi()[0]) {
+      f_puts("\n; WiFi for the modem on the M0S connector (Net,Password)\n", &file);
+      f_puts("wifi=", &file);
+      f_puts(netdl_get_wifi(), &file);
+      f_puts("\n", &file);
+    }
+
     // the download server, kept if one was set
     if(netdl_get_server()[0]) {
       f_puts("\n; web server for the companion's downloads (host:port)\n", &file);

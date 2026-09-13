@@ -50,13 +50,18 @@ the C3's.
 
 ## One-time setup
 
-1. Flash Zimodem to the C3 (see the release page), then join it to your
-   WiFi once, from the ST's terminal program or from a PC:
-   `atw"MyNetwork,MyPassword"` followed by `at&w`. It reconnects on its own
-   from then on.
-2. Put the PC's address and a port into `atarist.ini` on the card:
+1. Flash Zimodem to the C3 or S3 (see the release page).
+2. Put your WiFi and the PC's address with a port into `atarist.ini` on
+   the card:
 
+       wifi=MyNetwork,MyPassword
        server=192.168.1.20:8888
+
+   The companion hands the network to the modem the first time it finds
+   it without one, and the modem keeps it from then on; no terminal
+   program on the ST is needed. (It still works the old way, `atw"MyNetwork,MyPassword"`
+   and `at&w` from a terminal program.) A password may contain spaces,
+   the line is taken as it is up to its end.
 
    The port must be free on the PC; 8000 is often taken by Windows itself.
 3. Make a folder on the PC for the files, say `C:\atari\share`, and start
@@ -107,6 +112,10 @@ size is not limited by its flash. For the transfer both sides switch to
 460800 and back to 19200 afterwards, so the ST finds its modem as it
 left it. The core's port FIFOs hold 255 bytes for that, which is why the
 companion and the core from the branches named above belong together.
+
+A Bluetooth controller can join in as well, on a separate line to pin 54:
+see the Zimodem fork's MISTERYNANO.md. That build belongs on the S3, on
+the C3 the radio cannot serve WiFi and Bluetooth at once well enough.
 
 Every result is appended to `NETLOG.TXT` in the root of the card. If a
 download fails, that line says why. Should the modem ever go quiet, the

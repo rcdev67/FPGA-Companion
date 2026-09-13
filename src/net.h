@@ -32,6 +32,8 @@ void netdl_port_bytes(const unsigned char *data, int len);
 // server "host:port" from the ini file
 void netdl_set_server(const char *server);
 const char *netdl_get_server(void);
+void netdl_set_wifi(const char *net_and_password);   // "MyNet,MyPassword" from the ini
+const char *netdl_get_wifi(void);
 
 // requests from the menu, handled in the net task
 void netdl_request_list(void);

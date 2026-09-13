@@ -71,6 +71,9 @@ static bool in_body = false;        // file data is streaming, keep it out of th
 #define NET_FAST_BAUD   "460800"
 #define NET_FAST_N      4
 
+static char wifi_cfg[80];
+static bool wifi_tried = false;      // the ini's network is offered once per boot
+
 static bool fast = false;           // the port and the modem run at 115200 for a transfer
 
 // ------------------------------------------------------------ plumbing ----
@@ -210,8 +213,38 @@ static void net_port_reset(void) {
   net_log("port reset");
 }
 
+static bool wifi_none = false;      // the modem has no network configured
+
+// Join the network named in the ini (wifi=Net,Password) and save it in
+// the modem, so nobody needs a terminal program on the ST for the setup.
+// Offered once per boot when the modem has no network or cannot reach it.
+static bool modem_join_from_ini(void) {
+  char line[NET_LINE_LEN];
+  if(!wifi_cfg[0] || wifi_tried) return false;
+  wifi_tried = true;
+
+  net_set_message("Modem joining WiFi from ini...");
+  net_flush();
+  snprintf(line, sizeof(line), "ATW\"%s\"\r", wifi_cfg);
+  net_puts(line);
+  bool ok = false;
+  while(net_read_line(line, sizeof(line), 30000)) {
+    debugf("NET: ATW '%s'", line);
+    if(!strcmp(line, "OK")) { ok = true; break; }
+    if(!strcmp(line, "ERROR")) break;
+  }
+  if(ok) {
+    net_flush();
+    net_puts("AT&W\r");
+    ok = modem_cmd("AT", NULL, 3000);   // AT&W answers OK, then the probe does
+  }
+  net_log(ok ? "wifi from ini: joined and saved" : "wifi from ini: join failed");
+  return ok;
+}
+
 static bool modem_ati(void) {
   char line[NET_LINE_LEN];
+  wifi_none = false;
 
   net_flush();
   net_puts("AT\r");
@@ -225,8 +258,10 @@ static bool modem_ati(void) {
     debugf("NET: ATI '%s'", line);
     if(strstr(line, "Zimodem") || strstr(line, "zimodem")) modem = MODEM_ZIMODEM;
     if(strstr(line, "AT version") || strstr(line, "SDK version")) modem = MODEM_ESPAT;
-    // Zimodem reports its WiFi as "CONNECTED TO <ssid> (<ip>)" or "ERROR ON <ssid>"
+    // Zimodem reports its WiFi as "CONNECTED TO <ssid> (<ip>)" or "ERROR ON <ssid>",
+    // and "INITIALIZED" when it has no network at all
     if(!strncmp(line, "ERROR ON", 8)) wifi_down = true;
+    if(!strcmp(line, "INITIALIZED")) { wifi_down = true; wifi_none = true; }
     if(!strcmp(line, "OK")) return true;
     if(!strcmp(line, "ERROR")) return false;
   }
@@ -236,6 +271,11 @@ static bool modem_ati(void) {
 // find out what is on the other end of the wire
 static bool modem_detect(void) {
   bool ok = modem_ati();
+
+  if(ok && wifi_down && modem == MODEM_ZIMODEM && wifi_cfg[0] && !wifi_tried) {
+    if(modem_join_from_ini())
+      ok = modem_ati();
+  }
 
   if(ok && wifi_down && modem == MODEM_ZIMODEM) {
     // Zimodem has lost its WiFi and would wait a while before trying
@@ -885,6 +925,12 @@ void netdl_request_download(int index) {
 }
 
 // ------------------------------------------------------------- getters ----
+
+void netdl_set_wifi(const char *s) {
+  strncpy(wifi_cfg, s, sizeof(wifi_cfg)-1);
+  wifi_cfg[sizeof(wifi_cfg)-1] = 0;
+}
+const char *netdl_get_wifi(void) { return wifi_cfg; }
 
 void netdl_set_server(const char *s) {
   strncpy(server, s, sizeof(server)-1);
