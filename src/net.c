@@ -215,6 +215,8 @@ static void net_port_reset(void) {
 
 static bool wifi_none = false;      // the modem has no network configured
 static char modem_ip[20];           // from the modem's "CONNECTED TO <ssid> (<ip>)"
+static char tz_cfg[12];             // time zone code for the modem's clock, from the ini
+static bool time_set = false;       // the ST's clock has been set from the modem
 
 // Join the network named in the ini (wifi=Net,Password) and save it in
 // the modem, so nobody needs a terminal program on the ST for the setup.
@@ -241,6 +243,37 @@ static bool modem_join_from_ini(void) {
   }
   net_log(ok ? "wifi from ini: joined and saved" : "wifi from ini: join failed");
   return ok;
+}
+
+// Zimodem keeps the time by NTP. Ask for it in a fixed format and set the
+// ST's clock with it, the way the companion does with its own NTP on
+// boards that have a network. The time zone comes from the ini
+// (timezone=CEST); Zimodem knows no daylight saving rules, so it is CET in
+// winter and CEST in summer. Called once the modem has joined its network.
+static bool modem_time_sync(void) {
+  char line[NET_LINE_LEN];
+  if(time_set || modem != MODEM_ZIMODEM) return time_set;
+
+  snprintf(line, sizeof(line), "AT&T\"%s,%%yyyy-%%MM-%%dd %%HH:%%mm:%%ss,\"", tz_cfg);
+  if(!modem_cmd(line, NULL, 2000)) return false;
+
+  net_flush();
+  net_puts("AT&T\r");
+  while(net_read_line(line, sizeof(line), 2000)) {
+    int y, mo, d, h, mi, s;
+    if(sscanf(line, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
+      debugf("NET: modem time '%s'", line);
+      if(y < 2024 || y > 2099) return false;       // NTP has not answered yet
+      // day of the week, 0 = Sunday (Sakamoto)
+      static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+      int yy = (mo < 3) ? y - 1 : y;
+      int wday = (yy + yy/4 - yy/100 + yy/400 + t[mo-1] + d) % 7;
+      sys_set_time(SYS_TIME_FLAGS_NTP, y - 1900, mo - 1, d + (wday << 5), h, mi, s);
+      time_set = true;
+      return true;
+    }
+  }
+  return false;
 }
 
 static bool modem_ati(void) {
@@ -913,12 +946,12 @@ static void net_task(__attribute__((unused)) void *parms) {
   TickType_t next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(12000);
 
   while(1) {
-    if(!modem_ip[0] && probes < 8 && state != NET_STATE_BUSY &&
+    if((!modem_ip[0] || !time_set) && probes < 8 && state != NET_STATE_BUSY &&
        (int32_t)(xTaskGetTickCount() - next_probe) >= 0) {
       probes++;
       sys_set_val('E', 2);
       vTaskDelay(pdMS_TO_TICKS(50));
-      modem_ati();
+      if(modem_ati() && modem_ip[0]) modem_time_sync();
       int e0 = menu_variable_get('E');
       sys_set_val('E', (e0 < 0) ? 0 : e0);
       debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
@@ -927,7 +960,7 @@ static void net_task(__attribute__((unused)) void *parms) {
 
     int req;
     // wake up every second while the address is still unknown
-    TickType_t wait = (!modem_ip[0] && probes < 8) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
+    TickType_t wait = ((!modem_ip[0] || !time_set) && probes < 8) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
     if(xQueueReceive(req_queue, &req, wait)) {
       // Port 1 only exists while the core routes the M0S connector to it
       // ("Serial: Netz"). Switch it on for the request regardless of the
@@ -964,6 +997,11 @@ void netdl_set_wifi(const char *s) {
 }
 const char *netdl_get_wifi(void) { return wifi_cfg; }
 const char *netdl_get_ip(void) { return modem_ip; }
+void netdl_set_timezone(const char *s) {
+  strncpy(tz_cfg, s, sizeof(tz_cfg)-1);
+  tz_cfg[sizeof(tz_cfg)-1] = 0;
+}
+const char *netdl_get_timezone(void) { return tz_cfg; }
 
 void netdl_set_server(const char *s) {
   strncpy(server, s, sizeof(server)-1);

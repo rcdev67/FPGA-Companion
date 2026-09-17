@@ -127,6 +127,17 @@ int inifile_read(char *name) {
 	}
       }
 
+      // the time zone for the clock the modem hands to the ST, a Zimodem
+      // code such as CET, CEST or UTC, see net.c
+      if(strncasecmp(buffer, "timezone=", 9) == 0) {
+	char *p = buffer+9;
+	while(*p && iswhite(*p)) p++;
+	char *e = p;
+	while(*e && !iswhite(*e)) e++;
+	*e = '\0';
+	netdl_set_timezone(p);
+      }
+
       // the WiFi the modem should join, "Net,Password" (a password may hold
       // spaces, so only the line end is trimmed), see net.c
       if(strncasecmp(buffer, "wifi=", 5) == 0) {
@@ -228,6 +239,14 @@ void inifile_write(char *name) {
       f_puts(str, &file);
     }
     
+    // the modem's time zone, kept if one was set
+    if(netdl_get_timezone()[0]) {
+      f_puts("\n; time zone for the ST's clock, set from the modem (CET, CEST, UTC ...)\n", &file);
+      f_puts("timezone=", &file);
+      f_puts(netdl_get_timezone(), &file);
+      f_puts("\n", &file);
+    }
+
     // the modem's network, kept if one was set
     if(netdl_get_wifi()[0]) {
       f_puts("\n; WiFi for the modem on the M0S connector (Net,Password)\n", &file);
