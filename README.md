@@ -18,6 +18,10 @@ the network: see [DOWNLOAD.md](DOWNLOAD.md). It needs the matching core
 from the [MiSTeryNano fork](https://github.com/rcdev67/MiSTeryNano),
 branch `nano20k-running`.
 
+The Tang Nano 20K comes in two board versions, 3921 and 3923, that need
+different companion images: see [TANG_NANO_20K.md](TANG_NANO_20K.md) for
+the difference, how to tell them apart, flashing and the debug console.
+
 It also raises the USB hub limits of the BL616 build to four hubs with up
 to 16 ports each; the stock limit of four ports turned a 7-port hub away
 at the door. A plain hub works without its own supply, keyboard and mouse
