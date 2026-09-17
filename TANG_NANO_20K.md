@@ -47,9 +47,12 @@ console is silent. On a USB power supply, a power bank, the 5V pins or a
 dock the companion starts. This is not a fault, but it looks like one when
 you test a fresh flash on the PC's USB port.
 
-The useful side: while the board hangs on a PC, the core can be flashed
-with openFPGALoader. My 3923 came up as the debugger on the PC without
-any button; on my 3921 I hold S2 while plugging it into the PC.
+So for flashing the core or a TOS image the board goes to a PC. One more
+thing is needed once this fork's core is running: hold **S2** while
+plugging the board in and for two seconds after. Without it the debugger
+shows up but openFPGALoader answers `no device found`, the running core
+does not leave the FPGA's JTAG pins to the programmer. With the factory
+bitstream or the maintainers' core on the board it worked without S2.
 
 ## Flashing
 
@@ -60,10 +63,24 @@ Save the factory state first, it takes a minute:
 
 (the second one with the board in update mode, see below).
 
-The core and TOS, board on a PC:
+The core and TOS, board on a PC (S2 held while plugging in, see above):
 
     openFPGALoader -b tangnano20k -f --verify atarist.fs
     openFPGALoader -b tangnano20k --external-flash -o 0x100000 tos104de.img
+
+The flash has four TOS places, chosen in the OSD by chipset and TOS slot.
+This is what I have in mine:
+
+| Address | Place | Image |
+|---|---|---|
+| 0x100000 | ST, first | TOS 1.04 |
+| 0x140000 | STE, first | TOS 1.62 |
+| 0x180000 | ST, second | TOS 2.06 |
+| 0x1C0000 | STE, second | TOS 1.06 |
+
+To check a write, read it back with
+`--external-flash --dump-flash --file-size 262144 -o <address> readback.img`
+and compare.
 
 The companion: unplug, hold `UPDATE`, plug into the PC, release. The BL616
 shows up as a serial port. Then, from `src/bl616` with the partner binary
