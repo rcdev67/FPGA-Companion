@@ -215,6 +215,8 @@ static void net_port_reset(void) {
 
 static bool wifi_none = false;      // the modem has no network configured
 static char modem_ip[20];           // from the modem's "CONNECTED TO <ssid> (<ip>)"
+static char joy_status[40] = "not asked yet";   // the Bluetooth controller, as the modem reports it
+static bool joy_busy = false;
 static char tz_cfg[12];             // time zone code for the modem's clock, from the ini
 static bool time_set = false;       // the ST's clock has been set from the modem
 
@@ -256,6 +258,10 @@ static bool modem_time_sync(void) {
 
   snprintf(line, sizeof(line), "AT&T\"%s,%%yyyy-%%MM-%%dd %%HH:%%mm:%%ss,\"", tz_cfg);
   if(!modem_cmd(line, NULL, 2000)) return false;
+
+  // Zimodem applies a new time zone only when the next NTP answer comes
+  // in, which it asks for right away. Asked too early it still tells UTC.
+  if(tz_cfg[0]) vTaskDelay(pdMS_TO_TICKS(5000));
 
   net_flush();
   net_puts("AT&T\r");
@@ -933,6 +939,56 @@ static void download(int index) {
 }
 
 #define REQ_LIST      (-1)
+#define REQ_JOY       (-2)
+#define REQ_JOY_PAIR  (-3)
+
+// The modem's Bluetooth side: AT+JOY answers "JOYPAD <model>" or "JOYPAD
+// NONE", AT+JOYPAIR forgets the bond and waits for a controller in pairing
+// mode. A modem without these commands answers ERROR.
+static void joy_request(bool pair) {
+  char line[NET_LINE_LEN];
+
+  joy_busy = true;
+  snprintf(joy_status, sizeof(joy_status), "asking the modem...");
+  menu_notify(MENU_EVENT_NET_UPDATE);
+
+  if(!modem_ati()) {
+    net_port_reset();
+    if(!modem_ati()) {
+      snprintf(joy_status, sizeof(joy_status), "no modem on port 1");
+      goto done;
+    }
+  }
+  if(modem != MODEM_ZIMODEM) {
+    snprintf(joy_status, sizeof(joy_status), "modem has no Bluetooth");
+    goto done;
+  }
+
+  if(pair && !modem_cmd("AT+JOYPAIR", NULL, 3000)) {
+    snprintf(joy_status, sizeof(joy_status), "modem has no Bluetooth");
+    goto done;
+  }
+
+  net_flush();
+  net_puts("AT+JOY\r");
+  snprintf(joy_status, sizeof(joy_status), "modem has no Bluetooth");
+  while(net_read_line(line, sizeof(line), 2000)) {
+    debugf("NET: joy '%s'", line);
+    if(!strncmp(line, "JOYPAD ", 7)) {
+      if(!strcmp(line + 7, "NONE"))
+        snprintf(joy_status, sizeof(joy_status), "%s", pair ? "pairing: hold its pair button" : "none connected");
+      else if(!strcmp(line + 7, "UNSUPPORTED"))
+        snprintf(joy_status, sizeof(joy_status), "modem built without Bluetooth");
+      else
+        snprintf(joy_status, sizeof(joy_status), "%.38s", line + 7);
+    }
+    if(!strcmp(line, "OK") || !strcmp(line, "ERROR")) break;
+  }
+
+done:
+  joy_busy = false;
+  menu_notify(MENU_EVENT_NET_UPDATE);
+}
 
 static void net_task(__attribute__((unused)) void *parms) {
   debugf("NET: task running");
@@ -968,8 +1024,10 @@ static void net_task(__attribute__((unused)) void *parms) {
       sys_set_val('E', 2);
       vTaskDelay(pdMS_TO_TICKS(50));
 
-      if(req == REQ_LIST) fetch_list();
-      else                download(req);
+      if(req == REQ_LIST)          fetch_list();
+      else if(req == REQ_JOY)      joy_request(false);
+      else if(req == REQ_JOY_PAIR) joy_request(true);
+      else                         download(req);
 
       // the ST expects its modem at 19200 again
       net_baud_slow();
@@ -984,6 +1042,13 @@ void netdl_request_list(void) {
   int req = REQ_LIST;
   if(state != NET_STATE_BUSY) xQueueSendToBack(req_queue, &req, 0);
 }
+
+void netdl_request_joy(bool pair) {
+  int req = pair ? REQ_JOY_PAIR : REQ_JOY;
+  if(state != NET_STATE_BUSY && !joy_busy) xQueueSendToBack(req_queue, &req, 0);
+}
+const char *netdl_joy_status(void) { return joy_status; }
+bool netdl_joy_busy(void) { return joy_busy; }
 
 void netdl_request_download(int index) {
   if(state != NET_STATE_BUSY) xQueueSendToBack(req_queue, &index, 0);

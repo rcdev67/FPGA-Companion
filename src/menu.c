@@ -1714,8 +1714,77 @@ static const config_button_t net_btn = {
   .action = (config_action_t*)&net_action
 };
 
+/* ---- the controller dialog: the Bluetooth controller on the modem ----
+   Two entries, ask again and pair a new one; below them what the modem
+   says. See joypad.cpp in the Zimodem fork for the other end. */
+
+static const config_custom_t joy_dialog;
+
+static int joy_dialog_length(void) { return 2; }
+
+static void joy_dialog_draw(void) {
+  static const char *entries[] = { "Ask again", "Pair a new controller" };
+  int width = u8g2_GetDisplayWidth(&u8g2);
+
+  for(int i=0;i<2;i++) {
+    int y = MENU_LINE_Y + (i+1)*MENU_ENTRY_H;
+    u8g2_DrawStr(&u8g2, 2, y, entries[i]);
+    if(i == menu_state->selected - 1)
+      u8g2_DrawButtonFrame(&u8g2, 0, y, U8G2_BTN_INV, width, 1, 1);
+  }
+
+  u8g2_DrawHLine(&u8g2, 0, MENU_LINE_Y + 2*MENU_ENTRY_H + 4, width);
+  u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
+  u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 3*MENU_ENTRY_H + 2, "Controller:");
+  u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 4*MENU_ENTRY_H - 1, netdl_joy_status());
+  u8g2_SetFont(&u8g2, font_helvR08_te);
+}
+
+static void joy_dialog_select(int selected) {
+  if(netdl_joy_busy()) return;
+  netdl_request_joy(selected == 2);
+}
+
+static const config_custom_t joy_dialog = {
+  .label = "Controller",
+  .length = joy_dialog_length,
+  .draw = joy_dialog_draw,
+  .select = joy_dialog_select
+};
+
+static void joy_dialog_func(void) {
+  menu_push();
+  menu_state->type = MENU_TYPE_CUSTOM;
+  menu_state->custom = &joy_dialog;
+  menu_state->selected = 1;
+  menu_state->scroll = 0;
+  netdl_request_joy(false);      // show the current state right away
+}
+
+static const config_action_command_t joy_exec = {
+  .code = CONFIG_ACTION_COMMAND_EXEC,
+  .exec = joy_dialog_func
+};
+
+static const config_action_t joy_action = {
+  .name = "controller",
+  .commands = (config_action_command_t*)&joy_exec
+};
+
+static const config_button_t joy_btn = {
+  .label = "Controller...",
+  .action = (config_action_t*)&joy_action
+};
+
 // redraw the download dialog if it is on screen
 static void net_dialog_update(void) {
+  // the controller dialog only wants to be redrawn
+  if(osd_is_visible() && !menu_dialog_is_open() && menu_state &&
+     menu_state->type == MENU_TYPE_CUSTOM && menu_state->custom == &joy_dialog) {
+    menu_do(MENU_EVENT_NONE);
+    return;
+  }
+
   int st = netdl_state();
   if(st == NET_STATE_DONE || st == NET_STATE_ERROR)
     menu_draw_dialog_for("Download", (char*)netdl_message(), pdMS_TO_TICKS(3000));
@@ -1724,11 +1793,18 @@ static void net_dialog_update(void) {
     menu_do(MENU_EVENT_NONE);
 }
 
+// third entry in main system menu
+static const config_menu_entry_t system_menu_joy = {
+  .type = CONFIG_MENU_ENTRY_BUTTON,
+  .button = (config_button_t*)&joy_btn,
+  .next = (config_menu_entry_t*)&system_menu_usb_core_fsel
+};
+
 // second entry in main system menu
 static const config_menu_entry_t system_menu_net = {
   .type = CONFIG_MENU_ENTRY_BUTTON,
   .button = (config_button_t*)&net_btn,
-  .next = (config_menu_entry_t*)&system_menu_usb_core_fsel
+  .next = (config_menu_entry_t*)&system_menu_joy
 };
 
 // first entry in main system menu
