@@ -45,8 +45,8 @@
 #include "bflb_flash.h"
 #include "bflb_sec_mutex.h"
 
-#include <sys/socket.h>
-#include <lwip/inet.h>
+#include "lwip/opt.h"
+#include "lwip/init.h"
 #include "netif/etharp.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
@@ -61,10 +61,8 @@
 #include <lwip/pbuf.h>
 #include <lwip/tcp.h>
 #include <lwip/dns.h>
-#include "bl_fw_api.h"
-#include "fhost_api.h"
 #include "wifi_mgmr_ext.h"
-#include "wifi_mgmr.h"
+#include "rfparam_adapter.h"
 
 #include "bflb_rtc.h" 
 #include "board.h"
@@ -236,30 +234,41 @@ const UsbGamepadMap *find_usb_gamepad_map(uint16_t vid,
                                           uint16_t pid,
                                           int version_optional)
 {
-  const UsbGamepadMap *fallback = NULL;
+  /*
+   * Selection order:
+   *   1. exact VID/PID/bcdDevice match,
+   *   2. VID/PID entry with version == 0 (generic/default SDL entry),
+   *   3. first VID/PID entry as a deterministic last-resort fallback.
+   *
+   * The old code only populated fallback when version_optional < 0.  The
+   * normal caller always passes bcdDevice, so a missing exact version could
+   * never fall back and the SDL map was silently disabled.
+   */
+  const UsbGamepadMap *first_vid_pid = NULL;
+  const UsbGamepadMap *version_zero = NULL;
 
   for (size_t i = 0; i < kUsbGamepadMapsCount; i++)
   {
     const UsbGamepadMap *m = &kUsbGamepadMaps[i];
 
-    if (m->vid == vid && m->pid == pid)
-    {
-      if (version_optional >= 0)
-      {
-        if (m->version == (uint16_t)version_optional)
-        {
-          return m; // version hit
-        }
-      }
-      else
-      {
-        if (!fallback)
-          fallback = m;
-      }
-    }
+    if (m->vid != vid || m->pid != pid)
+      continue;
+
+    if (!first_vid_pid)
+      first_vid_pid = m;
+
+    if (!version_zero && m->version == 0)
+      version_zero = m;
+
+    if (version_optional >= 0 &&
+        m->version == (uint16_t)version_optional)
+      return m;
   }
 
-  return fallback;
+  if (version_zero)
+    return version_zero;
+
+  return first_vid_pid;
 }
 
 void set_led(int pin, int on) {
@@ -371,20 +380,22 @@ static void xbox_parse(struct xbox_info_S *xbox) {
 
   // build new state
   unsigned char state =
-    ((wButtons & XINPUT_GAMEPAD_DPAD_UP   )?0x08:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_DPAD_DOWN )?0x04:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_DPAD_LEFT )?0x02:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)?0x01:0x00) |
+    ((wButtons & XINPUT_GAMEPAD_DPAD_UP) ? 0x08 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_DPAD_DOWN) ? 0x04 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_DPAD_LEFT) ? 0x02 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) ? 0x01 : 0x00) |
     ((wButtons & 0xf000) >> 8); // Y, X, B, A
 
   // build extra button new state
   unsigned char state_btn_extra =
-    ((wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER  )?0x01:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER )?0x02:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_BACK           )?0x04:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_START          )?0x08:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_LEFT_THUMB     )?0x40:0x00) |
-    ((wButtons & XINPUT_GAMEPAD_RIGHT_THUMB    )?0x80:0x00);
+    ((wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 0x01 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 0x02 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_BACK) ? 0x04 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_START) ? 0x08 : 0x00) |
+    ((xbox->buffer[4] > 0x80) ? 0x10 : 0x00) |
+    ((xbox->buffer[5] > 0x80) ? 0x20 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_LEFT_THUMB) ? 0x40 : 0x00) |
+    ((wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) ? 0x80 : 0x00);
 
   // build analog stick x,y state
   int16_t sThumbLX = xbox->buffer[7] << 8 | xbox->buffer[6];
@@ -393,10 +404,10 @@ static void xbox_parse(struct xbox_info_S *xbox) {
   uint8_t ay = ~byteScaleAnalog(sThumbLY);
 
   // map analog stick directions to digital
-  if(ax > (uint8_t) 0xc0) state |= 0x01;
-  if(ax < (uint8_t) 0x40) state |= 0x02;
-  if(ay > (uint8_t) 0xc0) state |= 0x04;
-  if(ay < (uint8_t) 0x40) state |= 0x08;
+  if (ax > 0xc0) state |= 0x01;
+  if (ax < 0x40) state |= 0x02;
+  if (ay > 0xc0) state |= 0x04;
+  if (ay < 0x40) state |= 0x08;
 
   // submit if state has changed
   if(state != xbox->last_state ||
@@ -834,6 +845,13 @@ void usbh_hid_run(struct usbh_hid *hid_class)
       return;
     }
 
+    // Some device return broken hid descriptor reports. Just like the Linux
+    // kernel we replace these.
+    fix_report_descriptor(hid_class->hport->device_desc.idVendor,
+			  hid_class->hport->device_desc.idProduct,
+			  hid_class->hport->device_desc.bcdDevice,
+			  report_desc[i], (uint16_t)rep_desc);
+  
     if (!parse_report_descriptor(report_desc[i], (uint16_t)rep_desc, &usb->hid_info[i].report, NULL))
     {
       usb->hid_info[i].state = STATE_FAILED;
@@ -874,6 +892,7 @@ void usbh_xbox_run(struct usbh_xbox *xbox_class) {
 
     usb_debugf("NEW XBOX HID %d", i);
     memset(&usb->xbox_info[i].report, 0, sizeof(usb->xbox_info[i].report));
+    usb->xbox_info[i].js_index = hid_allocate_joystick();
 
 #if 0   // don't try to read HID report descriptor as it's not used/parsed, anyway
     uint16_t rep_desc = usbh_hid_get_report_descriptor(xbox_class, report_desc[i], 1024);
@@ -895,6 +914,11 @@ void usbh_xbox_run(struct usbh_xbox *xbox_class) {
 void usbh_xbox_stop(struct usbh_xbox *xbox_class) {
   uint8_t i = xbox_class->minor;
   usb_config.xbox_info[i].stop = 1;
+
+  if (usb_config.xbox_info[i].js_index != NO_JOYSTICK) {
+    hid_release_joystick(usb_config.xbox_info[i].js_index);
+    usb_config.xbox_info[i].js_index = NO_JOYSTICK;
+  }
 }
 
 static struct bflb_device_s *usb_dev;
@@ -922,7 +946,8 @@ void usb_host(void) {
   for(int i=0;i<CONFIG_USBHOST_MAX_XBOX_CLASS;i++) {
     usb_config.xbox_info[i].index = i;
     usb_config.xbox_info[i].state = 0;
-    usb_config.xbox_info[i].buffer = xbox_buffer[i];      
+    usb_config.xbox_info[i].js_index = NO_JOYSTICK;
+    usb_config.xbox_info[i].buffer = xbox_buffer[i];
     usb_config.xbox_info[i].usb = &usb_config;
     usb_config.xbox_info[i].sem = xSemaphoreCreateBinary();
   }
@@ -1838,18 +1863,18 @@ static void wifi_info()
 
 }
 
-void mcu_hw_wifi_connect(char *ssid, char *key) {
+bool mcu_hw_wifi_connect(char *ssid, char *key) {
   if (active_network_interface == NETWORK_INTERFACE_RTL8152 ||
       active_network_interface == NETWORK_INTERFACE_ASIX) {
     debugf("Ignoring WiFi command since USB Ethernet is active");
     at_wifi_puts("WiFi not available\r\n");
-    return;
+    return false;
   }
 
   if (!(network_status & NETWORK_STATUS_TCPIP_INIT)) {
     debugf("Ignoring WiFi command since TCP stack is not initialized");
     at_wifi_puts("TCPIP not available\r\n");
-    return;
+    return false;
   }
 
   debugf("WiFI: connect to %s/%s", ssid, key);
@@ -1882,8 +1907,11 @@ void mcu_hw_wifi_connect(char *ssid, char *key) {
       network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR | NETWORK_STATUS_TCP_CONNECTED);
       if (active_network_interface == NETWORK_INTERFACE_WIFI)
         active_network_interface = NETWORK_INTERFACE_NONE;
+
+      return false;
       }
     }
+  return true;
 }
 
 static bool network_available(void) {

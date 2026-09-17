@@ -671,31 +671,42 @@ void parse_with_sdl_mapping(const hid_report_t *report,
 {
   (void)nbytes;
 
+  // hexdump(buffer, nbytes);
+  
 #define READ_BUTTON_IDX(idx_) \
   ((idx_) < 0 ? 0 : ((buffer[report->joystick_mouse.button[(idx_)].byte_offset] & report->joystick_mouse.button[(idx_)].bitmask) ? 1 : 0))
 
-#define READ_AXIS_U8(idx_, out_u8_)                                        \
-  do                                                                       \
-  {                                                                        \
-    int tmp_;                                                              \
-    if ((idx_) < 0)                                                        \
-    {                                                                      \
-      (out_u8_) = 0x80; /* neutral fallback */                             \
-    }                                                                      \
-    else                                                                   \
-    {                                                                      \
-      bool _is_signed = report->joystick_mouse.axis[(idx_)].logical.min >  \
-                        report->joystick_mouse.axis[(idx_)].logical.max;   \
-      tmp_ = (int)collect_bits(buffer,                                     \
-                               report->joystick_mouse.axis[(idx_)].offset, \
-                               report->joystick_mouse.axis[(idx_)].size,   \
-                               _is_signed);                                \
-      if (tmp_ < 0)                                                        \
-        tmp_ = 0;                                                          \
-      if (tmp_ > 255)                                                      \
-        tmp_ = 255;                                                        \
-      (out_u8_) = (uint8_t)tmp_;                                           \
-    }                                                                      \
+#define READ_AXIS_U8(idx_, out_u8_)                                           \
+  do                                                                          \
+  {                                                                           \
+    int tmp_;								      \
+    if ((idx_) < 0)                                                           \
+    {                                                                         \
+      (out_u8_) = 0x80; /* neutral fallback */                                \
+    }                                                                         \
+    else                                                                      \
+    {                                                                         \
+      /* re-assign index as the parser may have re-ordered the axes */	      \
+      int pidx_ = report->joystick_mouse.axis[(idx_)].index;                  \
+      if ((pidx_) < 0)                                                        \
+      {                                                                       \
+        (out_u8_) = 0x80; /* neutral fallback */                              \
+      }                                                                       \
+      else                                                                    \
+      {                                                                       \
+        bool _is_signed = report->joystick_mouse.axis[(pidx_)].logical.min >  \
+                          report->joystick_mouse.axis[(pidx_)].logical.max;   \
+        tmp_ = (int)collect_bits(buffer,                                      \
+                                 report->joystick_mouse.axis[(pidx_)].offset, \
+                                 report->joystick_mouse.axis[(pidx_)].size,   \
+                                 _is_signed);                                 \
+        if (tmp_ < 0)                                                         \
+          tmp_ = 0;                                                           \
+        if (tmp_ > 255)                                                       \ 
+          tmp_ = 255;                                                         \
+        (out_u8_) = (uint8_t)tmp_;                                            \
+      }                                                                       \
+    }                                                                         \
   } while (0)
 
 #define READ_HAT_DIR(out_bits_)                                          \
@@ -791,6 +802,7 @@ void parse_with_sdl_mapping(const hid_report_t *report,
 
   unsigned char dpad = 0;
 
+  // parse directions from a button based configuration
   if (map->btn_dpad_up >= 0 || map->btn_dpad_right >= 0 ||
       map->btn_dpad_down >= 0 || map->btn_dpad_left >= 0)
   {
@@ -804,17 +816,34 @@ void parse_with_sdl_mapping(const hid_report_t *report,
       dpad |= DIR_LEFT;
   }
 
+  // otherwise parse directions from a hat
   if (dpad == 0 && map->dpad_hat >= 0 && report->joystick_mouse.hat.size > 0)
   {
     READ_HAT_DIR(dpad);
   }
 
+  // otherwise parse dpad axes
+  if (dpad == 0 && map->dpad_axis_up>=0 && map->dpad_axis_left>=0)
+  {
+    uint8_t dpup_raw, dpleft_raw;
+    READ_AXIS_U8(map->dpad_axis_up, dpup_raw);
+    READ_AXIS_U8(map->dpad_axis_left, dpleft_raw);    
+    if (dpleft_raw > AX_HIGH)
+      dpad |= DIR_RIGHT;
+    if (dpleft_raw < AX_LOW)
+      dpad |= DIR_LEFT;
+    if (dpup_raw > AX_HIGH)
+      dpad |= DIR_DOWN;
+    if (dpup_raw < AX_LOW)
+      dpad |= DIR_UP;
+  }
+
+  // otherwise parse directions from analogue axes
   if (dpad == 0)
   {
     uint8_t lx_raw, ly_raw;
     READ_AXIS_U8(map->axis_lx, lx_raw);
     READ_AXIS_U8(map->axis_ly, ly_raw);
-
     if (lx_raw > AX_HIGH)
       dpad |= DIR_RIGHT;
     if (lx_raw < AX_LOW)
@@ -827,12 +856,10 @@ void parse_with_sdl_mapping(const hid_report_t *report,
 
   joy &= ~(DIR_RIGHT | DIR_LEFT | DIR_DOWN | DIR_UP);
   joy |= dpad;
-
+  
   uint8_t ax = 0x80, ay = 0x80;
   READ_AXIS_U8(map->axis_lx, ax);
   READ_AXIS_U8(map->axis_ly, ay);
-  ax = buffer[0];
-  ay = buffer[1];
   if (map->axis_lx_invert)
     ax = 255 - ax;
   if (map->axis_ly_invert)
@@ -885,9 +912,6 @@ void parse_with_sdl_mapping(const hid_report_t *report,
 
     usb_debugf("MAP%d: D %02x X %02x Y %02x EB %02x",
                state->js_index, joy, ax, ay, btn_extra);
-
-    usb_debugf("MAP->AX %02x", map->axis_lx);
-    usb_debugf("MAP->AY %02x", map->axis_ly);
 
     mcu_hw_spi_begin();
     mcu_hw_spi_tx_u08(SPI_TARGET_HID);
