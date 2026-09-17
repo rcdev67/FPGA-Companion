@@ -71,8 +71,11 @@ the C3's.
    the time from it and sets the ST's clock, in that time zone (a Zimodem
    code such as `CET`, `CEST`, `GMT`, `EST`; without the line it is UTC).
    The modem knows no daylight saving rules, so in Germany it is `CET` in
-   winter and `CEST` in summer. TOS reads the clock when it starts, so the
-   right time shows after the next reset.
+   winter and `CEST` in summer. TOS reads the clock once, when it starts:
+   wait until the modem's address stands in the OSD title (it appears only
+   after the clock has been set), then use `Reset`, and the ST has the right
+   date and time. Seen working with TOS 1.04 and 2.06. `NETLOG.TXT` on the
+   SD card notes `clock set: ...`, or why the clock could not be set.
 
    The port must be free on the PC; 8000 is often taken by Windows itself.
 3. Make a folder on the PC for the files, say `C:\atari\share`, and start
