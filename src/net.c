@@ -219,6 +219,7 @@ static char joy_status[40] = "not asked yet";   // the Bluetooth controller, as 
 static bool joy_busy = false;
 static char tz_cfg[12];             // time zone code for the modem's clock, from the ini
 static bool time_set = false;       // the ST's clock has been set from the modem
+static bool time_busy = false;      // asking the modem for the time right now
 
 // Join the network named in the ini (wifi=Net,Password) and save it in
 // the modem, so nobody needs a terminal program on the ST for the setup.
@@ -252,12 +253,24 @@ static bool modem_join_from_ini(void) {
 // boards that have a network. The time zone comes from the ini
 // (timezone=CEST); Zimodem knows no daylight saving rules, so it is CET in
 // winter and CEST in summer. Called once the modem has joined its network.
+static bool modem_time_ask(void);
+
+// The address is held back from the OSD while this runs, see netdl_get_ip():
+// TOS looks at its clock chip once, when it starts, so "the address is
+// there" has to mean "a reset now picks up the right time".
 static bool modem_time_sync(void) {
-  char line[NET_LINE_LEN];
   if(time_set || modem != MODEM_ZIMODEM) return time_set;
+  time_busy = true;
+  bool ok = modem_time_ask();
+  time_busy = false;
+  return ok;
+}
+
+static bool modem_time_ask(void) {
+  char line[NET_LINE_LEN];
 
   snprintf(line, sizeof(line), "AT&T\"%s,%%yyyy-%%MM-%%dd %%HH:%%mm:%%ss,\"", tz_cfg);
-  if(!modem_cmd(line, NULL, 2000)) return false;
+  if(!modem_cmd(line, NULL, 2000)) { net_log("clock: modem refused the time format"); return false; }
 
   // Zimodem applies a new time zone only when the next NTP answer comes
   // in, which it asks for right away. Asked too early it still tells UTC.
@@ -269,16 +282,22 @@ static bool modem_time_sync(void) {
     int y, mo, d, h, mi, s;
     if(sscanf(line, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
       debugf("NET: modem time '%s'", line);
-      if(y < 2024 || y > 2099) return false;       // NTP has not answered yet
+      if(y < 2024 || y > 2099) {                   // NTP has not answered yet
+        net_log("clock: modem has no time yet");
+        return false;
+      }
       // day of the week, 0 = Sunday (Sakamoto)
       static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
       int yy = (mo < 3) ? y - 1 : y;
       int wday = (yy + yy/4 - yy/100 + yy/400 + t[mo-1] + d) % 7;
       sys_set_time(SYS_TIME_FLAGS_NTP, y - 1900, mo - 1, d + (wday << 5), h, mi, s);
       time_set = true;
+      snprintf(line, sizeof(line), "clock set: %04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
+      net_log(line);
       return true;
     }
   }
+  net_log("clock: no answer to AT&T");
   return false;
 }
 
@@ -998,7 +1017,8 @@ static void net_task(__attribute__((unused)) void *parms) {
   // repeated by the modem after up to a minute, so ask a few times. The
   // user's Serial setting is put back after every attempt, and a request
   // from the menu always comes first.
-  int probes = 0;
+  int probes = 0, silent = 0;
+  bool nudged = false;
   TickType_t next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(12000);
 
   while(1) {
@@ -1007,7 +1027,18 @@ static void net_task(__attribute__((unused)) void *parms) {
       probes++;
       sys_set_val('E', 2);
       vTaskDelay(pdMS_TO_TICKS(50));
-      if(modem_ati() && modem_ip[0]) modem_time_sync();
+      if(!modem_ati()) {
+        // nothing on the port: no modem, no point in asking on and on
+        if(++silent >= 2) probes = 8;
+      } else if(modem_ip[0]) {
+        modem_time_sync();
+      } else if(wifi_down && modem == MODEM_ZIMODEM && !nudged) {
+        // The modem's first join after power up fails now and then, and it
+        // waits a minute or more before it tries again. ATZ makes it join
+        // right away; once is enough, see modem_detect().
+        nudged = true;
+        net_puts("ATZ\r");
+      }
       int e0 = menu_variable_get('E');
       sys_set_val('E', (e0 < 0) ? 0 : e0);
       debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
@@ -1031,6 +1062,9 @@ static void net_task(__attribute__((unused)) void *parms) {
 
       // the ST expects its modem at 19200 again
       net_baud_slow();
+
+      // the clock, if the probes after power up did not get that far
+      if(!time_set && modem_ip[0]) modem_time_sync();
 
       int e = menu_variable_get('E');
       sys_set_val('E', (e < 0) ? 0 : e);
@@ -1061,7 +1095,7 @@ void netdl_set_wifi(const char *s) {
   wifi_cfg[sizeof(wifi_cfg)-1] = 0;
 }
 const char *netdl_get_wifi(void) { return wifi_cfg; }
-const char *netdl_get_ip(void) { return modem_ip; }
+const char *netdl_get_ip(void) { return time_busy ? "" : modem_ip; }
 void netdl_set_timezone(const char *s) {
   strncpy(tz_cfg, s, sizeof(tz_cfg)-1);
   tz_cfg[sizeof(tz_cfg)-1] = 0;
