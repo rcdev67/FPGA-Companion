@@ -59,12 +59,20 @@ the C3's.
 
        wifi=MyNetwork,MyPassword
        server=192.168.1.20:8888
+       timezone=CEST
 
    The companion hands the network to the modem the first time it finds
    it without one, and the modem keeps it from then on; no terminal
    program on the ST is needed. (It still works the old way, `atw"MyNetwork,MyPassword"`
    and `at&w` from a terminal program.) A password may contain spaces,
    the line is taken as it is up to its end.
+
+   `timezone` is optional: once the modem is online the companion takes
+   the time from it and sets the ST's clock, in that time zone (a Zimodem
+   code such as `CET`, `CEST`, `GMT`, `EST`; without the line it is UTC).
+   The modem knows no daylight saving rules, so in Germany it is `CET` in
+   winter and `CEST` in summer. TOS reads the clock when it starts, so the
+   right time shows after the next reset.
 
    The port must be free on the PC; 8000 is often taken by Windows itself.
 3. Make a folder on the PC for the files, say `C:\atari\share`, and start
