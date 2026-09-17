@@ -214,6 +214,7 @@ static void net_port_reset(void) {
 }
 
 static bool wifi_none = false;      // the modem has no network configured
+static char modem_ip[20];           // from the modem's "CONNECTED TO <ssid> (<ip>)"
 
 // Join the network named in the ini (wifi=Net,Password) and save it in
 // the modem, so nobody needs a terminal program on the ST for the setup.
@@ -260,7 +261,15 @@ static bool modem_ati(void) {
     if(strstr(line, "AT version") || strstr(line, "SDK version")) modem = MODEM_ESPAT;
     // Zimodem reports its WiFi as "CONNECTED TO <ssid> (<ip>)" or "ERROR ON <ssid>",
     // and "INITIALIZED" when it has no network at all
-    if(!strncmp(line, "ERROR ON", 8)) wifi_down = true;
+    if(!strncmp(line, "ERROR ON", 8)) { wifi_down = true; modem_ip[0] = 0; }
+    if(!strncmp(line, "CONNECTED TO", 12)) {
+      // keep the address in brackets for the OSD
+      char *a = strrchr(line, '('), *b = strrchr(line, ')');
+      if(a && b && b > a + 1 && (size_t)(b - a - 1) < sizeof(modem_ip)) {
+        memcpy(modem_ip, a + 1, b - a - 1);
+        modem_ip[b - a - 1] = 0;
+      }
+    }
     if(!strcmp(line, "INITIALIZED")) { wifi_down = true; wifi_none = true; }
     if(!strcmp(line, "OK")) return true;
     if(!strcmp(line, "ERROR")) return false;
@@ -894,9 +903,32 @@ static void download(int index) {
 
 static void net_task(__attribute__((unused)) void *parms) {
   debugf("NET: task running");
+
+  // Ask the modem for its address so the OSD can show it. It needs a while
+  // after power up to join its network, and a first join that fails is only
+  // repeated by the modem after up to a minute, so ask a few times. The
+  // user's Serial setting is put back after every attempt, and a request
+  // from the menu always comes first.
+  int probes = 0;
+  TickType_t next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(12000);
+
   while(1) {
+    if(!modem_ip[0] && probes < 8 && state != NET_STATE_BUSY &&
+       (int32_t)(xTaskGetTickCount() - next_probe) >= 0) {
+      probes++;
+      sys_set_val('E', 2);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      modem_ati();
+      int e0 = menu_variable_get('E');
+      sys_set_val('E', (e0 < 0) ? 0 : e0);
+      debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
+      next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(20000);
+    }
+
     int req;
-    if(xQueueReceive(req_queue, &req, 0xffffffffUL)) {
+    // wake up every second while the address is still unknown
+    TickType_t wait = (!modem_ip[0] && probes < 8) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
+    if(xQueueReceive(req_queue, &req, wait)) {
       // Port 1 only exists while the core routes the M0S connector to it
       // ("Serial: Netz"). Switch it on for the request regardless of the
       // menu, and put the user's setting back afterwards.
@@ -931,6 +963,7 @@ void netdl_set_wifi(const char *s) {
   wifi_cfg[sizeof(wifi_cfg)-1] = 0;
 }
 const char *netdl_get_wifi(void) { return wifi_cfg; }
+const char *netdl_get_ip(void) { return modem_ip; }
 
 void netdl_set_server(const char *s) {
   strncpy(server, s, sizeof(server)-1);

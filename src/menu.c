@@ -715,8 +715,26 @@ static void menu_draw(const config_menu_t *menu, int selected, int scroll) {
   // =============== draw a regular menu =================
   menu_debugf("drawing '%s'", menu->label);  
     
-  // draw the title
-  menu_draw_title(menu->label, !menu_is_root(menu), selected == 0);
+  // draw the title. The root menu tells which TOS is running and, with a
+  // modem on port 1, its network address
+  if(menu_is_root(menu)) {
+    char title[24];
+    unsigned short tos = sys_get_tos_version();
+    if(tos) snprintf(title, sizeof(title), "TOS %x.%02x", tos >> 8, tos & 0xff);
+    else    snprintf(title, sizeof(title), "%s", menu->label);
+    menu_draw_title(title, false, selected == 0);
+
+    const char *ip = netdl_get_ip();
+    if(ip[0]) {
+      u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
+      if(selected == 0) u8g2_SetDrawColor(&u8g2, 0);
+      int w = u8g2_GetStrWidth(&u8g2, ip);
+      u8g2_DrawStr(&u8g2, u8g2_GetDisplayWidth(&u8g2) - w - 1, MENU_ENTRY_BASE - 1, ip);
+      u8g2_SetDrawColor(&u8g2, 1);
+      u8g2_SetFont(&u8g2, font_helvR08_te);
+    }
+  } else
+    menu_draw_title(menu->label, true, selected == 0);
 
   config_menu_entry_t *entry = menu->entries;
   for(int i=0;i<scroll;i++) entry=entry->next;  // skip first "scroll" entries

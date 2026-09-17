@@ -46,6 +46,7 @@ extern struct sys_stats_S sys_stats;
 void sys_port_write(unsigned char, const unsigned char*, int);
 int  sys_port_read(unsigned char, unsigned char*, int);
 bool sys_port_status(unsigned char, unsigned char *rx_avail, unsigned char *tx_space);
+unsigned short sys_get_tos_version(void);   // 0x0104 for TOS 1.04, 0 if the core does not tell
 bool sys_port_get_status(unsigned char);
 
 #define SYS_TIME_FLAGS_NTP   (1<<0)

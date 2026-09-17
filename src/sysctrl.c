@@ -231,6 +231,20 @@ int sys_port_read(unsigned char port, unsigned char *buf, int max) {
   return avail;
 }
 
+// The core latches the version word of the TOS as the 68000 fetches it at
+// reset (bytes 2 and 3 of the ROM). Cores without this command answer with
+// whatever is on the bus, so only plausible BCD versions are passed on.
+unsigned short sys_get_tos_version(void) {
+  sys_begin(SPI_SYS_INFO);
+  mcu_hw_spi_tx_u08(0);
+  unsigned char hi = mcu_hw_spi_tx_u08(0);
+  unsigned char lo = mcu_hw_spi_tx_u08(0);
+  mcu_hw_spi_end();
+
+  if(hi < 1 || hi > 9 || (lo >> 4) > 9 || (lo & 15) > 9) return 0;
+  return (hi << 8) | lo;
+}
+
 // both fill levels of a port in one transaction, for diagnostics
 bool sys_port_status(unsigned char port, unsigned char *rx_avail, unsigned char *tx_space) {
   sys_port_begin(SPI_SYS_PORT_STATUS);

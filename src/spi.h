@@ -20,6 +20,7 @@
 #define SPI_SYS_READ_CFG  8
 #define SPI_SYS_JTAGSEL   9
 #define SPI_SYS_TIME     10
+#define SPI_SYS_INFO     32   // core information for the OSD, rcdev67 fork: TOS version word
 
 // port subcommands
 #define SPI_SYS_PORT_STATUS 0

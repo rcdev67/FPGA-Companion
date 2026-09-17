@@ -34,6 +34,7 @@ void netdl_set_server(const char *server);
 const char *netdl_get_server(void);
 void netdl_set_wifi(const char *net_and_password);   // "MyNet,MyPassword" from the ini
 const char *netdl_get_wifi(void);
+const char *netdl_get_ip(void);     // the modem's address as it last reported it, "" if unknown
 
 // requests from the menu, handled in the net task
 void netdl_request_list(void);
