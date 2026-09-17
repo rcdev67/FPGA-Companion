@@ -220,6 +220,8 @@ static bool joy_busy = false;
 static char tz_cfg[12];             // time zone code for the modem's clock, from the ini
 static bool time_set = false;       // the ST's clock has been set from the modem
 static bool time_busy = false;      // asking the modem for the time right now
+static int  clock_wait = 15;        // ini clockwait=: seconds the ST's start may wait for the clock
+static void (*hold_release)(void) = NULL;   // set while the ST's start is held back
 
 // Join the network named in the ini (wifi=Net,Password) and save it in
 // the modem, so nobody needs a terminal program on the ST for the setup.
@@ -266,22 +268,24 @@ static bool modem_time_sync(void) {
   return ok;
 }
 
-static bool modem_time_ask(void) {
+// Ask for the time. With check_zone the answer only counts if the modem
+// already tells it in my format and in the zone from the ini; *mine says
+// whether that was so.
+static bool modem_time_read(bool check_zone, bool *mine) {
   char line[NET_LINE_LEN];
-
-  snprintf(line, sizeof(line), "AT&T\"%s,%%yyyy-%%MM-%%dd %%HH:%%mm:%%ss,\"", tz_cfg);
-  if(!modem_cmd(line, NULL, 2000)) { net_log("clock: modem refused the time format"); return false; }
-
-  // Zimodem applies a new time zone only when the next NTP answer comes
-  // in, which it asks for right away. Asked too early it still tells UTC.
-  if(tz_cfg[0]) vTaskDelay(pdMS_TO_TICKS(5000));
+  *mine = false;
 
   net_flush();
   net_puts("AT&T\r");
   while(net_read_line(line, sizeof(line), 2000)) {
     int y, mo, d, h, mi, s;
-    if(sscanf(line, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
+    char zone[12] = "";
+    if(!strcmp(line, "OK") || !strcmp(line, "ERROR")) break;
+    int n = sscanf(line, "%d-%d-%d %d:%d:%d %11s", &y, &mo, &d, &h, &mi, &s, zone);
+    if(n >= 6) {
       debugf("NET: modem time '%s'", line);
+      if(check_zone && (n < 7 || strcasecmp(zone, tz_cfg[0] ? tz_cfg : "utc"))) return false;
+      *mine = true;
       if(y < 2024 || y > 2099) {                   // NTP has not answered yet
         net_log("clock: modem has no time yet");
         return false;
@@ -297,8 +301,30 @@ static bool modem_time_ask(void) {
       return true;
     }
   }
-  net_log("clock: no answer to AT&T");
   return false;
+}
+
+static bool modem_time_ask(void) {
+  char line[NET_LINE_LEN];
+  bool mine;
+
+  // The usual case: format and zone are stored in the modem from an earlier
+  // run, so the time is right as soon as its first NTP answer is in.
+  if(modem_time_read(true, &mine)) return true;
+  if(mine) return false;               // no NTP answer yet, the caller asks again
+
+  // First run with this modem, or a new zone in the ini: set format and
+  // zone and store them in the modem.
+  snprintf(line, sizeof(line), "AT&T\"%s,%%yyyy-%%MM-%%dd %%HH:%%mm:%%ss %%z,\"", tz_cfg);
+  if(!modem_cmd(line, NULL, 2000)) { net_log("clock: modem refused time zone or format"); return false; }
+  modem_cmd("AT&W", NULL, 3000);
+  net_log("clock: time zone and format stored in the modem");
+
+  // Zimodem applies a new time zone only when the next NTP answer comes
+  // in, which it asks for right away. Asked too early it still tells the
+  // old zone.
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  return modem_time_read(false, &mine);
 }
 
 static bool modem_ati(void) {
@@ -1017,37 +1043,78 @@ static void net_task(__attribute__((unused)) void *parms) {
   // repeated by the modem after up to a minute, so ask a few times. The
   // user's Serial setting is put back after every attempt, and a request
   // from the menu always comes first.
+  //
+  // TOS looks at its clock chip when it starts and when a program ends,
+  // never in between. For the right time without a reset by hand the ST's
+  // start is held back until the clock is set (see netdl_hold_start()), a
+  // few seconds as a rule and never longer than clockwait= in the ini says.
+  // While that lasts the probes come quickly.
+  #define NET_PROBES 12
   int probes = 0, silent = 0;
   bool nudged = false;
-  TickType_t next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(12000);
+  TickType_t t0 = xTaskGetTickCount();
+  TickType_t next_probe = t0 + pdMS_TO_TICKS(hold_release ? 1500 : 12000);
 
   while(1) {
-    if((!modem_ip[0] || !time_set) && probes < 8 && state != NET_STATE_BUSY &&
+    if(hold_release && (time_set || probes >= NET_PROBES ||
+       (xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(clock_wait * 1000))) {
+      char l[80];
+      snprintf(l, sizeof(l), "start: ST let go after %d s, clock %s",
+               (int)((xTaskGetTickCount() - t0) / pdMS_TO_TICKS(1000)),
+               time_set ? "set" : "NOT set in time");
+      net_log(l);
+      void (*release)(void) = hold_release;
+      hold_release = NULL;
+      release();
+    }
+
+    if((!modem_ip[0] || !time_set) && probes < NET_PROBES && state != NET_STATE_BUSY &&
        (int32_t)(xTaskGetTickCount() - next_probe) >= 0) {
       probes++;
       sys_set_val('E', 2);
       vTaskDelay(pdMS_TO_TICKS(50));
       if(!modem_ati()) {
-        // nothing on the port: no modem, no point in asking on and on
-        if(++silent >= 2) probes = 8;
+        // Nothing on the port. In its first seconds that is normal: a
+        // Zimodem does not answer while it joins its network. Later on it
+        // means no modem, and no point in asking on and on.
+        if((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(20000) && ++silent >= 2)
+          probes = NET_PROBES;
       } else if(modem_ip[0]) {
         modem_time_sync();
       } else if(wifi_down && modem == MODEM_ZIMODEM && !nudged) {
-        // The modem's first join after power up fails now and then, and it
-        // waits a minute or more before it tries again. ATZ makes it join
-        // right away; once is enough, see modem_detect().
+        // The modem answers and has no WiFi: its own join after power up
+        // has failed (it does not answer while it tries). Left alone it
+        // tries again after a minute or more. With a wifi= line in the ini
+        // join with that, which is the way that has proven to work; without
+        // one ATZ makes it try again right away. Once only, see
+        // modem_detect().
         nudged = true;
-        net_puts("ATZ\r");
+        if(wifi_cfg[0] && !wifi_tried) {
+          if(modem_join_from_ini() && modem_ati() && modem_ip[0]) modem_time_sync();
+        } else
+          net_puts("ATZ\r");
       }
       int e0 = menu_variable_get('E');
       sys_set_val('E', (e0 < 0) ? 0 : e0);
       debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
-      next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(20000);
+      {
+        // the start-up in NETLOG.TXT, for the day the clock stays wrong
+        char l[80];
+        snprintf(l, sizeof(l), "start: probe %d after %d s: %s%s", probes,
+                 (int)((xTaskGetTickCount() - t0) / pdMS_TO_TICKS(1000)),
+                 (modem == MODEM_UNKNOWN) ? "no answer" : modem_ip[0] ? modem_ip :
+                 wifi_down ? "modem has no WiFi yet" : "no address",
+                 time_set ? ", clock set" : "");
+        net_log(l);
+      }
+      next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(hold_release ? 2000 : 20000);
+      continue;
     }
 
     int req;
-    // wake up every second while the address is still unknown
-    TickType_t wait = ((!modem_ip[0] || !time_set) && probes < 8) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
+    // wake up now and then while the address is still unknown
+    TickType_t wait = hold_release ? pdMS_TO_TICKS(200) :
+      ((!modem_ip[0] || !time_set) && probes < NET_PROBES) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
     if(xQueueReceive(req_queue, &req, wait)) {
       // Port 1 only exists while the core routes the M0S connector to it
       // ("Serial: Netz"). Switch it on for the request regardless of the
@@ -1101,6 +1168,18 @@ void netdl_set_timezone(const char *s) {
   tz_cfg[sizeof(tz_cfg)-1] = 0;
 }
 const char *netdl_get_timezone(void) { return tz_cfg; }
+void netdl_set_clock_wait(int s) { clock_wait = (s < 0) ? 0 : (s > 60) ? 60 : s; }
+int netdl_get_clock_wait(void) { return clock_wait; }
+
+// Called before the core is let out of reset. With a modem set up in the
+// ini (wifi= or server=) the start is held back until the clock is set:
+// returns true and calls release() from the net task then, or when
+// clockwait= seconds are over. Without a modem nothing waits.
+bool netdl_hold_start(void (*release)(void)) {
+  if(clock_wait <= 0 || (!wifi_cfg[0] && !server[0])) return false;
+  hold_release = release;
+  return true;
+}
 
 void netdl_set_server(const char *s) {
   strncpy(server, s, sizeof(server)-1);

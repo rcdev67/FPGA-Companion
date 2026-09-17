@@ -138,6 +138,11 @@ int inifile_read(char *name) {
 	netdl_set_timezone(p);
       }
 
+      // how many seconds the ST's start may wait for the clock from the
+      // modem, 0 = do not wait, see net.c
+      if(strncasecmp(buffer, "clockwait=", 10) == 0)
+	netdl_set_clock_wait(atoi(buffer+10));
+
       // the WiFi the modem should join, "Net,Password" (a password may hold
       // spaces, so only the line end is trimmed), see net.c
       if(strncasecmp(buffer, "wifi=", 5) == 0) {
@@ -245,6 +250,14 @@ void inifile_write(char *name) {
       f_puts("timezone=", &file);
       f_puts(netdl_get_timezone(), &file);
       f_puts("\n", &file);
+    }
+
+    // the wait for the clock, kept if it is not the default
+    if(netdl_get_clock_wait() != 15) {
+      char str[48];
+      f_puts("\n; seconds the ST's start waits for the clock from the modem (0 = not at all)\n", &file);
+      sprintf(str, "clockwait=%d\n", netdl_get_clock_wait());
+      f_puts(str, &file);
     }
 
     // the modem's network, kept if one was set

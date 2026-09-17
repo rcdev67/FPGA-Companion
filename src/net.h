@@ -36,6 +36,9 @@ void netdl_set_wifi(const char *net_and_password);   // "MyNet,MyPassword" from 
 const char *netdl_get_wifi(void);
 void netdl_set_timezone(const char *tz);   // a Zimodem time zone code from the ini, "CET", "CEST", "UTC" ...
 const char *netdl_get_timezone(void);
+void netdl_set_clock_wait(int s);
+int netdl_get_clock_wait(void);
+bool netdl_hold_start(void (*release)(void));
 const char *netdl_get_ip(void);
 
 // the Bluetooth controller on the modem (Zimodem built with Bluepad32)

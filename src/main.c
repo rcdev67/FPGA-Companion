@@ -24,6 +24,14 @@
 
 TaskHandle_t com_task_handle = NULL;
 
+// Run the ready action. This will usually get the core out of reset.
+// On setups not using core configs, just release FPGA from reset
+// But this should actually never be the case nowadays.
+static void core_ready(void) {
+  if(!cfg) sys_set_val('R', 0);
+  else     sys_run_action_by_name("ready");
+}
+
 static void com_task(__attribute__((unused)) void *p ) {
   debugf("Starting main communication task");
   
@@ -90,9 +98,11 @@ static void com_task(__attribute__((unused)) void *p ) {
     // On setups not using core configs, just release FPGA from reset
     // But this should actually never be the case nowadays.
     // TODO: An image upload may still be in progress ...
+    // With a modem set up in the ini the net task does this a few seconds
+    // later, once the ST's clock has been set, see netdl_hold_start().
     if(!sdc_image_upload_in_progress()) {
-      if(!cfg) sys_set_val('R', 0);
-      else     sys_run_action_by_name("ready");
+      if(!netdl_hold_start(core_ready)) core_ready();
+      else debugf("Ready action waits for the clock from the modem");
     } else
       debugf("Image upload in progress, delaying ready action");
 
