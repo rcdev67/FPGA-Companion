@@ -266,6 +266,10 @@ def listing(path):
             names.add(name.lower())
             out.append(Entry(name, de.path, size=st.st_size))
 
+    # The menu is sorted by what it shows, not by what is on the disk:
+    # "'Nam 1965-1975 (1991).zip" is filed under N, where a player looks
+    # for it, not in front of everything else.
+    out.sort(key=lambda e: (not e.is_dir, e.name.lower()))
     return out
 
 
@@ -287,39 +291,73 @@ def listing_of(path, depth=8):
 
 # -------------------------------------------------------------- buckets ----
 
-_LABEL = re.compile(r"[^A-Za-z0-9]+")
+
+def _stem(name):
+    return name.rsplit(".", 1)[0] if "." in name else name
 
 
-def _tag(entry, n=5):
-    t = _LABEL.sub("", entry.name.rsplit(".", 1)[0])[:n]
-    return t or "_"
+def _key(name, depth):
+    """The drawer a name belongs in: its first letter, then its first two."""
+    return _stem(name)[:depth].upper()
 
 
-def buckets(entries):
-    """Split a long listing into at most MAX_ENTRIES lettered ranges.
+def _merge(groups, limit):
+    """Put neighbouring drawers together until they fit on one page.
 
-    The split is computed from the folder's contents alone, so the ranges
-    are the same on the request that shows them and on the request that
-    walks into one. Ranges that are still too long are split again when
-    they are entered, which is what makes a collection of thousands work
-    with a menu of thirty lines.
+    A collection has few games under X and many under S. Merging the small
+    drawers keeps the page short without tearing the big ones apart, and
+    what comes out reads like the spine of a card index: 1-9, A, B, C.
     """
-    n = len(entries)
-    # As few steps as possible, and every step about equally wide: with 30
-    # per page, 7000 games become 20 ranges of 19 ranges of 19 games, not
-    # 30 ranges of 2 ranges of 117.
-    depth = 1
-    while MAX_ENTRIES ** depth < n:
-        depth += 1
-    groups = min(MAX_ENTRIES, max(2, -(-int(round(n ** (1.0 / depth))) // 1)))
-    size = -(-n // groups)                    # ceil, so at most `groups` chunks
-    chunks = [entries[i:i + size] for i in range(0, n, size)]
+    total = sum(len(g) for _, g in groups)
+    target = max(1, -(-total // limit))
+    while True:
+        bins, cur, cur_n = [], [], 0
+        for key, g in groups:
+            if cur and cur_n + len(g) > target:
+                bins.append(cur)
+                cur, cur_n = [], 0
+            cur.append((key, g))
+            cur_n += len(g)
+        if cur:
+            bins.append(cur)
+        if len(bins) <= limit or target >= total:
+            return bins
+        target = int(target * 1.3) + 1
+
+
+def buckets(entries, depth=1):
+    """File a long listing into drawers by first letter.
+
+    Level one is the first letter, level two the first two, and so on as
+    deep as a collection needs. Everything is computed from the folder's
+    contents alone, so the drawers are the same on the request that shows
+    them and on the request that walks into one.
+    """
+    groups = []
+    for e in entries:
+        k = _key(e.name, depth)
+        if groups and groups[-1][0] == k:
+            groups[-1][1].append(e)
+        else:
+            groups.append((k, [e]))
+
+    # Names that are the same this far down: deeper drawers would all hold
+    # the same thing, so they are cut into equal pieces instead.
+    if len(groups) == 1 and len(entries) > MAX_ENTRIES and depth > 12:
+        size = -(-len(entries) // MAX_ENTRIES)
+        return [("%d" % (i // size + 1), entries[i:i + size])
+                for i in range(0, len(entries), size)]
 
     labels = set()
     out = []
-    for c in chunks:
-        a, b = _tag(c[0]), _tag(c[-1])
-        label = a if a == b else "%s-%s" % (a, b)
+    for b in _merge(groups, MAX_ENTRIES):
+        chunk = [e for _, g in b for e in g]
+        # the drawer's name in the spelling of the folder, "As", not "AS"
+        first = _stem(b[0][1][0].name)[:depth]
+        last = _stem(b[-1][1][-1].name)[:depth]
+        first = first[:1].upper() + first[1:]
+        last = last[:1].upper() + last[1:]
+        label = first if first.upper() == last.upper() else "%s-%s" % (first, last)
         if label.lower() in labels:
             for k in range(2, 100):
                 cand = "%s~%d" % (label, k)
@@ -327,7 +365,7 @@ def buckets(entries):
                     label = cand
                     break
         labels.add(label.lower())
-        out.append((label, c))
+        out.append((label, chunk))
     return out
 
 
@@ -335,53 +373,54 @@ def buckets(entries):
 
 
 class Resolved:
-    def __init__(self, kind, path=None, entries=None, entry=None, label=""):
+    def __init__(self, kind, path=None, entries=None, entry=None, depth=1):
         self.kind = kind            # "dir", "file" or None
         self.path = path
         self.entries = entries
         self.entry = entry
-        self.label = label
+        self.depth = depth          # how many drawers deep inside a folder
 
 
 def resolve(parts):
     """Walk a request path over folders, lettered ranges and names."""
     cur, entries = listing_of(ROOT)
-    label = ""
+    depth = 1
 
     for part in parts:
         if part in ("", ".", ".."):
             return Resolved(None)
 
-        # inside a range, not a folder of its own
+        # a drawer of this folder, not a folder of its own
         if len(entries) > MAX_ENTRIES:
             hit = None
-            for lab, chunk in buckets(entries):
+            for lab, chunk in buckets(entries, depth):
                 if lab.lower() == part.lower():
-                    hit = (lab, chunk)
+                    hit = chunk
                     break
-            if hit:
-                label, entries = hit[0], hit[1]
+            if hit is not None:
+                entries = hit
+                depth += 1
                 continue
 
         for e in entries:
             if e.name.lower() == part.lower():
                 if e.is_dir:
-                    label = ""
                     cur, entries = listing_of(e.real)
+                    depth = 1
                     break
                 return Resolved("file", entry=e)
         else:
             return Resolved(None)
 
-    return Resolved("dir", path=cur, entries=entries, label=label)
+    return Resolved("dir", path=cur, entries=entries, depth=depth)
 
 
-def page(url_path, entries, label, full):
+def page(url_path, entries, depth, full):
     """The listing. Kept small: the companion reads it into 4 KB."""
     shown = list(entries)
     ranges = []
     if len(shown) > MAX_ENTRIES:
-        ranges = buckets(shown)
+        ranges = buckets(shown, depth)
         shown = []
 
     title = html.escape(url_path or "/")
@@ -470,7 +509,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.close_connection = True
                 return
-            data = page("/".join(parts), r.entries, r.label, full)
+            data = page("/".join(parts), r.entries, r.depth, full)
             self.send_response(200, "OK")
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
