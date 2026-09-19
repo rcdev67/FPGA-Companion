@@ -14,7 +14,7 @@ services:
     restart: unless-stopped
 
     volumes:
-      - /volume1/atari:/games:ro          # <-- your collection
+      - /volume1/games/atari:/games:ro    # <-- your collection
       - ./stserve.py:/stserve.py:ro
 
     ports:
