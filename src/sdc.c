@@ -47,6 +47,7 @@ static DWORD *lktbl[MAX_DRIVES];
 
 // information about image data to be sent
 static uint32_t image_bytes2send[MAX_IMAGES];
+uint32_t sdc_sector_requests = 0;   // sectors the core has asked for
 
 static void sdc_spi_begin(void) {
   mcu_hw_spi_begin();  
@@ -618,6 +619,12 @@ int sdc_handle_event(void) {
   if(request) {
     int drive = 0;
     while(!(request & (1<<drive))) drive++;
+
+    // Counted for the OSD: the drive sound follows the running floppy
+    // command, so when a hum will not stop, the question is whether the ST
+    // keeps reading or whether nothing is happening at all. The number
+    // climbing or standing still answers it.
+    sdc_sector_requests++;
 
     if(!fil[drive].flag) {
       // no file selected

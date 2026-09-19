@@ -1666,8 +1666,11 @@ static void net_dialog_draw(void) {
         u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
         u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, a);
       }
+      // bytes over the port, and sectors the core's floppy has asked for
       snprintf(row, sizeof(row), "b%lu", sys_stats.net_bytes);
       u8g2_DrawStr(&u8g2, 100, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
+      snprintf(row, sizeof(row), "s%lu", (unsigned long)sdc_sector_requests);
+      u8g2_DrawStr(&u8g2, 100, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, row);
       u8g2_SetFont(&u8g2, font_helvR08_te);
     }
     return;

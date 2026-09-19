@@ -28,6 +28,7 @@ void sdc_set_cwd(int drive, char *path);
 void sdc_set_default(int drive, const char *name);
 void sdc_mount_defaults(void);
 bool sdc_image_upload_in_progress(void);
+extern uint32_t sdc_sector_requests;   // sectors the core has asked for
 bool sdc_check_for_pending_image_uploads(void);
 
 #endif // SDC_H
