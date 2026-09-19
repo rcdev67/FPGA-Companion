@@ -362,13 +362,27 @@ static bool modem_ati(void) {
   return false;
 }
 
+// Wait for the modem to be in its network, asking every two seconds.
+// A join takes a few seconds and the modem answers all the while, so
+// asking once and giving up turns a link that is about to come up into
+// "Modem has no WiFi" - and the next try a minute later works, which is
+// exactly the kind of thing that looks like bad luck.
+static bool modem_wait_wifi(int seconds) {
+  for(int i = 0; i < seconds; i += 2) {
+    if(!modem_ati()) return false;        // nothing on the port at all
+    if(!wifi_down) return true;           // in
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+  return modem_ati() && !wifi_down;
+}
+
 // find out what is on the other end of the wire
 static bool modem_detect(void) {
   bool ok = modem_ati();
 
   if(ok && wifi_down && modem == MODEM_ZIMODEM && wifi_cfg[0] && !wifi_tried) {
     if(modem_join_from_ini())
-      ok = modem_ati();
+      ok = modem_wait_wifi(12);
   }
 
   if(ok && wifi_down && modem == MODEM_ZIMODEM) {
@@ -379,9 +393,9 @@ static bool modem_detect(void) {
     net_set_message("Modem joining WiFi...");
     net_flush();
     net_puts("ATZ\r");
-    vTaskDelay(pdMS_TO_TICKS(25000));
-    ok = modem_ati();
-    if(wifi_down) { net_set_message("Modem has no WiFi"); return false; }
+    vTaskDelay(pdMS_TO_TICKS(15000));
+    ok = modem_wait_wifi(12);
+    if(!ok || wifi_down) { net_set_message("Modem has no WiFi"); return false; }
   }
 
   if(!ok) {
