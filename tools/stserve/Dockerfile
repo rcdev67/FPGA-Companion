@@ -16,8 +16,8 @@ ENV ST_ROOT=/games \
 EXPOSE 8888
 
 # The collection is only ever read, so there is no reason to be root.
-# Should the files on your NAS belong to someone else, set the container's
-# user to that one (see the README) or let the group read them.
+# Should this user not be allowed to read your files, run the container
+# with --user <id> instead, or take this line out.
 USER 1000:1000
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=5s \

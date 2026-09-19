@@ -34,15 +34,19 @@ The short way, no image to build:
 
 1. Copy `stserve.py` and `docker-compose.yml` into a folder on the NAS,
    for example `/volume1/docker/stserve` (File Station is enough).
-2. Open `docker-compose.yml` and change the one line marked `<-- your
-   collection` to the folder your disk images are in, for example
-   `/volume1/games/atari:/games:ro`. The part before the colon is yours,
+2. Put your disk images anywhere inside a shared folder — that is what
+   gives them a path like `/volume1/atari/...`, which is what a container
+   can be handed. Sharing that folder with Windows or anyone else is not
+   needed; stserve reads it straight off the disk.
+3. Open `docker-compose.yml` and change the one line marked `<-- your
+   collection` to that folder, for example
+   `/volume1/atari:/games:ro`. The part before the colon is yours,
    the rest stays as it is.
-3. **Container Manager → Project → Create**: give it the name `stserve`,
-   pick that folder as the path, it finds the `docker-compose.yml`
-   itself, then **Next → Done**. It pulls the Python image once and
-   starts.
-4. In `atarist.ini` on the ST's SD card:
+4. **Container Manager → Project → Create**: give it the name `stserve`,
+   pick the folder from step 1 as the path, it finds the
+   `docker-compose.yml` itself, then **Next → Done**. It pulls the Python
+   image once and starts.
+5. In `atarist.ini` on the ST's SD card:
 
        server=192.168.1.10:8888
 

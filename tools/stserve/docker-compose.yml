@@ -31,7 +31,10 @@ services:
 
     command: ["python3", "/stserve.py"]
 
-    # The container reads your files as this user. If the collection
-    # belongs to someone else on the NAS, put that user's id here (id -u
-    # over ssh), or let the group read the folder.
-    user: "1000:1000"
+    # Without this line the container reads your collection as root, which
+    # is what a container on a Synology does anyway and the only thing
+    # that always works: files there belong to whoever put them there.
+    # The mount above is read only, so root or not, nothing can change
+    # your collection. To run as someone else, put their id here (ssh to
+    # the NAS, "id -u"), and make sure that user may read the folder.
+    # user: "1026:100"
