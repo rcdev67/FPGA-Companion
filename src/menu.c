@@ -1639,9 +1639,13 @@ static void net_dialog_draw(void) {
     u8g2_DrawStr(&u8g2, 2, y, "Load file list");
     if(menu_state->selected == 1)
       u8g2_DrawButtonFrame(&u8g2, 0, y, U8G2_BTN_INV, width, 1, 1);
-    if(st == NET_STATE_IDLE)
-      u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H,
-		   netdl_get_server()[0] ? netdl_get_server() : "no server= in ini");
+    // Where we stand with the modem, so that waiting for it does not look
+    // like nothing happening: it needs a while after power up, and the
+    // address it shows here is the proof that the network is there.
+    if(!netdl_get_server()[0])
+      u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H, "no server= in ini");
+    else if(st == NET_STATE_IDLE)
+      u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H, netdl_link_text());
     else
       u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H, netdl_message());
 

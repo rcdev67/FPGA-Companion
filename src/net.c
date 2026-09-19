@@ -220,6 +220,15 @@ static char joy_status[40] = "not asked yet";   // the Bluetooth controller, as 
 static bool joy_busy = false;
 static char tz_cfg[12];             // time zone code for the modem's clock, from the ini
 static bool time_set = false;       // the ST's clock has been set from the modem
+// What the OSD tells about the line to the modem. Joining a network takes
+// the modem the better part of half a minute after power up, and without a
+// word about it the download menu looks broken for that while.
+#define LINK_ASKING   0             // nothing asked yet
+#define LINK_TRYING   1             // asking, or the modem is joining
+#define LINK_UP       2             // in its network, address known
+#define LINK_NO_WIFI  3             // answers, but is not in a network
+#define LINK_NONE     4             // nothing answers on the port
+static int link_state = LINK_ASKING;
 static bool time_busy = false;      // asking the modem for the time right now
 static int  clock_wait = 15;        // ini clockwait=: seconds the ST's start may wait for the clock
 static void (*hold_release)(void) = NULL;   // set while the ST's start is held back
@@ -368,6 +377,7 @@ static bool modem_ati(void) {
 // "Modem has no WiFi" - and the next try a minute later works, which is
 // exactly the kind of thing that looks like bad luck.
 static bool modem_wait_wifi(int seconds) {
+  link_state = LINK_TRYING;
   for(int i = 0; i < seconds; i += 2) {
     if(!modem_ati()) return false;        // nothing on the port at all
     if(!wifi_down) return true;           // in
@@ -395,7 +405,11 @@ static bool modem_detect(void) {
     net_puts("ATZ\r");
     vTaskDelay(pdMS_TO_TICKS(15000));
     ok = modem_wait_wifi(12);
-    if(!ok || wifi_down) { net_set_message("Modem has no WiFi"); return false; }
+    if(!ok || wifi_down) {
+      link_state = ok ? LINK_NO_WIFI : LINK_NONE;
+      net_set_message("Modem has no WiFi");
+      return false;
+    }
   }
 
   if(!ok) {
@@ -405,6 +419,9 @@ static bool modem_detect(void) {
     ok = modem_ati();
     net_snapshot(ok ? "answer after port reset" : "still no answer");
   }
+  if(modem_ip[0])   link_state = LINK_UP;
+  else if(!ok)      link_state = LINK_NONE;
+  else if(wifi_down) link_state = LINK_NO_WIFI;
 
   if(!ok) {
     // no answer: the modem may still sit in a stream from an earlier
@@ -1154,6 +1171,7 @@ static void net_task(__attribute__((unused)) void *parms) {
         // means no modem, and no point in asking on and on.
         if((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(20000) && ++silent >= 2)
           probes = NET_PROBES;
+        link_state = (probes >= NET_PROBES) ? LINK_NONE : LINK_TRYING;
       } else if(modem_ip[0]) {
         modem_time_sync();
       } else if(wifi_down && modem == MODEM_ZIMODEM && !nudged) {
@@ -1169,6 +1187,9 @@ static void net_task(__attribute__((unused)) void *parms) {
         } else
           net_puts("ATZ\r");
       }
+      if(modem_ip[0])                 link_state = LINK_UP;
+      else if(link_state != LINK_NONE)
+        link_state = (probes >= NET_PROBES) ? LINK_NO_WIFI : LINK_TRYING;
       int e0 = menu_variable_get('E');
       sys_set_val('E', (e0 < 0) ? 0 : e0);
       debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
@@ -1238,6 +1259,19 @@ void netdl_set_wifi(const char *s) {
 }
 const char *netdl_get_wifi(void) { return wifi_cfg; }
 const char *netdl_get_ip(void) { return time_busy ? "" : modem_ip; }
+
+// One line for the OSD: where we stand with the modem.
+const char *netdl_link_text(void) {
+  switch(link_state) {
+    case LINK_UP:      return modem_ip[0] ? modem_ip : "modem connected";
+    case LINK_TRYING:  return "modem connecting...";
+    // kept short: the OSD line is 128 pixels wide
+    case LINK_NO_WIFI: return wifi_none ? "modem has no network"
+                                        : "modem has no WiFi";
+    case LINK_NONE:    return "no modem on port 1";
+    default:           return "modem not asked yet";
+  }
+}
 void netdl_set_timezone(const char *s) {
   strncpy(tz_cfg, s, sizeof(tz_cfg)-1);
   tz_cfg[sizeof(tz_cfg)-1] = 0;
