@@ -1789,8 +1789,14 @@ static void net_dialog_update(void) {
   if(st == NET_STATE_DONE || st == NET_STATE_ERROR)
     menu_draw_dialog_for("Download", (char*)netdl_message(), pdMS_TO_TICKS(3000));
   else if(osd_is_visible() && !menu_dialog_is_open() && menu_state &&
-	  menu_state->type == MENU_TYPE_CUSTOM && menu_state->custom == &net_dialog)
+	  menu_state->type == MENU_TYPE_CUSTOM && menu_state->custom == &net_dialog) {
+    // a new folder is a new list: start at its first line
+    if(menu_state->selected > net_dialog_length()) {
+      menu_state->selected = 1;
+      menu_state->scroll = 0;
+    }
     menu_do(MENU_EVENT_NONE);
+  }
 }
 
 // third entry in main system menu

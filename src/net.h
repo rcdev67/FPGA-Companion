@@ -16,6 +16,7 @@
 #define NET_NAME_LEN      48      // the name as shown and as written to the card
 #define NET_HREF_LEN      96      // the name as the server wants it in the URL
 #define NET_SERVER_LEN    64
+#define NET_PATH_LEN      128     // the folder the list is showing
 
 // states shown by the OSD
 #define NET_STATE_IDLE     0   // nothing done yet, no list

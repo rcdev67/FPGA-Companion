@@ -1,0 +1,37 @@
+# stserve on a Synology NAS, without building an image.
+#
+# Put this file and stserve.py into one folder on the NAS, for example
+# /volume1/docker/stserve, then in Container Manager: Project -> Create,
+# pick that folder, "Use an existing docker-compose.yml", start.
+#
+# Change the one line under volumes: to the folder your disk images are
+# in. It is mounted read only; stserve never writes to your collection.
+
+services:
+  stserve:
+    image: python:3.12-alpine
+    container_name: stserve
+    restart: unless-stopped
+
+    volumes:
+      - /volume1/atari:/games:ro          # <-- your collection
+      - ./stserve.py:/stserve.py:ro
+
+    ports:
+      - "8888:8888"                       # server=<nas-ip>:8888 in atarist.ini
+
+    environment:
+      ST_ROOT: /games
+      ST_PORT: "8888"
+      # Entries per menu page. The companion shows at most 32.
+      ST_MAX_ENTRIES: "30"
+      # Hide what the core cannot read anyway, e.g. the Pasti folders of a
+      # TOSEC collection:
+      # ST_HIDE: "*[STX]*,*[IPF]*"
+
+    command: ["python3", "/stserve.py"]
+
+    # The container reads your files as this user. If the collection
+    # belongs to someone else on the NAS, put that user's id here (id -u
+    # over ssh), or let the group read the folder.
+    user: "1000:1000"

@@ -58,6 +58,7 @@ static char server[NET_SERVER_LEN] = "";
 static int state = NET_STATE_IDLE;
 static char message[48] = "";
 static char names[NET_MAX_ENTRIES][NET_NAME_LEN];   // shown, and the name on the card
+static char cwd[NET_PATH_LEN];                      // the folder shown, "" at the top
 static char hrefs[NET_MAX_ENTRIES][NET_HREF_LEN];   // as the server wants it in the URL
 static int name_count = 0;
 static uint32_t bytes_done = 0, bytes_total = 0;
@@ -480,10 +481,24 @@ static void modem_hangup(void) {
 // -------------------------------------------------------------- HTTP ----
 
 // split "host:port" from the ini, port defaults to 80
-static bool net_server_parse(char *host, int max, int *port) {
+// "192.168.1.2:8888" or "192.168.1.2:8888/games" - the folder is where
+// every list starts, so a server holding more than the ST's share can be
+// used as well
+static bool net_server_parse(char *host, int max, int *port, char *base, int bmax) {
   if(!server[0]) { net_set_message("No server in ini file"); return false; }
   strncpy(host, server, max-1);
   host[max-1] = '\0';
+  base[0] = '\0';
+
+  char *s = strchr(host, '/');
+  if(s) {
+    *s++ = '\0';
+    if(*s) {
+      int n = snprintf(base, bmax, "%s", s);
+      if(n > 0 && n < bmax - 1 && base[n-1] != '/') { base[n] = '/'; base[n+1] = '\0'; }
+    }
+  }
+
   *port = 80;
   char *c = strchr(host, ':');
   if(c) { *c = '\0'; *port = atoi(c+1); }
@@ -669,8 +684,11 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
   char host[NET_SERVER_LEN];
   int port;
   char line[NET_LINE_LEN];
+  char base[NET_PATH_LEN], full[NET_PATH_LEN + NET_HREF_LEN];
 
-  if(!net_server_parse(host, sizeof(host), &port)) return false;
+  if(!net_server_parse(host, sizeof(host), &port, base, sizeof(base))) return false;
+  snprintf(full, sizeof(full), "%s%s", base, path);
+  path = full;
 
   if(!modem_detect()) return false;
 
@@ -817,14 +835,23 @@ static void url_decode(const char *in, char *out, int max) {
   out[o] = '\0';
 }
 
+// One link of the listing. Folders keep their slash and are shown with
+// it, so the list tells them apart at a glance and download() knows what
+// to do with them; ".." is the way back up.
 static void add_entry(const char *href) {
   if(name_count >= NET_MAX_ENTRIES) return;
   int hl = strlen(href);
   if(hl == 0 || hl >= NET_HREF_LEN) return;
-  if(href[hl-1] == '/') return;                 // a directory
-  if(strchr(href, '/') || strchr(href, '?')) return;   // links elsewhere
+  if(strchr(href, '?')) return;                 // a view for browsers
+
+  bool dir = (href[hl-1] == '/');
+  bool up = !strcmp(href, "../");
+  // a slash anywhere but at the end leads out of this folder
+  if(!up && strchr(href, '/') != (dir ? href + hl - 1 : NULL)) return;
+  if(up && !cwd[0]) return;                     // already at the top
+
   char name[NET_NAME_LEN];
-  url_decode(href, name, sizeof(name));
+  url_decode(up ? ".." : href, name, sizeof(name));
   if(!name[0]) return;
   strcpy(hrefs[name_count], href);
   strcpy(names[name_count], name);
@@ -838,7 +865,7 @@ static void fetch_list(void) {
   net_set_message("Fetching list...");
 
   // the folder itself; python's http.server answers with a listing
-  if(!http_get("", index_sink)) {
+  if(!http_get(cwd, index_sink)) {
     state = NET_STATE_ERROR;
     char line[80];
     snprintf(line, sizeof(line), "FAIL list: %s", message);
@@ -918,9 +945,34 @@ static bool file_sink(const unsigned char *data, int len) {
   return true;
 }
 
+// Up one level: cut the last part off the path.
+static void cwd_up(void) {
+  int n = strlen(cwd);
+  if(n) n--;                                    // the trailing slash
+  while(n > 0 && cwd[n-1] != '/') n--;
+  cwd[n] = '\0';
+}
+
 static void download(int index) {
   if(index < 0 || index >= name_count) return;
   const char *name = names[index];
+
+  // a folder: show what is in it, and go back to where we were if that
+  // folder cannot be read
+  int nl = strlen(name);
+  if(!strcmp(name, "..") || (nl && name[nl-1] == '/')) {
+    char was[NET_PATH_LEN];
+    strcpy(was, cwd);
+    if(!strcmp(name, ".."))
+      cwd_up();
+    else if(strlen(cwd) + strlen(hrefs[index]) < sizeof(cwd))
+      strcat(cwd, hrefs[index]);
+    else
+      { net_set_message("Folder path too long"); return; }
+    fetch_list();
+    if(state == NET_STATE_ERROR) strcpy(cwd, was);
+    return;
+  }
 
   state = NET_STATE_BUSY;
   bytes_done = bytes_total = 0;
@@ -947,7 +999,9 @@ static void download(int index) {
   }
   dl_open = true;
 
-  bool ok = http_get(hrefs[index], file_sink);   // the URL form, spaces and all encoded
+  char url[NET_PATH_LEN + NET_HREF_LEN];
+  snprintf(url, sizeof(url), "%s%s", cwd, hrefs[index]);
+  bool ok = http_get(url, file_sink);            // the URL form, spaces and all encoded
 
   sdc_lock();
   FRESULT cr = f_close(&dl_file);

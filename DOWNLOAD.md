@@ -99,12 +99,22 @@ the C3's.
    If you would rather hand out a fixed list, serve a plain text file
    instead of the listing: one file name per line, `;` starts a comment.
 
+   For a whole collection there is [stserve](tools/stserve/) in this
+   fork: a small server for a NAS or the PC that opens ZIP archives while
+   the file is fetched, shortens the names to what fits on the card, and
+   splits thousands of games into menus of thirty. It needs nothing but
+   Python and runs as a container on a Synology.
+
 ## Using it
 
 1. Open the companion menu with Shift+F12 and choose `Download...`.
 2. `Load file list` fetches the folder listing and shows the names.
 3. Pick a file. A bar shows the progress, the end says how many bytes
    arrived. The file lands in the root of the card.
+
+   Names that end in a slash are folders: picking one shows what is in
+   it, `..` goes back up. A folder in the `server=` line works as well,
+   `server=192.168.1.10:8888/atari/games` starts the list there.
 4. F12, `Disk A:`, pick the new image. Games usually want a cold start:
    set `Video: Color` if needed and use the reset entry, TOS reads the
    monitor type only at boot.
