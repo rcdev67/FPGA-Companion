@@ -589,9 +589,14 @@ static bool xmodem_get(const char *host, int port, const char *path, bool (*sink
 
   // the modem fetches the whole resource first, that takes a while
   net_set_message("Modem fetching...");
-  snprintf(line, sizeof(line), "AT&G\"xmodem:http://%s:%d/%s\"", host, port, path);   // AT&G is the web get; quoted, unquoted text ends at the first letter
+  // Room for a path a few folders deep. Zimodem takes 256 characters per
+  // command; a longer one would be cut in the middle of the address and
+  // fetch something else, so say so instead.
+  char cmd[256];
+  int n = snprintf(cmd, sizeof(cmd), "AT&G\"xmodem:http://%s:%d/%s\"", host, port, path);   // AT&G is the web get; quoted, unquoted text ends at the first letter
+  if(n < 0 || n >= (int)sizeof(cmd)) { net_set_message("Path too long for the modem"); return false; }
   net_flush();
-  net_puts(line);
+  net_puts(cmd);
   net_puts("\r");
 
   bytes_total = 0;
@@ -713,8 +718,10 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
 
   // the request. HTTP/1.0 and Connection: close keep it simple: no
   // chunked encoding, and the server closes when it is done
-  snprintf(line, sizeof(line), "GET /%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
-  net_puts(line);
+  char req[256];
+  int rn = snprintf(req, sizeof(req), "GET /%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+  if(rn < 0 || rn >= (int)sizeof(req)) { net_set_message("Path too long"); return false; }
+  net_puts(req);
 
   // The reply head: the status line and the header lines, each ending in
   // CR LF, closed by an empty line. Read it byte by byte here, every byte
