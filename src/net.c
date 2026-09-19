@@ -1130,25 +1130,36 @@ done:
 static void net_task(__attribute__((unused)) void *parms) {
   debugf("NET: task running");
 
-  // Ask the modem for its address so the OSD can show it. It needs a while
-  // after power up to join its network, and a first join that fails is only
-  // repeated by the modem after up to a minute, so ask a few times. The
-  // user's Serial setting is put back after every attempt, and a request
-  // from the menu always comes first.
+  // Ask the modem for its address so the OSD can show it, and get it into
+  // its network if it is not.
+  //
+  // A Zimodem does not retry a join of its own accord: when the one it
+  // makes at power up fails, it reports "ERROR ON <ssid>" and sets its
+  // retry delay to zero, so it stays out of the network until something
+  // tells it otherwise. Its first join does fail now and then. So this
+  // keeps asking as long as the modem answers without being in a network,
+  // and every so often offers it the network from the ini or resets it,
+  // which brings it in within seconds. Only a port where nothing answers
+  // at all is given up on.
+  //
+  // The user's Serial setting is put back after every attempt, and a
+  // request from the menu always comes first.
   //
   // TOS looks at its clock chip when it starts and when a program ends,
   // never in between. For the right time without a reset by hand the ST's
   // start is held back until the clock is set (see netdl_hold_start()), a
   // few seconds as a rule and never longer than clockwait= in the ini says.
   // While that lasts the probes come quickly.
-  #define NET_PROBES 12
+  #define NET_PROBES 12            // silent ones before there is no modem
+  #define NET_NUDGE_MS 45000       // between two attempts to get it in
   int probes = 0, silent = 0;
   bool nudged = false;
+  TickType_t last_nudge = 0;
   TickType_t t0 = xTaskGetTickCount();
   TickType_t next_probe = t0 + pdMS_TO_TICKS(hold_release ? 1500 : 12000);
 
   while(1) {
-    if(hold_release && (time_set || probes >= NET_PROBES ||
+    if(hold_release && (time_set || link_state == LINK_NONE ||
        (xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(clock_wait * 1000))) {
       char l[80];
       snprintf(l, sizeof(l), "start: ST let go after %d s, clock %s",
@@ -1160,7 +1171,7 @@ static void net_task(__attribute__((unused)) void *parms) {
       release();
     }
 
-    if((!modem_ip[0] || !time_set) && probes < NET_PROBES && state != NET_STATE_BUSY &&
+    if((!modem_ip[0] || !time_set) && link_state != LINK_NONE && state != NET_STATE_BUSY &&
        (int32_t)(xTaskGetTickCount() - next_probe) >= 0) {
       probes++;
       sys_set_val('E', 2);
@@ -1169,27 +1180,34 @@ static void net_task(__attribute__((unused)) void *parms) {
         // Nothing on the port. In its first seconds that is normal: a
         // Zimodem does not answer while it joins its network. Later on it
         // means no modem, and no point in asking on and on.
-        if((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(20000) && ++silent >= 2)
-          probes = NET_PROBES;
-        link_state = (probes >= NET_PROBES) ? LINK_NONE : LINK_TRYING;
+        if((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(20000) && ++silent >= NET_PROBES)
+          link_state = LINK_NONE;
+        else
+          link_state = LINK_TRYING;
       } else if(modem_ip[0]) {
+        silent = 0;
         modem_time_sync();
-      } else if(wifi_down && modem == MODEM_ZIMODEM && !nudged) {
-        // The modem answers and has no WiFi: its own join after power up
-        // has failed (it does not answer while it tries). Left alone it
-        // tries again after a minute or more. With a wifi= line in the ini
-        // join with that, which is the way that has proven to work; without
-        // one ATZ makes it try again right away. Once only, see
-        // modem_detect().
-        nudged = true;
-        if(wifi_cfg[0] && !wifi_tried) {
+      } else if(wifi_down && modem == MODEM_ZIMODEM &&
+                (!nudged || (xTaskGetTickCount() - last_nudge) >= pdMS_TO_TICKS(NET_NUDGE_MS))) {
+        // The modem answers and is not in a network: its own join has
+        // failed, and it will not try again by itself. The first attempt
+        // offers it the network from the ini, which also stores it; later
+        // ones reset it, which was measured to bring it in within a few
+        // seconds. Never faster than NET_NUDGE_MS, or a join in progress
+        // would be cut short and the link would only flap.
+        silent = 0;
+        last_nudge = xTaskGetTickCount();
+        if(!nudged && wifi_cfg[0] && !wifi_tried) {
           if(modem_join_from_ini() && modem_ati() && modem_ip[0]) modem_time_sync();
-        } else
+        } else {
+          net_log("modem is not in its network: resetting it");
           net_puts("ATZ\r");
-      }
-      if(modem_ip[0])                 link_state = LINK_UP;
-      else if(link_state != LINK_NONE)
-        link_state = (probes >= NET_PROBES) ? LINK_NO_WIFI : LINK_TRYING;
+        }
+        nudged = true;
+      } else
+        silent = 0;
+      if(modem_ip[0])                  link_state = LINK_UP;
+      else if(link_state != LINK_NONE) link_state = wifi_down ? LINK_NO_WIFI : LINK_TRYING;
       int e0 = menu_variable_get('E');
       sys_set_val('E', (e0 < 0) ? 0 : e0);
       debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
@@ -1203,14 +1221,16 @@ static void net_task(__attribute__((unused)) void *parms) {
                  time_set ? ", clock set" : "");
         net_log(l);
       }
-      next_probe = xTaskGetTickCount() + pdMS_TO_TICKS(hold_release ? 2000 : 20000);
+      next_probe = xTaskGetTickCount() +
+        pdMS_TO_TICKS(hold_release ? 2000 :
+                      ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(180000)) ? 15000 : 60000);
       continue;
     }
 
     int req;
     // wake up now and then while the address is still unknown
     TickType_t wait = hold_release ? pdMS_TO_TICKS(200) :
-      ((!modem_ip[0] || !time_set) && probes < NET_PROBES) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
+      ((!modem_ip[0] || !time_set) && link_state != LINK_NONE) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
     if(xQueueReceive(req_queue, &req, wait)) {
       // Port 1 only exists while the core routes the M0S connector to it
       // ("Serial: Netz"). Switch it on for the request regardless of the
