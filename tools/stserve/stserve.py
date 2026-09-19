@@ -242,6 +242,10 @@ def listing(path):
             continue
         try:
             st = de.stat()
+            # A link may point anywhere; only what is really below the
+            # served folder is served.
+            if de.is_symlink() and not os.path.realpath(de.path).startswith(ROOT):
+                continue
         except OSError:
             continue
 
@@ -460,6 +464,10 @@ def page(url_path, entries, depth, full):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "stserve/1.0"
+    # A modem that opens a connection and then says nothing, because the ST
+    # was switched off in the middle of a transfer, must not hold a thread
+    # for the rest of the day.
+    timeout = 60
 
     def log_message(self, fmt, *args):
         if not QUIET:
@@ -556,9 +564,8 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    # The modem opens a connection per file and drops it when the ST
-    # cancels; a half open one must not keep a thread for good.
-    timeout = 30
+    # The NAS may hand out the port again right after a restart.
+    allow_reuse_address = True
 
 
 USAGE = """stserve - serve a collection of Atari ST disk images
