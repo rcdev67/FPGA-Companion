@@ -107,6 +107,18 @@ def short_name(filename, ext):
     room = NAME_LEN - len(suffix) - len(ext) - 1
     if room < 4:
         room = 4
+
+    # A number at the end is often the only thing telling two entries
+    # apart - "Pompey Pirates Menu Disk 12" and "... 13". Cutting the name
+    # to length would cut exactly that off and leave a folder full of the
+    # same name, so the number is kept and the title gives way.
+    if len(title) > room:
+        m = re.search(r"(\d{1,4})$", title)
+        if m:
+            suffix = "_" + m.group(1) + suffix
+            title = title[:m.start()].rstrip("_-")
+            room = max(4, NAME_LEN - len(suffix) - len(ext) - 1)
+
     return title[:room].rstrip("_") + suffix + "." + ext.upper()
 
 
@@ -296,6 +308,16 @@ def listing_of(path, depth=8):
 # -------------------------------------------------------------- buckets ----
 
 
+# How many letters a drawer's name may grow to before the listing is cut
+# into numbered pieces instead. It keeps the address the modem is given
+# within its 256 characters, whatever a collection is named.
+DRAWER_LEN = 16
+# How many drawers a level should offer before it is worth a menu of its
+# own. Below that the next letter is taken as well, so that a folder full
+# of "Delicious Disk ..." does not become one menu per letter.
+DRAWER_MIN = 8
+
+
 def _stem(name):
     return name.rsplit(".", 1)[0] if "." in name else name
 
@@ -337,6 +359,23 @@ def buckets(entries, depth=1):
     contents alone, so the drawers are the same on the request that shows
     them and on the request that walks into one.
     """
+    # A drawer is only worth a menu if it tells the entries apart. Where a
+    # whole folder is called "Floppyshop ...", F, Fl, Flo, Flop and so on
+    # would be fourteen menus with one choice each, so the first letters
+    # they all share are taken in one step.
+    limit = max((len(_stem(e.name)) for e in entries), default=1)
+    while depth < limit and depth <= DRAWER_LEN:
+        keys = {}
+        for e in entries:
+            k = _key(e.name, depth)
+            keys[k] = keys.get(k, 0) + 1
+        # Enough to choose from, or every drawer already fits a page:
+        # that is the level to show. Otherwise one letter further, which
+        # is what turns D / De / Del / Deli into one step.
+        if len(keys) >= DRAWER_MIN or max(keys.values()) <= MAX_ENTRIES:
+            break
+        depth += 1
+
     groups = []
     for e in entries:
         k = _key(e.name, depth)
@@ -345,14 +384,36 @@ def buckets(entries, depth=1):
         else:
             groups.append((k, [e]))
 
-    # Names that are the same this far down: deeper drawers would all hold
-    # the same thing, so they are cut into equal pieces instead.
-    if len(groups) == 1 and len(entries) > MAX_ENTRIES and depth > 12:
-        size = -(-len(entries) // MAX_ENTRIES)
-        return [("%d" % (i // size + 1), entries[i:i + size])
-                for i in range(0, len(entries), size)]
-
+    # Names that are the same all the way down, or that only differ past
+    # what a drawer may be called: equal pieces. A drawer is named after
+    # the part where its entries finally differ, which for the numbered
+    # series this happens to is exactly their number.
     labels = set()
+
+    def named(label, fallback, chunk):
+        """Every drawer of a page needs its own name to be reachable."""
+        label = label or fallback
+        if label.lower() in labels:
+            for k in range(2, 1000):
+                cand = "%s~%d" % (label, k)
+                if cand.lower() not in labels:
+                    label = cand
+                    break
+        labels.add(label.lower())
+        return (label, chunk)
+
+    if len(groups) == 1 or depth > DRAWER_LEN:
+        same = len(os.path.commonprefix([_stem(e.name) for e in entries]))
+        size = -(-len(entries) // MAX_ENTRIES)
+        out = []
+        for i in range(0, len(entries), size):
+            chunk = entries[i:i + size]
+            a = _stem(chunk[0].name)[same:same + 6].strip("_-")
+            b = _stem(chunk[-1].name)[same:same + 6].strip("_-")
+            out.append(named(a if a == b else "%s-%s" % (a, b),
+                             "%d" % (i // size + 1), chunk))
+        return out
+
     out = []
     for b in _merge(groups, MAX_ENTRIES):
         chunk = [e for _, g in b for e in g]
@@ -361,15 +422,8 @@ def buckets(entries, depth=1):
         last = _stem(b[-1][1][-1].name)[:depth]
         first = first[:1].upper() + first[1:]
         last = last[:1].upper() + last[1:]
-        label = first if first.upper() == last.upper() else "%s-%s" % (first, last)
-        if label.lower() in labels:
-            for k in range(2, 100):
-                cand = "%s~%d" % (label, k)
-                if cand.lower() not in labels:
-                    label = cand
-                    break
-        labels.add(label.lower())
-        out.append((label, chunk))
+        out.append(named(first if first.upper() == last.upper()
+                         else "%s-%s" % (first, last), "?", chunk))
     return out
 
 
