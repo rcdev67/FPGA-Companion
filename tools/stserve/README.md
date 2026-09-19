@@ -64,9 +64,13 @@ page shows which file of your collection is behind each name.
     docker run -d --name stserve -p 8888:8888 -v /volume1/atari:/games:ro stserve
 
 **Or no Docker at all** — on the NAS, a Raspberry Pi or the PC that has
-the collection:
+the collection. The folder comes first, the port second:
 
-    ST_ROOT="D:\atari" python3 stserve.py
+    python3 stserve.py "D:\atari" 8889
+
+That works the same in PowerShell, in a command prompt and in a shell.
+Ctrl+C stops it. `ST_ROOT` and `ST_PORT` do the same thing for the
+container, where there is no command line to put them on.
 
 ## Settings
 
@@ -113,7 +117,7 @@ All of them are optional; the defaults are what the companion can handle.
 companion does, fetches it and compares it byte for byte with what is
 inside the archive:
 
-    ST_ROOT="D:\atari" python3 selftest.py
+    python3 selftest.py "D:\atari"
 
 It also checks the two limits the companion cannot exceed: at most 32
 entries and under 4 KB per page.

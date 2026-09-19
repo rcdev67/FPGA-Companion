@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check stserve against a real collection, without an ST in the room.
 
-    ST_ROOT="/volume1/atari" python3 selftest.py
+    python3 selftest.py [folder]
 
 It starts the server on a free port, walks into the collection the way
 the companion does, downloads one image and compares it byte for byte
@@ -19,6 +19,8 @@ import urllib.request
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if len(sys.argv) > 1:
+    os.environ["ST_ROOT"] = sys.argv[1]
 import stserve                                              # noqa: E402
 
 HREF = re.compile(r'href="([^"]*)"')

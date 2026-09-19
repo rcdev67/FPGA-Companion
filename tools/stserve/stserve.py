@@ -522,18 +522,51 @@ class Server(ThreadingHTTPServer):
     timeout = 30
 
 
-def main():
+USAGE = """stserve - serve a collection of Atari ST disk images
+
+    stserve.py [folder] [port]
+
+The folder holds the images, the port defaults to 8888. Both can come
+from ST_ROOT and ST_PORT instead, which is what the container does; the
+arguments win. Every setting is in the README.
+"""
+
+
+def main(argv):
+    global ROOT, PORT
+
+    if "-h" in argv or "--help" in argv or "/?" in argv:
+        sys.stdout.write(USAGE)
+        return 0
+
+    args = [a for a in argv[1:] if not a.startswith("-")]
+    if args:
+        ROOT = os.path.realpath(args[0])
+    if len(args) > 1:
+        try:
+            PORT = int(args[1])
+        except ValueError:
+            sys.stderr.write("stserve: '%s' is not a port number\n" % args[1])
+            return 1
+
     if not os.path.isdir(ROOT):
-        sys.stderr.write("stserve: %s is not a folder (set ST_ROOT)\n" % ROOT)
+        sys.stderr.write("stserve: '%s' is not a folder\n\n%s" % (ROOT, USAGE))
         return 1
+
     n = len(listing_of(ROOT)[1])
     sys.stdout.write(
         "stserve on port %d, serving %s (%d entries at the top, %d per page)\n"
         % (PORT, ROOT, n, MAX_ENTRIES))
     sys.stdout.flush()
-    Server(("", PORT), Handler).serve_forever()
+    try:
+        Server(("", PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        sys.stdout.write("stserve stopped\n")
+    except OSError as e:
+        sys.stderr.write("stserve: cannot listen on port %d: %s\n" % (PORT, e))
+        return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))
