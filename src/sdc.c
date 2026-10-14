@@ -625,6 +625,9 @@ int sdc_handle_event(void) {
     // keeps reading or whether nothing is happening at all. The number
     // climbing or standing still answers it.
     sdc_sector_requests++;
+    if((sdc_sector_requests & 63) == 0)
+      sdc_debugf("%lu sectors at tick %lu", (unsigned long)sdc_sector_requests,
+                 (unsigned long)xTaskGetTickCount());
 
     if(!fil[drive].flag) {
       // no file selected

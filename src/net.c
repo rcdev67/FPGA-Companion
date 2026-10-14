@@ -1206,7 +1206,16 @@ static void net_task(__attribute__((unused)) void *parms) {
         nudged = true;
       } else
         silent = 0;
-      if(modem_ip[0])                  link_state = LINK_UP;
+      if(modem_ip[0]) {
+        link_state = LINK_UP;
+        // A request that failed while the modem was out of its network is
+        // history once it is back. Without this the menu keeps showing
+        // "Modem has no WiFi" for good, because the state of a request is
+        // only ever left by the next one - and the line is there to say
+        // what is true now.
+        if(state == NET_STATE_ERROR)
+          state = name_count ? NET_STATE_LIST : NET_STATE_IDLE;
+      }
       else if(link_state != LINK_NONE) link_state = wifi_down ? LINK_NO_WIFI : LINK_TRYING;
       int e0 = menu_variable_get('E');
       sys_set_val('E', (e0 < 0) ? 0 : e0);

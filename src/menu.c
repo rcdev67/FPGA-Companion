@@ -1657,11 +1657,13 @@ static void net_dialog_draw(void) {
       char row[25];
       const char *a = (len > 48) ? t + len - 48 : t;
       int alen = strlen(a);
-      if(alen > 24) {
-        snprintf(row, sizeof(row), "%.24s", a);
+      // 18 characters of 5 pixels, so the counts to the right stay readable
+      if(alen > 18) {
+        snprintf(row, sizeof(row), "%.18s", a);
         u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
         u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
-        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, a + 24);
+        snprintf(row, sizeof(row), "%.18s", a + 18);
+        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, row);
       } else {
         u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
         u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, a);
@@ -1674,6 +1676,16 @@ static void net_dialog_draw(void) {
       u8g2_SetFont(&u8g2, font_helvR08_te);
     }
     return;
+  }
+
+  // the sectors the ST's floppy has read, for chasing a drive sound that
+  // will not stop: it is here with a list loaded as well, top right corner.
+  {
+    char row[12];
+    snprintf(row, sizeof(row), "s%lu", (unsigned long)sdc_sector_requests);
+    u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
+    u8g2_DrawStr(&u8g2, width - 5*strlen(row) - 2, MENU_LINE_Y - 2, row);
+    u8g2_SetFont(&u8g2, font_helvR08_te);
   }
 
   // the list, four lines, scrolled like a menu
