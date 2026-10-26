@@ -13,6 +13,14 @@
 #include "net.h"      // the download server line
 #include "debug.h"
 
+#ifdef ESP_PLATFORM
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#else
+#include <FreeRTOS.h>
+#include <task.h>
+#endif
+
 static int iswhite(char c) {
   return c == ' ' || c == '\r' || c == '\n' || c == '\t';
 }
@@ -204,10 +212,11 @@ int inifile_read(char *name) {
   return 0;
 }
 
-void inifile_write(char *name) {
+// returns 0 when the file was written, -1 otherwise, so the OSD can report it
+int inifile_write(char *name) {
   if(!name) {
     ini_debugf("Unable to write core specific setting as no core has been identified");
-    return;
+    return -1;
   }
     
   char *filename = pvPortMalloc(strlen(CARD_MOUNTPOINT) + strlen(name) + 2);  // MP+'/'+name+'\0'
@@ -219,9 +228,9 @@ void inifile_write(char *name) {
   
   sdc_lock();  // get exclusive access to the file system
   
-  // saving does not work, yet, as there is no SD card write support by now
+  int ok = 0;
   FIL file;
-  if(f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {    
+  if(f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
     f_puts("; FPGA Companion settings\n", &file);
 
     // write variable values
@@ -299,13 +308,15 @@ void inifile_write(char *name) {
     }
 
     f_puts("\n", &file);
-    
-    f_close(&file);  
+
+    ok = (f_error(&file) == 0);             // a line could not be written
+    if(f_close(&file) != FR_OK) ok = 0;     // the data only reaches the card here
   } else
     ini_debugf("Error opening file");
   
   vPortFree(filename);
   sdc_unlock();
+  return ok ? 0 : -1;
 }
 
 // --------------------------------------------------------------------
@@ -358,6 +369,7 @@ static const struct {
   { "NETWORK", "IP", CONFIG_TYPE_IP, NULL },
   { "NETWORK", "MASK", CONFIG_TYPE_IP, NULL },
   { "NETWORK", "GW", CONFIG_TYPE_IP, NULL },
+  { "NETWORK", "DNS", CONFIG_TYPE_IP, NULL },
 
   // wifi settings
   { "WIFI", "SSID", CONFIG_TYPE_STRING, NULL },
@@ -366,6 +378,9 @@ static const struct {
   // (S)NTP
   { "NTP", "IP", CONFIG_TYPE_IP, NULL },
   { "NTP", "TIMEZONE", CONFIG_TYPE_INT, NULL },
+
+  // MENU/OSD
+  { "MENU", "GAMEPAD_TRIGGER", CONFIG_TYPE_INT, NULL },
   
   { NULL, NULL, 0, NULL }
 };
@@ -475,7 +490,7 @@ static struct config_value_s *inifile_config_get_value_n(char *section, char *na
   struct config_value_s *val = cfg->value;
   if(!val) return NULL;
 
-  while(n) {
+  while(n--) {
     val = val->next;
     if(!val) return NULL;
   }
@@ -623,8 +638,7 @@ static void inifile_config_parse_line(char *line) {
 
 	if(inifile_config_parse_ip(value, &addr))
 	  inifile_config_append_value(cfg)->data.ip = addr;
-	break;	
-      }
+      } break;	
       }
       
       return;
@@ -635,6 +649,9 @@ static void inifile_config_parse_line(char *line) {
 }
   
 // read the system config.ini
+static bool config_read_done = false;
+static TaskHandle_t config_waiter = NULL;  // task blocked in inifile_config_wait()
+
 void inifile_config_read(void) {
   ini_debugf("inifile_config_read()");
 
@@ -649,7 +666,9 @@ void inifile_config_read(void) {
 
   FIL fil;
   if(f_open(&fil, filename, FA_OPEN_EXISTING | FA_READ) == FR_OK) {
-    char buffer[64];
+    // a WPA key has up to 63 characters, PASS= and the key must fit,
+    // with room for spaces and a short comment
+    char buffer[128];
 
     ini_debugf("Settings file %s opened", filename);
     bool no_eol = false;
@@ -665,8 +684,8 @@ void inifile_config_read(void) {
 	
       } else {      
 	// check if line ends with newline. If not, then it's
-	// been truncated
-	if(strlen(buffer) && buffer[strlen(buffer)-1] != '\n')
+	// been truncated, unless it's the last line of the file
+	if(strlen(buffer) && buffer[strlen(buffer)-1] != '\n' && !f_eof(&fil))
 	  no_eol = true;
 	
 	// a truncated line may still be valid/usable if the truncated
@@ -700,4 +719,29 @@ void inifile_config_read(void) {
   sdc_unlock();
 
   inifile_config_dump();
+
+  // also set when there was no config.ini. The scheduler is suspended around
+  // flag and waiter, so inifile_config_wait() cannot miss the wakeup
+  vTaskSuspendAll();
+  config_read_done = true;
+  TaskHandle_t waiter = config_waiter;
+  xTaskResumeAll();
+  if(waiter) xTaskNotifyGive(waiter);
+}
+
+bool inifile_config_is_read(void) {
+  return config_read_done;
+}
+
+void inifile_config_wait(void) {
+  for(;;) {
+    vTaskSuspendAll();
+    bool done = config_read_done;
+    if(!done) config_waiter = xTaskGetCurrentTaskHandle();
+    xTaskResumeAll();
+    if(done) return;
+
+    // any other notification just leads to another check
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  }
 }

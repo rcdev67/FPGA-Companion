@@ -61,6 +61,7 @@ void mcu_hw_jtag_set_clock(uint32_t);
 void jtag_writeTDI_msb_first_gpio_out_mode(uint8_t *tx, unsigned int bytes, bool end);
 void jtag_enter_gpio_out_mode(void); 
 void jtag_exit_gpio_out_mode(void);
+void mcu_hw_wifi_auto_connect(void);
 
 // the BL616 based platforms implement custom JTAG routines for fast bulk transfers
 #define MCU_HW_JTAG_GPIO_OUT_MODE
@@ -106,7 +107,7 @@ void mcu_hw_jtag_set_clock(uint32_t);
 // give file system driver in sdio.c access to the local sdio sd card
 #define SDIO_DIRECT_READ   sdio_sector_read
 #define SDIO_DIRECT_WRITE  sdio_sector_write
-#elif MISTLE_BOARD == 5
+#elif (MISTLE_BOARD == 5) || (MISTLE_BOARD == 7)
 // MiSTeryShield PiPico + TN20k + Rework JTAG
 void mcu_hw_jtag_set_pins(uint8_t dir, uint8_t data);
 uint8_t mcu_hw_jtag_tms(uint8_t tdi, uint8_t data, int len);

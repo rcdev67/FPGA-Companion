@@ -605,43 +605,50 @@ static void menu_draw_entry(config_menu_entry_t *entry, int row, bool selected) 
     u8g2_DrawButtonFrame(&u8g2, width-hl_w, ypos, U8G2_BTN_INV, hl_w, 1, 1);
 }
 
-static int menu_wrap_text(int y_in, const char *msg) {  
-  // fetch words until the width is exceeded
-  const char *p = msg;
-  char *b = NULL;
+// Draws msg centered in lines no wider than the display, from y_in down, and
+// returns the y below the last line. With y_in 0 it only measures. A '\n' ends
+// a line, the rest breaks at spaces, and a word wider than the display is split.
+static int menu_wrap_text(int y_in, const char *msg) {
+  const int width = u8g2_GetDisplayWidth(&u8g2);
+  char line[80];
   int y = y_in;
-  
+
   u8g2_SetFont(&u8g2, font_helvR08_te);
-  while(*msg && *p) {
-    // search for end of word
-    while(*p && *p != ' ') p++;
-    
-    // allocate substring
-    if(b) vPortFree(b);
-    b = pvPortMalloc(p-msg+1);
-    strncpy(b, msg, p-msg);
-    b[p-msg]='\0';
-    
-    // check if this is now too long for screen
-    if((u8g2_GetStrWidth(&u8g2, b) >  u8g2_GetDisplayWidth(&u8g2))) {
-      // cut last word to fit to screen
-      while(*p == ' ') p--;
-      while(*p != ' ') p--;
-      b[p-msg]='\0';
+  if(!*msg) return y + 11;   // an empty message still takes one line
 
-      if(y_in)
-	u8g2_DrawStr(&u8g2, (u8g2_GetDisplayWidth(&u8g2)-u8g2_GetStrWidth(&u8g2, b))/2, y, b);
-      y+=11;
-      
-      msg = ++p;
+  while(*msg) {
+    size_t take = 0;   // characters that fit for sure
+    size_t gap  = 0;   // last space among them, 0 = none
+    size_t i;
+
+    while(*msg == ' ') msg++;                        // a line never starts with a space
+    if(*msg == '\n') { y += 11; msg++; continue; }   // an empty line
+    if(!*msg) break;
+
+    // take characters until the line is too wide, the buffer is full or the text ends
+    for(i = 0; msg[i] && msg[i] != '\n' && i < sizeof(line) - 1; i++) {
+      line[i]     = msg[i];
+      line[i + 1] = '\0';
+      if(u8g2_GetStrWidth(&u8g2, line) > width) break;
+      if(msg[i] == ' ') gap = i;
+      take = i + 1;
     }
-    while(*p == ' ') p++;
-  }
-  
-  if(y_in) u8g2_DrawStr(&u8g2, (u8g2_GetDisplayWidth(&u8g2)-u8g2_GetStrWidth(&u8g2, b))/2, y, b);
-  y+=11;
 
-  vPortFree(b);
+    // stopped inside a word with a space before it: break at the space instead.
+    // Stopped at a space: everything before it fits, the line ends right there.
+    if(msg[i] && msg[i] != '\n' && msg[i] != ' ' && gap) take = gap;
+    if(take == 0) take = 1;   // even one character is too wide, it goes out anyway
+    while(take > 1 && msg[take - 1] == ' ') take--;   // spaces at the end would shift the centering
+
+    line[take] = '\0';
+    if(y_in) u8g2_DrawStr(&u8g2, (width - u8g2_GetStrWidth(&u8g2, line)) / 2, y, line);
+    y += 11;
+
+    // the next line starts after the '\n' that ended this one
+    msg += take;
+    while(*msg == ' ') msg++;
+    if(*msg == '\n') msg++;
+  }
 
   return y;
 }
@@ -1049,17 +1056,14 @@ static void menu_select(void) {
     break;
 
   case CONFIG_MENU_ENTRY_LIST: {
-    // user has choosen a selection list
-    // Step to the next list entry rather than counting the value up. Both are
-    // the same as long as a list numbers its entries from zero, which every
-    // list did so far, but the label lookup already matches on the value. A
-    // list whose values mean something -- a resolution, a divisor -- would
-    // otherwise walk through numbers that have no entry and show a blank.
-    int value = menu_variable_get(entry->list->id);
+    // user has choosen a selection list: go to the next entry in list
+    // order and back to the first one after the last. The values need not
+    // be 0..n-1, e.g. DIP switch settings like 3, 2, 1
     config_listentry_t *le = entry->list->listentries;
+    int value = menu_variable_get(entry->list->id);
     while(le && le->value != value) le = le->next;
-    value = (le && le->next) ? le->next->value : entry->list->listentries->value;
-    menu_variable_set(entry->list->id, value);
+    le = (le && le->next) ? le->next : entry->list->listentries;
+    if(le) menu_variable_set(entry->list->id, le->value);
 
     // check if there's an action connected to changing this
     // list. This e.g. happens when changing system settings is

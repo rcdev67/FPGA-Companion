@@ -58,6 +58,10 @@
 #warning "Building for GW3A/GW5A DEV 25K"
 #include "../jtag.h"
 #include "pio_jtag.h"
+#elif MISTLE_BOARD == 7
+#warning "Building for MiSTeryShieldPico2_TN20k"
+#include "../jtag.h"
+#include "pio_jtag.h"
 #else
 #error "Not a supported MiSTle board!"
 #endif
@@ -73,7 +77,7 @@
 #define PIN_nCFG      21   // pin 32, PIO21
 #define PIN_MODE0     23   // pin 35, PIO23
 #define PIN_MODE1     24   /* pin 36, PIO24 */
-#elif MISTLE_BOARD == 5
+#elif MISTLE_BOARD == 5 || MISTLE_BOARD == 7
 // FPGA JTAG pins
 #define PIN_JTAG_TDI  12   // pin 15, gpio 12
 #define PIN_JTAG_TMS  13   // pin 16, gpio 13
@@ -194,7 +198,7 @@ static void pio_usb_task(__attribute__((unused)) void *parms) {
   while(1) {
     for(int i=0;i<100;i++) {
       tuh_task();
-#if (MISTLE_BOARD == 2) || (MISTLE_BOARD == 4) || (MISTLE_BOARD == 5) || (MISTLE_BOARD == 6)
+#if (MISTLE_BOARD == 2) || (MISTLE_BOARD == 4) || (MISTLE_BOARD == 5) || (MISTLE_BOARD == 6) || (MISTLE_BOARD == 7)
       tud_task();
       usb_jtag_poll();
 #endif
@@ -721,6 +725,8 @@ static void netif_link_callback(struct netif *netif) {
   }
 }
 
+#define SNTP_FALLBACK_SERVER "pool.ntp.org"
+
 static void ntp_setup(struct netif *netif) {  
   if(!(network_status & NETWORK_STATUS_SNTP_STARTED)) {
     sntp_init();
@@ -731,7 +737,7 @@ static void ntp_setup(struct netif *netif) {
   if(inifile_config_has("ntp", "ip")) {
     for(int i=0;i<inifile_config_num_values("ntp", "ip");i++) {
       ip_addr_t sa;
-      ip_addr_set_ip4_u32(&sa, htonl(inifile_config_get_ip("ntp", "ip", i)));
+      ip_addr_set_ip4_u32(&sa, htonl(inifile_config_get_ip_n("ntp", "ip", 0, i)));
       sntp_setserver(i, &sa);
     }
   }
@@ -740,6 +746,11 @@ static void ntp_setup(struct netif *netif) {
   // and if the interface is ppp as that cannot use dhcp
   if(!netif || netif->name[0] != 'p' || netif->name[1] != 'p') 
     sntp_servermode_dhcp(!inifile_config_has("ntp", "ip"));
+
+  // neither config.ini nor DHCP named a server: use the public pool. A server
+  // from DHCP later replaces it.
+  if(ip_addr_isany(sntp_getserver(0)) && sntp_getservername(0) == NULL)
+    sntp_setservername(0, SNTP_FALLBACK_SERVER);
 }
 
 // this is actually called by axis _and_ the wifi
@@ -796,6 +807,15 @@ void sntp_set_system_time(u32_t sec) {
 	       timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
 }
 
+// set the name server of a static network config if config.ini names one
+#include "lwip/dns.h"
+static void netif_set_static_dns(void) {
+  if(!inifile_config_has("network", "dns")) return;
+  ip_addr_t dns;
+  ip_addr_set_ip4_u32(&dns, htonl(inifile_config_get_ip("network", "dns", 0)));
+  dns_setserver(0, &dns);
+}
+
 static void netif_up(struct netif *netif) {
   usb_debugf("netif_up(%c%c)", netif->name[0], netif->name[1]);
   
@@ -821,6 +841,7 @@ static void netif_up(struct netif *netif) {
       ip_addr_set_ip4_u32(&netmask, htonl(inifile_config_get_ip("network", "mask", 0xffffff00)));
       ip_addr_set_ip4_u32(&gw, htonl(inifile_config_get_ip("network", "gw", 0xc0a80001)));
       netif_set_addr(netif, &ipaddr, &netmask, &gw);
+      netif_set_static_dns();
     }
   } else
     usb_debugf("Not starting DHCP for PPP");
@@ -1195,6 +1216,15 @@ void tuh_cdc_umount_cb(uint8_t idx) {
 
 void mcu_hw_reset(void) {
   debugf("HW reset");
+#ifdef ENABLE_WIFI
+  // Leave the access point before the restart (core switch, reset from the menu), else it
+  // still holds the association and drops the first authentication after the restart. The
+  // short wait lets the chip send the disassociation.
+  if((network_status & NETWORK_STATUS_WIFI) && (network_status & NETWORK_STATUS_UP)) {
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    busy_wait_ms(50);
+  }
+#endif
   watchdog_reboot(0, 0, 10);
   while(1);
 }
@@ -1215,21 +1245,46 @@ bool mcu_hw_wifi_connect(__attribute__((unused)) char *ssid, __attribute__((unus
 static bool is_pico_w = false;
 #include "pico/cyw43_arch.h"
 
+// The LED hangs on the cyw43 chip, and writing it needs the cyw43 lock, which
+// other work can hold for a while. So the timer only sets the state, and the
+// cyw43 context writes it: the timer task never waits for that lock.
+static volatile bool led_state_w;   // the state the next write sets
+
+static void led_write_w(__attribute__((unused)) async_context_t *context,
+                        __attribute__((unused)) async_when_pending_worker_t *worker) {
+  cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state_w);   // runs in the cyw43 context
+}
+
+static async_when_pending_worker_t led_worker_w = { .do_work = led_write_w };
+
 static void led_timer_w(__attribute__((unused)) TimerHandle_t pxTimer) {
   static char state = 0;
   switch(inifile_option_get(INIFILE_OPTION_LED)) {
   case 0:    
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, state & 1);
+    led_state_w = state & 1;   // blink
     break;
   case 1:    
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    led_state_w = 1;
     break;
   case 2:    
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+    led_state_w = 0;
     break;
   }
+  // never blocks, the write follows when the cyw43 context is free
+  async_context_set_work_pending(cyw43_arch_async_context(), &led_worker_w);
     
   state = !state;
+}
+
+// Sets a 32-bit setting (iovar) of the WiFi chip: the name with its NUL, then the value
+// in little endian.
+static int wifi_set_iovar_u32(const char *name, uint32_t val) {
+  uint8_t buf[32];
+  size_t len = strlen(name) + 1;
+  if(len + 4 > sizeof(buf)) return -1;
+  memcpy(buf, name, len);
+  for(int i=0;i<4;i++) buf[len+i] = (val >> (8*i)) & 0xff;
+  return cyw43_ioctl(&cyw43_state, CYW43_IOCTL_SET_VAR, len + 4, buf, CYW43_ITF_STA);
 }
 
 static void mcu_hw_wifi_init(void) {
@@ -1254,12 +1309,34 @@ static void mcu_hw_wifi_init(void) {
 
   cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
 
+  // After a reset the access point may still hold the old association. Some (seen on a
+  // Qualcomm based one) then drop the first authentication while they clear it. Phones send
+  // it again within 200 ms. The chip does the same once it may retry the join (default 0).
+  if(wifi_set_iovar_u32("assoc_retry_max", 3))
+    debugf("WiFi: assoc_retry_max not set");
+
+  // the LED timer hands its writes to the cyw43 context, see led_timer_w()
+  async_context_add_when_pending_worker(cyw43_arch_async_context(), &led_worker_w);
   TimerHandle_t led_timer_handle =
     xTimerCreate("LED timer (W)", pdMS_TO_TICKS(200), pdTRUE,
 		 NULL, led_timer_w);
   xTimerStart(led_timer_handle, 0);
 
   netif_set_status_callback(netif_default, netif_status_callback);
+
+#ifdef ENABLE_BLUETOOTH
+  // bluetooth needs nothing from config.ini, start it right away
+  bluetooth_init();
+#endif
+
+  // after a cold start com_task reads config.ini only once the FPGA
+  // is up, so wait for it before deciding whether to connect. Without
+  // an FPGA it waits until com_task detects one and restarts
+  if(!inifile_config_is_read()) {
+    debugf("WiFi: waiting for the configuration from the card");
+    inifile_config_wait();
+    debugf("WiFi: configuration is available");
+  }
 
   // connect to wifi immediately if configured through config file
   if(inifile_config_has("wifi", "ssid") && inifile_config_has("wifi", "pass")) {
@@ -1280,7 +1357,7 @@ static void mcu_hw_wifi_init(void) {
 #ifdef ENABLE_BLUETOOTH
   // this will actually never return. But that is no problem
   // as this task is only needed for wifi init
-  bluetooth_init();
+  bluetooth_run();
 #endif
 }
 
@@ -1309,22 +1386,28 @@ static mcu_hw_wifi_scan_cb_func wifi_scan_cb = NULL;
 static int scan_result(__attribute__((unused)) void *env, const cyw43_ev_scan_result_t *result) {
   if (result) {
     char str[74];
+    // the ssid comes with its length and is not terminated when it
+    // fills all 32 bytes
+    int ssid_len = result->ssid_len < sizeof(result->ssid) ?
+      result->ssid_len : sizeof(result->ssid);
     
-    debugf("ssid: %s rssi: %d chan: %d sec: %u",
-	   result->ssid, result->rssi, result->channel,
+    debugf("ssid: %.*s rssi: %d chan: %d sec: %u",
+	   ssid_len, result->ssid, result->rssi, result->channel,
 	   result->auth_mode);
 
     if(wifi_scan_cb) {
       // allocate reply. It's up to the callee to free this
       mcu_hw_scan_result_t *res = pvPortMalloc(sizeof(mcu_hw_scan_result_t));
-      char *ssid = pvPortMalloc(sizeof(strlen(result->ssid)+1));
-      strcpy(ssid, result->ssid);
+      char *ssid = pvPortMalloc(ssid_len+1);
+      memcpy(ssid, result->ssid, ssid_len);
+      ssid[ssid_len] = '\0';
       res->ssid = ssid;
+      res->next = NULL;
 			       
       wifi_scan_cb(res);
     } else {     
-      snprintf(str, sizeof(str), "SSID %s, RSSI %d, CH %d, %s\r\n",
-	       result->ssid, result->rssi, result->channel,
+      snprintf(str, sizeof(str), "SSID %.*s, RSSI %d, CH %d, %s\r\n",
+	       ssid_len, result->ssid, result->rssi, result->channel,
 	       auth_mode_str(result->auth_mode));
       
       at_wifi_puts(str);
@@ -1381,15 +1464,86 @@ void mcu_hw_wifi_scan(void) {
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
+// Joins and waits for the link, a replacement for cyw43_arch_wifi_connect_timeout_ms().
+// When the chip retries a failed authentication (assoc_retry_max), the driver reports the
+// failure for a few milliseconds before the retry succeeds, and the SDK function takes that
+// as final. Here a failure counts only once it has held for a second. Returns PICO_OK or a
+// PICO_ERROR_* code like the SDK function.
+static int wifi_join(const char *ssid, const char *key, uint32_t timeout_ms) {
+  // start the join, the chip and the driver work on it in the background
+  int err = cyw43_arch_wifi_connect_async(ssid, key, CYW43_AUTH_WPA2_AES_PSK);
+  if(err) return err;
+
+  TickType_t start = xTaskGetTickCount(), fail_since = 0;
+  bool failing = false;            // the link status has been negative since fail_since
+  for(;;) {
+    // the driver's view of the join, polled every 10 ms
+    int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    TickType_t now = xTaskGetTickCount();
+
+    // joined, keys exchanged and an IP address from DHCP: done
+    if(status == CYW43_LINK_UP)
+      return PICO_OK;
+
+    if(status == CYW43_LINK_NONET) {
+      // no access point with this SSID found (out of range or not up yet): start the
+      // join again, as the SDK function does
+      failing = false;
+      err = cyw43_arch_wifi_connect_async(ssid, key, CYW43_AUTH_WPA2_AES_PSK);
+      if(err) return err;
+    } else if(status < 0) {
+      // BADAUTH or FAIL. After an unanswered authentication the driver shows BADAUTH while
+      // the chip already sends the authentication again, and a good answer turns the state
+      // back to joining. Only a failure that lasts for a second is final, e.g. FAIL once
+      // the chip has given up.
+      if(!failing) { failing = true; fail_since = now; }
+      else if(now - fail_since >= pdMS_TO_TICKS(1000))
+        return status == CYW43_LINK_BADAUTH ? PICO_ERROR_BADAUTH : PICO_ERROR_CONNECT_FAILED;
+    } else
+      failing = false;             // still joining, or joined and waiting for DHCP
+
+    // no link within the time limit, e.g. a wrong key: the driver keeps joining and
+    // reports no failure state for that
+    if(now - start >= pdMS_TO_TICKS(timeout_ms))
+      return PICO_ERROR_TIMEOUT;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// The cyw43 driver always starts DHCP on the STA interface. Apply the
+// [NETWORK] section of config.ini the same way netif_up() does for usb ethernet.
+static void wifi_apply_network_config(void) {
+  if(inifile_config_get_int("network", "mode", 1) == 1) return;  // dhcp (default)
+
+  ip_addr_t ipaddr, netmask, gw;
+  ip_addr_set_ip4_u32(&ipaddr, htonl(inifile_config_get_ip("network", "ip", 0xc0a80002)));
+  ip_addr_set_ip4_u32(&netmask, htonl(inifile_config_get_ip("network", "mask", 0xffffff00)));
+  ip_addr_set_ip4_u32(&gw, htonl(inifile_config_get_ip("network", "gw", 0xc0a80001)));
+
+  struct netif *netif = &cyw43_state.netif[CYW43_ITF_STA];
+  cyw43_arch_lwip_begin();
+  dhcp_stop(netif);
+  netif_set_addr(netif, ip_2_ip4(&ipaddr), ip_2_ip4(&netmask), ip_2_ip4(&gw));
+  netif_set_static_dns();
+  cyw43_arch_lwip_end();
+  debugf("WiFi: static ip %s", ip4addr_ntoa(netif_ip4_addr(netif)));
+}
+
 bool mcu_hw_wifi_connect(char *ssid, char *key) {
   if(!wifi_available()) return false;
+
+  wifi_apply_network_config();
 
   debugf("WiFI: connect to %s/%s", ssid, key);
   
   if(!(network_status & NETWORK_STATUS_WIFI_AUTO))
     at_wifi_puts("Connecting...");
   
-  if(cyw43_arch_wifi_connect_timeout_ms(ssid, key, CYW43_AUTH_WPA2_AES_PSK, 30000)) {
+  int err = wifi_join(ssid, key, 30000);
+  if(err) {
+    debugf("WiFI: connect failed, error %d", err);
+    // the chip keeps rejoining in the background otherwise (wrong key: every few seconds)
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
     if(!(network_status & NETWORK_STATUS_WIFI_AUTO))
       at_wifi_puts("\r\nConnection failed!\r\n");
 
@@ -2258,7 +2412,7 @@ void mcu_hw_init(void) {
   };
   tusb_init(BOARD_TUH_RHPORT, &host_init);
   
-#if (MISTLE_BOARD == 4) || (MISTLE_BOARD == 5) || (MISTLE_BOARD == 6)
+#if (MISTLE_BOARD == 4) || (MISTLE_BOARD == 5) || (MISTLE_BOARD == 6) || (MISTLE_BOARD == 7)
   tusb_rhport_init_t dev_init = {
     .role = TUSB_ROLE_DEVICE,
     .speed = TUSB_SPEED_AUTO

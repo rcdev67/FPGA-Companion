@@ -49,6 +49,7 @@
 #include "lwip/init.h"
 #include "netif/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/netifapi.h"
 #include "lwip/dhcp.h"
 #include "lwip/prot/dhcp.h"
 #include "lwip/apps/sntp.h"
@@ -194,11 +195,11 @@ static void mcu_hw_jtag_init(void);
 #include <queue.h>
 #include <hardware/bl616.h>
 
-// Long enough for report protocol devices, not just boot protocol ones. A
-// mouse with 16 bit axes reports nine bytes including its report id, and the
-// URB below is filled with the length the device asks for, so a smaller
-// buffer is written past its end.
-#define MAX_REPORT_SIZE   64
+// Upstream's sizes, both more generous than the 64 we had: a report is filled
+// with the length the device asks for, so the buffer must not be the smaller
+// one, and the descriptor bound is checked where it is fetched.
+#define MAX_REPORT_SIZE   256
+#define MAX_HID_REPORT_DESC_SIZE 2048
 
 // How long to wait for a report, which is not the same thing as how often the
 // device offers one. Passing the endpoint's bInterval here made the wait as
@@ -271,6 +272,31 @@ const UsbGamepadMap *find_usb_gamepad_map(uint16_t vid,
   return first_vid_pid;
 }
 
+static void show_map(const UsbGamepadMap *map) {
+  char str0[8], str1[8], str2[8], str3[8];
+
+  if(map->btn_a >= 0) sprintf(str0, " A=%d", map->btn_a); else str0[0] = '\0';
+  if(map->btn_b >= 0) sprintf(str1, " B=%d", map->btn_b); else str1[0] = '\0';
+  if(map->btn_x >= 0) sprintf(str2, " X=%d", map->btn_x); else str2[0] = '\0';
+  if(map->btn_y >= 0) sprintf(str3, " Y=%d", map->btn_y); else str3[0] = '\0';
+  usb_debugf("  buttons:%s%s%s%s", str0, str1, str2, str3);
+
+  if(map->axis_lx >= 0 || map->axis_ly >= 0) {
+    if(map->axis_lx >= 0) sprintf(str0, " LX=%d", map->axis_lx); else str0[0] = '\0';
+    if(map->axis_ly >= 0) sprintf(str1, " LY=%d", map->axis_ly); else str1[0] = '\0';
+    usb_debugf("  analogue axes:%s%s", str0, str1);
+  }
+
+  if(map->dpad_axis_up >= 0 || map->dpad_axis_down >= 0 ||
+     map->dpad_axis_left >= 0 || map->dpad_axis_right >= 0) {
+    if(map->dpad_axis_up >= 0) sprintf(str0, " U=%d", map->dpad_axis_up); else str0[0] = '\0';
+    if(map->dpad_axis_down >= 0) sprintf(str1, " D=%d", map->dpad_axis_down); else str1[0] = '\0';
+    if(map->dpad_axis_left >= 0) sprintf(str2, " L=%d", map->dpad_axis_left); else str2[0] = '\0';
+    if(map->dpad_axis_right >= 0) sprintf(str3, " R=%d", map->dpad_axis_right); else str3[0] = '\0';
+    usb_debugf("  dpad axes:%s%s%s%s", str0, str1, str2, str3);
+  }
+}
+
 void set_led(int pin, int on) {
 #ifdef M0S_DOCK
   // only M0S dock has those leds
@@ -291,8 +317,8 @@ static struct usb_config {
     unsigned char last_state;
     unsigned char js_index;
     unsigned char last_state_btn_extra;
-    int16_t last_state_x;
-    int16_t last_state_y;
+    uint8_t last_state_x;
+    uint8_t last_state_y;
 
     struct usb_config *usb;
     SemaphoreHandle_t sem;
@@ -312,6 +338,10 @@ static struct usb_config {
     uint8_t *buffer;
     int nbytes;
     hid_report_t report;
+    struct usbh_hid_report_info cherry_report;
+    uint16_t input_report_size;
+    bool report_ids_present;
+    bool use_cherry_keyboard;
     struct usb_config *usb;
     SemaphoreHandle_t sem;
     TaskHandle_t task_handle;
@@ -326,10 +356,9 @@ static struct usb_config {
 
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t hid_buffer[CONFIG_USBHOST_MAX_HID_CLASS][MAX_REPORT_SIZE];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t xbox_buffer[CONFIG_USBHOST_MAX_XBOX_CLASS][XBOX_REPORT_SIZE];
-// Must match the length passed to usbh_hid_get_report_descriptor() below,
-// which asked for 1024 bytes into a 128 byte buffer.
-#define MAX_REPORT_DESC_SIZE 512
-USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t report_desc[CONFIG_USBHOST_MAX_HID_CLASS][MAX_REPORT_DESC_SIZE];
+// Report descriptors are fetched and parsed synchronously during enumeration,
+// so one scratch buffer can be reused by every HID interface.
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t report_desc[MAX_HID_REPORT_DESC_SIZE];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t dummy_report[20];
 
 uint8_t byteScaleAnalog(int16_t xbox_val)
@@ -392,8 +421,6 @@ static void xbox_parse(struct xbox_info_S *xbox) {
     ((wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 0x02 : 0x00) |
     ((wButtons & XINPUT_GAMEPAD_BACK) ? 0x04 : 0x00) |
     ((wButtons & XINPUT_GAMEPAD_START) ? 0x08 : 0x00) |
-    ((xbox->buffer[4] > 0x80) ? 0x10 : 0x00) |
-    ((xbox->buffer[5] > 0x80) ? 0x20 : 0x00) |
     ((wButtons & XINPUT_GAMEPAD_LEFT_THUMB) ? 0x40 : 0x00) |
     ((wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) ? 0x80 : 0x00);
 
@@ -412,13 +439,13 @@ static void xbox_parse(struct xbox_info_S *xbox) {
   // submit if state has changed
   if(state != xbox->last_state ||
     state_btn_extra != xbox->last_state_btn_extra ||
-    sThumbLX != xbox->last_state_x ||
-    sThumbLY != xbox->last_state_y) {
+    ax != xbox->last_state_x ||
+    ay != xbox->last_state_y) {
 
     xbox->last_state = state;
     xbox->last_state_btn_extra = state_btn_extra;
-    xbox->last_state_x = sThumbLX;
-    xbox->last_state_y = sThumbLY;
+    xbox->last_state_x = ax;
+    xbox->last_state_y = ay;
     usb_debugf("XBOX Joy%d: B %02x EB %02x X %02x Y %02x", xbox->js_index, state, state_btn_extra, ax, ay);
 
     if(osd_is_visible()) {	       
@@ -436,6 +463,186 @@ static void xbox_parse(struct xbox_info_S *xbox) {
     mcu_hw_spi_end();
     }
   }
+}
+
+static bool usbh_hid_prepare_report_info(struct hid_info_S *hid)
+{
+  struct usbh_hid_report_info *report = &hid->cherry_report;
+  uint64_t max_report_bits = 0;
+
+  hid->report_ids_present = false;
+  hid->use_cherry_keyboard = false;
+  for (uint32_t i = 0; i < report->report_item_count; i++) {
+    struct usbh_hid_report_item *item = &report->report_items[i];
+    uint64_t bit_offset = 0;
+
+    if (item->attribute.report_id != 0)
+      hid->report_ids_present = true;
+
+    for (uint32_t j = 0; j < i; j++) {
+      const struct usbh_hid_report_item *previous = &report->report_items[j];
+      if (previous->report_type == item->report_type &&
+          previous->attribute.report_id == item->attribute.report_id) {
+        bit_offset += (uint64_t)previous->attribute.report_size *
+                      previous->attribute.report_count;
+      }
+    }
+
+    if (bit_offset > UINT32_MAX)
+      return false;
+    item->report_bit_offset = (uint32_t)bit_offset;
+
+    if (item->report_type != HID_REPORT_INPUT)
+      continue;
+
+    uint64_t item_end = bit_offset +
+                        (uint64_t)item->attribute.report_size *
+                        item->attribute.report_count;
+    if (item_end > max_report_bits)
+      max_report_bits = item_end;
+
+    if (!(item->report_flags & HID_MAINITEM_CONSTANT) &&
+        item->attribute.usage_page == 0x07)
+      hid->use_cherry_keyboard = true;
+  }
+
+  uint64_t report_size = (max_report_bits + 7) / 8;
+  if (hid->report_ids_present)
+    report_size++;
+  if (report_size == 0 || report_size > MAX_REPORT_SIZE)
+    return false;
+
+  hid->input_report_size = (uint16_t)report_size;
+  return true;
+}
+
+static bool usbh_hid_read_converted_value(
+    const struct usbh_hid_report_item *item, uint32_t scalar,
+    const uint8_t *bytes, uint32_t bytes_len, uint32_t element,
+    uint32_t *value)
+{
+  uint32_t width = item->attribute.report_size;
+  uint64_t first_bit = (uint64_t)element * width;
+
+  if (width == 0 || width > 32)
+    return false;
+
+  *value = 0;
+  for (uint32_t bit = 0; bit < width; bit++) {
+    uint64_t source_bit = first_bit + bit;
+    uint8_t set;
+
+    if (bytes) {
+      if (source_bit >= (uint64_t)bytes_len * 8)
+        return false;
+      set = (bytes[source_bit / 8] >> (source_bit % 8)) & 1;
+    } else {
+      if (source_bit >= 32)
+        return false;
+      set = (scalar >> source_bit) & 1;
+    }
+
+    *value |= (uint32_t)set << bit;
+  }
+  return true;
+}
+
+static void usbh_hid_set_keyboard_usage(uint8_t *modifiers, uint8_t *keys,
+                                        uint16_t usage)
+{
+  if (usage >= 0xe0 && usage <= 0xe7) {
+    *modifiers |= (uint8_t)(1U << (usage - 0xe0));
+  } else if (usage > 3 && usage <= UINT8_MAX) {
+    keys[usage / 8] |= (uint8_t)(1U << (usage % 8));
+  }
+}
+
+static bool usbh_hid_keyboard_report_parse(struct hid_info_S *hid,
+                                           const uint8_t *report_buf,
+                                           uint32_t report_len)
+{
+  uint8_t report_id = hid->report_ids_present ? report_buf[0] : 0;
+  uint8_t modifiers = 0;
+  uint8_t keys[32] = { 0 };
+  uint64_t required_bits = 0;
+  bool has_report = false;
+
+  for (uint32_t i = 0; i < hid->cherry_report.report_item_count; i++) {
+    const struct usbh_hid_report_item *item =
+        &hid->cherry_report.report_items[i];
+    if (item->report_type != HID_REPORT_INPUT ||
+        item->attribute.report_id != report_id)
+      continue;
+
+    has_report = true;
+    uint64_t item_end = (uint64_t)item->report_bit_offset +
+                        (uint64_t)item->attribute.report_size *
+                        item->attribute.report_count;
+    if (item_end > required_bits)
+      required_bits = item_end;
+  }
+
+  if (!has_report)
+    return false;
+
+  uint64_t required_len = (required_bits + 7) / 8;
+  if (hid->report_ids_present)
+    required_len++;
+  if (report_len < required_len)
+    return false;
+
+  bool found_keyboard_data = false;
+  for (uint32_t i = 0; i < hid->cherry_report.report_item_count; i++) {
+    const struct usbh_hid_report_item *item =
+        &hid->cherry_report.report_items[i];
+    if (item->report_type != HID_REPORT_INPUT ||
+        item->attribute.report_id != report_id ||
+        (item->report_flags & HID_MAINITEM_CONSTANT) ||
+        item->attribute.usage_page != 0x07)
+      continue;
+
+    uint32_t scalar = 0;
+    uint8_t *bytes = NULL;
+    uint32_t bytes_len = 0;
+    int ret = usbh_hid_report_convert((struct usbh_hid_report_item *)item,
+                                      report_buf, &scalar, &bytes,
+                                      &bytes_len);
+    if (ret < 0)
+      return false;
+
+    found_keyboard_data = true;
+    bool variable = (item->report_flags & HID_MAINITEM_VARIABLE) != 0;
+    for (uint32_t element = 0;
+         element < item->attribute.report_count; element++) {
+      uint32_t value;
+      if (!usbh_hid_read_converted_value(item, scalar, bytes, bytes_len,
+                                         element, &value))
+        return false;
+      if (value == 0)
+        continue;
+
+      if (variable) {
+        uint16_t usage_min = item->attribute.usage_min;
+        uint16_t usage_max = item->attribute.usage_max;
+        if (usage_min > usage_max || usage_min == UINT16_MAX)
+          continue;
+        uint32_t usage_count = (uint32_t)usage_max - usage_min + 1;
+        uint16_t usage = usage_min +
+                         (element < usage_count ? element : usage_count - 1);
+        usbh_hid_set_keyboard_usage(&modifiers, keys, usage);
+      } else {
+        if (value <= 3)
+          return false;
+        usbh_hid_set_keyboard_usage(&modifiers, keys, (uint16_t)value);
+      }
+    }
+  }
+
+  if (!found_keyboard_data)
+    return false;
+
+  kbd_parse_usage_state(&hid->hid_state.kbd, modifiers, keys);
+  return true;
 }
 
 // each HID client gets itws own thread which submits urbs
@@ -487,7 +694,15 @@ static void usbh_hid_client_thread(void *argument) {
     }
   }
 
-  size_t len = hid->report.report_size + (hid->report.report_id_present ? 1 : 0);
+  size_t len = hid->use_cherry_keyboard ? hid->input_report_size :
+      hid->report.report_size + (hid->report.report_id_present ? 1 : 0);
+  if (len == 0 || len > sizeof(hid_buffer[0])) {
+    usb_debugf("HID client #%d: input report too large (%u bytes)",
+               hid->index, (unsigned int)len);
+    hid->task_handle = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
 
   uint32_t hid_interval_ms;
   if (hid->class->hport->speed == USB_SPEED_HIGH) {
@@ -568,7 +783,10 @@ static void usbh_hid_client_thread(void *argument) {
       break;
 
     if (hid->nbytes > 0) {
-      hid_parse(&hid->report, &hid->hid_state, hid->buffer, hid->nbytes);
+      if (hid->use_cherry_keyboard)
+        usbh_hid_keyboard_report_parse(hid, hid->buffer, hid->nbytes);
+      else
+        hid_parse(&hid->report, &hid->hid_state, hid->buffer, hid->nbytes);
     }
 
     hid->nbytes = 0;
@@ -727,6 +945,7 @@ static void usbh_xbox_client_thread(void *argument) {
   if (map) {
     usb_debugf("Found gamepad map: %s (VID=%04x PID=%04x VER=%04x)",
                 map->name, map->vid, map->pid, map->version);
+    show_map(map);
 
     xbox->report.map = map;
     xbox->report.map_found = 1;
@@ -837,7 +1056,15 @@ void usbh_hid_run(struct usbh_hid *hid_class)
     usb_debugf("NEW HID %d", i);
     memset(&usb->hid_info[i].report, 0, sizeof(usb->hid_info[i].report));
 
-    int rep_desc = usbh_hid_get_report_descriptor(hid_class, report_desc[i], MAX_REPORT_DESC_SIZE);
+    if (hid_class->report_size > sizeof(report_desc)) {
+      usb_debugf("HID report descriptor too large (%u bytes)",
+                 hid_class->report_size);
+      usb->hid_info[i].state = STATE_FAILED;
+      return;
+    }
+
+    int rep_desc = usbh_hid_get_report_descriptor(
+      hid_class, report_desc, hid_class->report_size);
     if (rep_desc < 0)
     {
       usb_debugf("usbh_hid_get_report_descriptor issue");
@@ -850,10 +1077,28 @@ void usbh_hid_run(struct usbh_hid *hid_class)
     fix_report_descriptor(hid_class->hport->device_desc.idVendor,
 			  hid_class->hport->device_desc.idProduct,
 			  hid_class->hport->device_desc.bcdDevice,
-			  report_desc[i], (uint16_t)rep_desc);
+              report_desc, hid_class->report_size);
+
+    bool project_report_parsed = parse_report_descriptor(
+    report_desc, hid_class->report_size,
+        &usb->hid_info[i].report, NULL);
+    int cherry_parse_result = usbh_hid_parse_report_descriptor(
+    report_desc, hid_class->report_size,
+        &usb->hid_info[i].cherry_report);
+    if (cherry_parse_result == 0 &&
+        usbh_hid_prepare_report_info(&usb->hid_info[i])) {
+      if (usb->hid_info[i].use_cherry_keyboard)
+        usb->hid_info[i].report.type = REPORT_TYPE_KEYBOARD;
+    }
   
-    if (!parse_report_descriptor(report_desc[i], (uint16_t)rep_desc, &usb->hid_info[i].report, NULL))
-    {
+    if (!usb->hid_info[i].use_cherry_keyboard && !project_report_parsed) {
+      usb->hid_info[i].state = STATE_FAILED;
+      return;
+    }
+
+    if (usb->hid_info[i].report.type == REPORT_TYPE_KEYBOARD &&
+        !usb->hid_info[i].use_cherry_keyboard) {
+      usb_debugf("HID keyboard report descriptor is unsupported");
       usb->hid_info[i].state = STATE_FAILED;
       return;
     }
@@ -892,10 +1137,14 @@ void usbh_xbox_run(struct usbh_xbox *xbox_class) {
 
     usb_debugf("NEW XBOX HID %d", i);
     memset(&usb->xbox_info[i].report, 0, sizeof(usb->xbox_info[i].report));
+    usb->xbox_info[i].last_state = 0;
+    usb->xbox_info[i].last_state_btn_extra = 0;
+    usb->xbox_info[i].last_state_x = 0;
+    usb->xbox_info[i].last_state_y = 0;
     usb->xbox_info[i].js_index = hid_allocate_joystick();
 
 #if 0   // don't try to read HID report descriptor as it's not used/parsed, anyway
-    uint16_t rep_desc = usbh_hid_get_report_descriptor(xbox_class, report_desc[i], 1024);
+  int rep_desc = usbh_hid_get_report_descriptor(xbox_class, report_desc, 1024);
     if (rep_desc < 0) {
       usb_debugf("usbh_hid_get_report_descriptor issue");
       usb->xbox_info[i].state = STATE_FAILED;
@@ -1115,6 +1364,16 @@ extern uint32_t __HeapLimit;
 extern uint32_t _heap_wifi_start;
 extern uint32_t _heap_wifi_size;
 
+// Weak, so that an SDK without it links and the call site can skip it.
+// See where it is called, below.
+__attribute__((weak)) void mm_heap_set_any_alloc_order(const uint32_t *order, size_t count);
+
+static const uint32_t any_alloc_order[] = {
+    MM_HEAP_OCRAM_0,
+    MM_HEAP_PSRAM_0,
+    MM_HEAP_WRAM_0,
+};
+
 extern void bl_show_flashinfo(void);
 extern void bl_show_log(void);
 extern void bl_show_component_version(void);
@@ -1304,6 +1563,17 @@ static void mn_board_init(void) {
     debugf("\r\ndynamic memory init success");
     debugf("ocram heap size: %d Kbyte",((size_t)&__HeapLimit - (size_t)&__HeapBase) / 1024);
 
+    // Upstream sets the order in which the heaps are tried. The symbol only
+    // exists in newer Bouffalo SDKs; ours is 2.3.33 and links without it, so
+    // the call is skipped rather than failing to link. Declared weak, an
+    // absent symbol resolves to zero and the test below is false. Once the
+    // SDK is updated this starts working on its own, with nothing to undo.
+    // What is lost meanwhile is allocation order, not correctness.
+    if(mm_heap_set_any_alloc_order)
+      mm_heap_set_any_alloc_order(any_alloc_order, sizeof(any_alloc_order) / sizeof(any_alloc_order[0]));
+    else
+      debugf("SDK without mm_heap_set_any_alloc_order, keeping the default order");
+
     /* boot info dump */
     bl_show_log();
     /* version info dump */
@@ -1338,13 +1608,6 @@ static void mn_board_init(void) {
     debugf("===========================");
 }
 
-void shell_task_runner(void *param)
-{
-  vTaskDelay(pdMS_TO_TICKS(5000));
-  shell_exe_cmd((unsigned char*)"lsusb -v\r\n", strlen("lsusb -v\r\n"));
-  vTaskDelay(pdMS_TO_TICKS(100));
-  vTaskDelete( NULL );
-}
 
 void mcu_hw_init(void) {
   mn_board_init();
@@ -1406,7 +1669,6 @@ void mcu_hw_init(void) {
 #endif
   usb_host();
 
-  xTaskCreate(shell_task_runner, "runner", 2048, NULL, 5, NULL);
 }
 
 void stop_hid(void) {
@@ -1498,7 +1760,6 @@ void mcu_hw_port_byte(unsigned char byte) {
 
 extern int wifi_mgmr_task_start(void);
 extern int wifi_mgmr_sta_scanlist(void);
-extern int wifi_mgmr_sta_quickconnect(const char *ssid, const char *key, uint16_t freq1, uint16_t freq2);
 
 // the network connection state
 #define NETWORK_STATUS_UNINITIALIZED        (0)
@@ -1508,6 +1769,9 @@ extern int wifi_mgmr_sta_quickconnect(const char *ssid, const char *key, uint16_
 #define NETWORK_STATUS_HAS_ADDR           (1<<3) // IP address is valid
 #define NETWORK_STATUS_SNTP_STARTED       (1<<4) // sntp app is running
 #define NETWORK_STATUS_TCP_CONNECTED      (1<<5) // the at wifi tcp connection is established
+#define NETWORK_STATUS_WIFI_AUTO          (1<<6) // WiFi started from config file (no serial AT-WiFi IO)
+#define USB_ETH_RX_TASK_STACK_SIZE         1024
+#define NETWORK_LINK_TASK_STACK_SIZE       512
 
 static uint8_t network_status = NETWORK_STATUS_UNINITIALIZED;
 
@@ -1519,18 +1783,87 @@ enum network_interface {
 };
 
 static enum network_interface active_network_interface = NETWORK_INTERFACE_NONE;
+static enum network_interface active_usb_network_interface = NETWORK_INTERFACE_NONE;
 static struct netif *active_network_netif = NULL;
 static struct usbh_rtl8152 *active_rtl8152 = NULL;
 static struct usbh_asix *active_asix = NULL;
 static TaskHandle_t network_link_task = NULL;
 static TimerHandle_t dhcp_handle = NULL;
 
+static bool network_uses_dhcp(void)
+{
+  return inifile_config_get_int("network", "mode", 1) == 1;
+}
+
+static void network_get_static_ipv4(ip4_addr_t *ipaddr, ip4_addr_t *netmask,
+                                    ip4_addr_t *gateway)
+{
+  ip4_addr_set_u32(ipaddr,
+                   htonl(inifile_config_get_ip("network", "ip", 0xc0a80002)));
+  ip4_addr_set_u32(netmask,
+                   htonl(inifile_config_get_ip("network", "mask", 0xffffff00)));
+  ip4_addr_set_u32(gateway,
+                   htonl(inifile_config_get_ip("network", "gw", 0xc0a80001)));
+}
+
+static void network_set_static_dns_callback(void *arg)
+{
+  (void)arg;
+
+  ip_addr_t dns;
+  ip_addr_set_ip4_u32(&dns,
+                      htonl(inifile_config_get_ip("network", "dns", 0)));
+  dns_setserver(0, &dns);
+}
+
+static void network_apply_static_dns(void)
+{
+  if (!inifile_config_has("network", "dns"))
+    return;
+
+  if (tcpip_callback_with_block(network_set_static_dns_callback, NULL, 1) !=
+      ERR_OK)
+    debugf("Failed to apply static DNS configuration");
+}
+
+static void network_apply_static_ipv4(struct netif *netif)
+{
+  ip4_addr_t ipaddr, netmask, gateway;
+  network_get_static_ipv4(&ipaddr, &netmask, &gateway);
+  if (netifapi_netif_set_addr(netif, &ipaddr, &netmask, &gateway) != ERR_OK) {
+    debugf("Failed to apply static network configuration");
+    return;
+  }
+
+  network_apply_static_dns();
+
+  if (!(network_status & NETWORK_STATUS_HAS_ADDR))
+    menu_notify_ip(ip4addr_ntoa(&ipaddr));
+  network_status |= NETWORK_STATUS_HAS_ADDR;
+}
+
 #define SNTP_FALLBACK_SERVER "pool.ntp.org"
+
+static void sntp_configure_servers(void)
+{
+  bool has_configured_servers = inifile_config_has("ntp", "ip");
+
+  if (has_configured_servers) {
+    for (int i = 0; i < inifile_config_num_values("ntp", "ip"); i++) {
+      ip_addr_t server;
+      ip_addr_set_ip4_u32(&server,
+                          htonl(inifile_config_get_ip_n("ntp", "ip", 0, i)));
+      sntp_setserver(i, &server);
+    }
+  }
+
+  sntp_servermode_dhcp(!has_configured_servers);
+}
 
 static void sntp_enable_dhcp_servers_callback(void *arg)
 {
   (void)arg;
-  sntp_servermode_dhcp(1);
+  sntp_configure_servers();
 }
 
 static void sntp_enable_dhcp_servers(void)
@@ -1543,6 +1876,7 @@ static void sntp_start_callback(void *arg)
   (void)arg;
   if (!(network_status & NETWORK_STATUS_SNTP_STARTED)) {
     network_status |= NETWORK_STATUS_SNTP_STARTED;
+    sntp_configure_servers();
 #if SNTP_SERVER_DNS
     if (ip_addr_isany(sntp_getserver(0)) && sntp_getservername(0) == NULL)
       sntp_setservername(0, SNTP_FALLBACK_SERVER);
@@ -1571,12 +1905,93 @@ uint8_t mcu_hw_network_status(void)
 #define WIFI_STATE_CONNECTED    3
 
 static int wifi_state = WIFI_STATE_UNKNOWN;
+static volatile bool wifi_manager_ready = false;
+static volatile bool wifi_auto_connect_pending = false;
+static bool wifi_auto_connect_started = false;
 
 static char *wifi_ssid = NULL;
 static char *wifi_key = NULL;
 static int s_retry_num = 0;
 static QueueHandle_t wifi_event_queue = NULL;
 static uint32_t wifi_reported_ip = 0;
+static void wifi_auto_connect_start_if_ready(void);
+
+static void wifi_auto_connect_task(void *param)
+{
+  (void)param;
+  char *ssid = inifile_config_get_str("wifi", "ssid");
+  char *key = inifile_config_get_str("wifi", "pass");
+
+  if (!ssid || !key) {
+    debugf("No WiFi setup");
+    network_status &= ~NETWORK_STATUS_WIFI_AUTO;
+    wifi_auto_connect_started = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  network_status |= NETWORK_STATUS_WIFI_AUTO;
+  debugf("Connecting to WiFi '%s'", ssid);
+  if (!mcu_hw_wifi_connect(ssid, key)) {
+    debugf("WiFi auto-connect failed");
+    network_status &= ~NETWORK_STATUS_WIFI_AUTO;
+    wifi_auto_connect_started = false;
+    wifi_auto_connect_start_if_ready();
+  }
+  vTaskDelete(NULL);
+}
+
+static void wifi_auto_connect_start_if_ready(void)
+{
+  if (!wifi_auto_connect_pending || !wifi_manager_ready ||
+      wifi_auto_connect_started)
+    return;
+  if (active_network_interface == NETWORK_INTERFACE_RTL8152 ||
+      active_network_interface == NETWORK_INTERFACE_ASIX)
+    return;
+
+  wifi_auto_connect_pending = false;
+  wifi_auto_connect_started = true;
+  if (xTaskCreate(wifi_auto_connect_task, "wifi auto", 1024, NULL,
+                  TASK_PRIORITY_FW, NULL) != pdPASS) {
+    wifi_auto_connect_started = false;
+    network_status &= ~NETWORK_STATUS_WIFI_AUTO;
+    debugf("Failed to start WiFi auto-connect task");
+  }
+}
+
+static int wifi_connect_with_network_config(const char *ssid, const char *key)
+{
+  wifi_mgmr_sta_connect_params_t params = {0};
+  size_t ssid_len = strlen(ssid);
+  size_t key_len = strlen(key);
+
+  if (ssid_len > sizeof(params.ssid) || key_len > sizeof(params.key)) {
+    debugf("WiFi credentials exceed supported length");
+    return -1;
+  }
+
+  memcpy(params.ssid, ssid, ssid_len);
+  memcpy(params.key, key, key_len);
+  params.ssid_len = (uint8_t)ssid_len;
+  params.key_len = (uint8_t)key_len;
+  params.use_dhcp = network_uses_dhcp();
+  params.quick_connect = 1;
+
+  return wifi_mgmr_sta_connect(&params);
+}
+
+void mcu_hw_wifi_auto_connect(void)
+{
+  if (!inifile_config_has("wifi", "ssid") ||
+      !inifile_config_has("wifi", "pass")) {
+    debugf("No WiFi setup");
+    return;
+  }
+
+  wifi_auto_connect_pending = true;
+  wifi_auto_connect_start_if_ready();
+}
 
 static void wifi_got_ip(const ip4_addr_t *ip, bool force_notify)
 {
@@ -1639,6 +2054,8 @@ void wifi_event_handler(async_input_event_t ev, void *priv)
   } break;
   case CODE_WIFI_ON_MGMR_DONE: {
     debugf("[APP] [EVT] %s, CODE_WIFI_ON_MGMR_DONE", __func__);
+    wifi_manager_ready = true;
+    wifi_auto_connect_start_if_ready();
   } break;
   case CODE_WIFI_ON_SCAN_DONE: {
     debugf("[APP] [EVT] %s, CODE_WIFI_ON_SCAN_DONE", __func__);
@@ -1658,8 +2075,24 @@ void wifi_event_handler(async_input_event_t ev, void *priv)
      * which may already be up and have a valid IPv4 lease.
      */
     network_status |= NETWORK_STATUS_WIFI;
+    bool static_ip_applied = false;
+    if (!network_uses_dhcp()) {
+      ip4_addr_t ipaddr, netmask, gateway;
+      network_get_static_ipv4(&ipaddr, &netmask, &gateway);
+      if (wifi_mgmr_sta_ip_set(ipaddr.addr, netmask.addr, gateway.addr, 0) == 0) {
+        network_apply_static_dns();
+        wifi_got_ip(&ipaddr, true);
+        static_ip_applied = true;
+      } else {
+        debugf("Failed to apply static WiFi network configuration");
+      }
+    }
     unsigned char evt = 3; 
     xQueueSendFromISR(wifi_event_queue, &evt, 0);
+    if (static_ip_applied) {
+      unsigned char static_ip_evt = 4;
+      xQueueSendFromISR(wifi_event_queue, &static_ip_evt, 0);
+    }
   } break;
   case CODE_WIFI_ON_GOT_IP: {
     debugf("[APP] [EVT] %s, CODE_WIFI_ON_GOT_IP", __func__);
@@ -1741,12 +2174,14 @@ static void wait4event(char code, char code2) {
           debugf("  -> disconnect");
           if (s_retry_num < 10) {
             // connect
-            wifi_mgmr_sta_quickconnect(wifi_ssid, wifi_key, 0, 0);
+            wifi_connect_with_network_config(wifi_ssid, wifi_key);
             s_retry_num++;
             debugf("retry to connect to the AP");
-            at_wifi_puts(".");
+            if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+              at_wifi_puts(".");
           } else {
-            at_wifi_puts("\r\nConnection failed!\r\n");
+            if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+              at_wifi_puts("\r\nConnection failed!\r\n");
             debugf("finally failed");
           }	
           break;
@@ -1755,7 +2190,8 @@ static void wait4event(char code, char code2) {
           break;
         case 4:
           debugf("  -> got ip");
-          at_wifi_puts("\r\nConnected\r\n");
+          if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+            at_wifi_puts("\r\nConnected\r\n");
           break;	
         case 5:
           debugf("  -> init done");
@@ -1867,19 +2303,22 @@ bool mcu_hw_wifi_connect(char *ssid, char *key) {
   if (active_network_interface == NETWORK_INTERFACE_RTL8152 ||
       active_network_interface == NETWORK_INTERFACE_ASIX) {
     debugf("Ignoring WiFi command since USB Ethernet is active");
-    at_wifi_puts("WiFi not available\r\n");
+    if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+      at_wifi_puts("WiFi not available\r\n");
     return false;
   }
 
   if (!(network_status & NETWORK_STATUS_TCPIP_INIT)) {
     debugf("Ignoring WiFi command since TCP stack is not initialized");
-    at_wifi_puts("TCPIP not available\r\n");
+    if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+      at_wifi_puts("TCPIP not available\r\n");
     return false;
   }
 
-  debugf("WiFI: connect to %s/%s", ssid, key);
+  debugf("WiFi: connect to '%s'", ssid);
   
-  at_wifi_puts("WiFI: Connecting...");
+  if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+    at_wifi_puts("WiFI: Connecting...");
   if(wifi_ssid) free(wifi_ssid);
   if(wifi_key) free(wifi_key);
 
@@ -1892,18 +2331,24 @@ bool mcu_hw_wifi_connect(char *ssid, char *key) {
   wifi_key = strdup(key);
   
   s_retry_num = 0;
-  if (0 != wifi_mgmr_sta_quickconnect(wifi_ssid, wifi_key, 0, 0)) {
+  if (0 != wifi_connect_with_network_config(wifi_ssid, wifi_key)) {
     debugf("\r\nWiFI: STA failed!");
+    if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+      at_wifi_puts("\r\nWiFI: Connection failed!\r\n");
+    return false;
   } else {
     wait4event(4, 4);
     if (wifi_mgmr_sta_state_get() == 1 && (network_status & NETWORK_STATUS_HAS_ADDR)) {
       active_network_interface = NETWORK_INTERFACE_WIFI;
       network_status |= NETWORK_STATUS_TCPIP_INIT | NETWORK_STATUS_WIFI | NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR;
-      at_wifi_puts("\r\nWiFI: Connected\r\n");
-      wifi_info();
+      if (!(network_status & NETWORK_STATUS_WIFI_AUTO)) {
+        at_wifi_puts("\r\nWiFI: Connected\r\n");
+        wifi_info();
+      }
     } else {
       debugf("\r\nWiFI: Connection failed!");
-      at_wifi_puts("\r\nWiFI: Connection failed!\r\n");
+      if (!(network_status & NETWORK_STATUS_WIFI_AUTO))
+        at_wifi_puts("\r\nWiFI: Connection failed!\r\n");
       network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR | NETWORK_STATUS_TCP_CONNECTED);
       if (active_network_interface == NETWORK_INTERFACE_WIFI)
         active_network_interface = NETWORK_INTERFACE_NONE;
@@ -2555,8 +3000,41 @@ delete:
 
 void usbh_msc_run(struct usbh_msc *msc_class)
 {
-  xTaskCreate(usbh_msc_thread, "usbh_msc", 2048, msc_class,
-              CONFIG_USBHOST_PSC_PRIO - 1, &usbh_msc_handle);
+  // short-lived task (scsi init + fatfs register), keep the stack small as the
+  // device may be enumerated while wifi/wpa is under heavy heap pressure
+  if (xTaskCreate(usbh_msc_thread, "usbh_msc", 1024, msc_class,
+                  CONFIG_USBHOST_PSC_PRIO - 1, &usbh_msc_handle) != pdPASS) {
+    usbh_msc_handle = NULL;
+    usb_debugf("usbh_msc: task creation failed\r\n");
+  }
+}
+
+volatile size_t xMallocFailedSize = 0;
+
+// overrides the SDK's weak hook to report the heap state before aborting
+void vApplicationMallocFailedHook(void)
+{
+  usb_debugf("vApplicationMallocFailedHook: request %u bytes, task %s\r\n",
+         (unsigned)xMallocFailedSize, pcTaskGetName(NULL));
+
+  for (uint32_t i = 0; i < CONFIG_MM_HEAP_COUNT; i++) {
+    mm_heap_t *heap = g_mem_manager.heaps[i];
+    if (!heap || !heap->is_active) continue;
+
+    const mm_allocator_t *allocator = g_mem_manager.allocators[heap->allocator_id];
+    if (!allocator || !allocator->get_usage_info) continue;
+
+    struct mm_usage_info usage;
+    uintptr_t flags = mm_lock_save();
+    allocator->get_usage_info(heap, &usage);
+    mm_unlock_restore(flags);
+
+    usb_debugf("  heap %u (%s): total %u, free %u, largest free block %u\r\n",
+           (unsigned)i, heap->name, (unsigned)usage.total_size,
+           (unsigned)usage.free_size, (unsigned)usage.max_free_size);
+  }
+
+  abort();
 }
 
 void usbh_msc_stop(struct usbh_msc *msc_class)
@@ -2654,12 +3132,9 @@ bool mcu_hw_usb_msc_present(void) {
 void sntp_set_system_time(u32_t sec) {
   debugf("%s(%lu)", __FUNCTION__, sec);
 
-  time_t ut = sec;
+  time_t ut = sec + 3600 * inifile_config_get_int("ntp", "timezone", 0);
   struct tm* timeinfo = gmtime(&ut);
 
-  // TODO: handle time zone
-  // (needs to be read from config or the like)
-  
   // time is UTC ...
   debugf(" YEAR:     %u", 1900 + timeinfo->tm_year);
   debugf(" MONTH:    %u", 1 + timeinfo->tm_mon);
@@ -2687,15 +3162,22 @@ static void usbh_lwip_netif_link_callback(struct netif *netif)
   debugf("USB netif link status changed %s", netif_is_link_up(netif) ? "up" : "down");
   if (netif_is_link_up(netif)) {
     network_status |= NETWORK_STATUS_UP;
-    dhcp_start(netif);
-    if (dhcp_handle)
-      xTimerStart(dhcp_handle, 0);
+    if (network_uses_dhcp()) {
+      if (dhcp_handle)
+        xTimerStart(dhcp_handle, 0);
+    } else {
+      network_apply_static_ipv4(netif);
+    }
   } else {
-    network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR |
-                        NETWORK_STATUS_TCP_CONNECTED);
-    dhcp_stop(netif);
-    dhcp_cleanup(netif);
-    menu_notify_network_disconnected();
+    if (active_network_interface != NETWORK_INTERFACE_WIFI) {
+      network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR |
+                          NETWORK_STATUS_TCP_CONNECTED);
+      menu_notify_network_disconnected();
+    }
+    if (network_uses_dhcp()) {
+      dhcp_stop(netif);
+      dhcp_cleanup(netif);
+    }
   }
 }
 
@@ -2785,32 +3267,54 @@ static void dhcp_timeout(void *arg)
 static void network_link_monitor(void *arg)
 {
     struct netif *netif = (struct netif *)arg;
-    enum network_interface interface = active_network_interface;
+  enum network_interface interface = active_usb_network_interface;
+  bool fallback_requested = false;
+  bool asix_status_monitor_started = false;
 
     while (active_network_netif == netif) {
-      int ret;
       bool connected;
 
-      if (interface == NETWORK_INTERFACE_RTL8152) {
-        ret = usbh_rtl8152_get_connect_status(active_rtl8152);
-      } else {
-        if (!active_asix) {
-          ret = 0;
-          connected = false;
-        } else {
-          ret = usbh_asix_get_connect_status(active_asix);
-          connected = active_asix->connect_status;
-        }
+      if (interface == NETWORK_INTERFACE_ASIX && asix_status_monitor_started &&
+          active_asix) {
+        int status = usbh_asix_get_connect_status(active_asix);
+        if (status < 0)
+          debugf("ASIX link status request failed: %d", status);
       }
 
-      if (ret == 0) {
-        if (interface == NETWORK_INTERFACE_RTL8152)
-          connected = active_rtl8152->connect_status;
-        if (connected != netif_is_link_up(netif)) {
-          if (connected)
-            netif_set_link_up(netif);
-          else
-            netif_set_link_down(netif);
+      if (interface == NETWORK_INTERFACE_RTL8152) {
+        connected = active_rtl8152 &&
+                    *(volatile bool *)&active_rtl8152->connect_status;
+      } else {
+        connected = active_asix &&
+                    *(volatile bool *)&active_asix->connect_status;
+      }
+
+      if (connected) {
+        if (interface == NETWORK_INTERFACE_ASIX)
+          asix_status_monitor_started = true;
+        fallback_requested = false;
+        if (active_network_interface != interface) {
+          active_network_interface = interface;
+          network_status &= ~NETWORK_STATUS_WIFI;
+        }
+        if (!netif_is_link_up(netif)) {
+          netif_set_default(netif);
+          netif_set_link_up(netif);
+        }
+      } else {
+        if (netif_is_link_up(netif))
+          netif_set_link_down(netif);
+
+        if (active_network_interface == interface) {
+          active_network_interface = NETWORK_INTERFACE_NONE;
+          network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR |
+                              NETWORK_STATUS_TCP_CONNECTED);
+        }
+
+        if (active_network_interface == NETWORK_INTERFACE_NONE &&
+            !fallback_requested) {
+          fallback_requested = true;
+          mcu_hw_wifi_auto_connect();
         }
       }
 
@@ -2860,7 +3364,8 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 {
     struct netif *netif = &g_rtl8152_netif;
 
-  if (active_network_interface != NETWORK_INTERFACE_NONE) {
+  if (active_network_netif != NULL ||
+      active_network_interface != NETWORK_INTERFACE_NONE) {
     debugf("Ignoring RTL8152 since another network interface is active");
     return;
   }
@@ -2876,11 +3381,10 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 
     netif = netif_add(netif, &g_ipaddr, &g_netmask, &g_gateway, NULL, usbh_rtl8152_if_init, tcpip_input);
     active_network_interface = NETWORK_INTERFACE_RTL8152;
+    active_usb_network_interface = NETWORK_INTERFACE_RTL8152;
     active_network_netif = netif;
-    network_status &= ~NETWORK_STATUS_WIFI;
     netif_set_link_callback(netif, usbh_lwip_netif_link_callback);
     netif_set_status_callback(netif, usbh_lwip_netif_status_callback);
-    netif_set_default(netif);
     while (!netif_is_up(netif)) {
     }
 
@@ -2891,14 +3395,16 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
         }
     }
 
-    xTaskCreate(usbh_rtl8152_rx_thread, "usbh_rtl8152_rx", 2048, NULL,
+    xTaskCreate(usbh_rtl8152_rx_thread, "usbh_rtl8152_rx", USB_ETH_RX_TASK_STACK_SIZE, NULL,
                 CONFIG_USBHOST_PSC_PRIO + 1, NULL);
     active_rtl8152 = rtl8152_class;
-    xTaskCreate(network_link_monitor, "net link", 1536, netif,
+    xTaskCreate(network_link_monitor, "net link", NETWORK_LINK_TASK_STACK_SIZE, netif,
             CONFIG_USBHOST_PSC_PRIO + 1, &network_link_task);
     sntp_enable_dhcp_servers();
-    dhcp_start(netif);
-    xTimerStart(dhcp_handle, 0);
+    if (network_uses_dhcp()) {
+      dhcp_start(netif);
+      xTimerStart(dhcp_handle, 0);
+    }
 }
 
 void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
@@ -2913,8 +3419,10 @@ void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
         network_link_task = NULL;
     }
 
-    dhcp_stop(netif);
-    dhcp_cleanup(netif);
+    if (network_uses_dhcp()) {
+      dhcp_stop(netif);
+      dhcp_cleanup(netif);
+    }
     if (dhcp_handle) {
         xTimerDelete(dhcp_handle, 0);
         dhcp_handle = NULL;
@@ -2922,9 +3430,12 @@ void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
     netif_set_down(netif);
     netif_remove(netif);
     active_network_netif = NULL;
-    active_network_interface = NETWORK_INTERFACE_NONE;
+    active_usb_network_interface = NETWORK_INTERFACE_NONE;
+    if (active_network_interface == NETWORK_INTERFACE_RTL8152)
+      active_network_interface = NETWORK_INTERFACE_NONE;
     active_rtl8152 = NULL;
-    network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR | NETWORK_STATUS_TCP_CONNECTED);
+    if (active_network_interface != NETWORK_INTERFACE_WIFI)
+      network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR | NETWORK_STATUS_TCP_CONNECTED);
 }
 
 struct netif g_asix_netif;
@@ -2966,7 +3477,8 @@ void usbh_asix_run(struct usbh_asix *asix_class)
 {
     struct netif *netif = &g_asix_netif;
 
-  if (active_network_interface != NETWORK_INTERFACE_NONE) {
+  if (active_network_netif != NULL ||
+      active_network_interface != NETWORK_INTERFACE_NONE) {
     debugf("Ignoring ASIX since another network interface is active");
     return;
   }
@@ -2982,11 +3494,10 @@ void usbh_asix_run(struct usbh_asix *asix_class)
 
     netif = netif_add(netif, &g_ipaddr, &g_netmask, &g_gateway, NULL, usbh_asix_if_init, tcpip_input);
     active_network_interface = NETWORK_INTERFACE_ASIX;
+    active_usb_network_interface = NETWORK_INTERFACE_ASIX;
     active_network_netif = netif;
-    network_status &= ~NETWORK_STATUS_WIFI;
     netif_set_link_callback(netif, usbh_lwip_netif_link_callback);
     netif_set_status_callback(netif, usbh_lwip_netif_status_callback);
-    netif_set_default(netif);
     while (!netif_is_up(netif)) {
     }
 
@@ -2997,14 +3508,16 @@ void usbh_asix_run(struct usbh_asix *asix_class)
         }
     }
 
-    xTaskCreate(usbh_asix_rx_thread, "usbh_asix_rx", 2048, NULL,
+    xTaskCreate(usbh_asix_rx_thread, "usbh_asix_rx", USB_ETH_RX_TASK_STACK_SIZE, NULL,
                 CONFIG_USBHOST_PSC_PRIO + 1, NULL);
     active_asix = asix_class;
-    xTaskCreate(network_link_monitor, "net link", 1536, netif,
+    xTaskCreate(network_link_monitor, "net link", NETWORK_LINK_TASK_STACK_SIZE, netif,
             CONFIG_USBHOST_PSC_PRIO + 1, &network_link_task);
     sntp_enable_dhcp_servers();
-    dhcp_start(netif);
-    xTimerStart(dhcp_handle, 0);
+    if (network_uses_dhcp()) {
+      dhcp_start(netif);
+      xTimerStart(dhcp_handle, 0);
+    }
 }
 
 void usbh_asix_stop(struct usbh_asix *asix_class)
@@ -3019,8 +3532,10 @@ void usbh_asix_stop(struct usbh_asix *asix_class)
         network_link_task = NULL;
     }
 
-    dhcp_stop(netif);
-    dhcp_cleanup(netif);
+    if (network_uses_dhcp()) {
+      dhcp_stop(netif);
+      dhcp_cleanup(netif);
+    }
     if (dhcp_handle) {
         xTimerDelete(dhcp_handle, 0);
         dhcp_handle = NULL;
@@ -3028,9 +3543,12 @@ void usbh_asix_stop(struct usbh_asix *asix_class)
     netif_set_down(netif);
     netif_remove(netif);
     active_network_netif = NULL;
-    active_network_interface = NETWORK_INTERFACE_NONE;
+    active_usb_network_interface = NETWORK_INTERFACE_NONE;
+    if (active_network_interface == NETWORK_INTERFACE_ASIX)
+      active_network_interface = NETWORK_INTERFACE_NONE;
     active_asix = NULL;
-    network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR | NETWORK_STATUS_TCP_CONNECTED);
+    if (active_network_interface != NETWORK_INTERFACE_WIFI)
+      network_status &= ~(NETWORK_STATUS_UP | NETWORK_STATUS_HAS_ADDR | NETWORK_STATUS_TCP_CONNECTED);
 }
 
 // BL616 MPU pin mapping

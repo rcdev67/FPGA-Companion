@@ -81,7 +81,7 @@ git clone https://github.com/MiSTle-Dev/FPGA-Companion.git  --recursive
 cd FPGA-Companion
 ```
 
-Alternally do a
+Alternatively do a
 
 ```bash
 git submodule update --init
@@ -100,6 +100,7 @@ mkdir build
 cd build
 cmake -DBOARD=PICO ..
 # for Pico OSD core loader use: cmake -DBOARD=MSP20K ..
+# for Pico2 OSD core loader use: cmake -DBOARD=MSP2_20K ..
 make
 ```
 

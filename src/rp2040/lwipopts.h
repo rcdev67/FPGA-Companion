@@ -72,11 +72,14 @@
 #define LWIP_DHCP_DOES_ACD_CHECK    0
 
 // enable PPP for wireless via esp32
+#if MISTLE_BOARD == 6
 #define PPP_SUPPORT                 1
 #define PPPOS_SUPPORT               1
+#endif
 
 #define LWIP_DHCP_GET_NTP_SRV       1
 #define LWIP_DHCP_MAX_NTP_SERVERS   2
+#define SNTP_SERVER_DNS             1
 void sntp_set_system_time(uint32_t sec);
 #define SNTP_SET_SYSTEM_TIME        sntp_set_system_time
 #define SO_REUSE                    1

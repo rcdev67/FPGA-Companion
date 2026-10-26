@@ -54,12 +54,29 @@ static void sdc_spi_begin(void) {
   mcu_hw_spi_tx_u08(SPI_TARGET_SDC);
 }
 
-// max time to wait for the fpga/sd card to leave the busy state, and for a
-// single sector read/write to complete once issued. Without these bounds a
-// stalled fpga/card hangs the MCU forever and, worse, the caller currently
-// has no way to notice a sector that never really finished
+// max time to wait for the fpga/sd card. Without these bounds a stalled
+// fpga/card hangs the MCU forever and, worse, the caller currently has no way
+// to notice a sector that never really finished.
+//   SDC_BUSY_TIMEOUT_MS     the card is still busy with a transfer for the core
+//                           when the MCU wants a sector of its own
+//   SDC_READY_TIMEOUT_MS    one sector read of the MCU, from the request until
+//                           the fpga reports it done. This is the bound a slow
+//                           card can run into, so it is generous: if it fires on
+//                           a card that is merely slow, the fpga still finishes
+//                           the sector while the MCU has given up, and the two
+//                           are out of step from then on. A controller that
+//                           never answers is caught all the same. A read right
+//                           after a failed write also waits while the fpga
+//                           initializes the card again, and CMD0 alone waits
+//                           64,000 clocks of the slow init clock
+//   SDC_SLOW_REPORT_MS      a sector of the MCU slower than this is logged with
+//                           its time, so a slow card shows up in the log long
+//                           before it reaches a bound
+//   SDC_CORE_RW_TIMEOUT_MS  the core does its own io on a sector the MCU told
+//                           it about
 #define SDC_BUSY_TIMEOUT_MS   1000
-#define SDC_READY_TIMEOUT_MS  2000      // a card may still be busy after a run of writes
+#define SDC_READY_TIMEOUT_MS  3000
+#define SDC_SLOW_REPORT_MS    200
 #define SDC_WRITE_DONE_TIMEOUT_MS 5000   // cards may stall this long after many single sector writes
 #define SDC_CORE_RW_TIMEOUT_MS 1000
 
@@ -144,6 +161,11 @@ static int sdc_read_sector_once(unsigned long sector, unsigned char *buffer) {
       return -1;
     }
   }
+  // tell if this sector was slow, a slow card should show up in the log
+  // long before it runs into the timeout above
+  if((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(SDC_SLOW_REPORT_MS))
+    sdc_debugf("read of sector %lu took %lu ms", sector,
+               (unsigned long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS));
 
   // read 512 bytes sector data
   for(int i=0;i<512;i++) buffer[i] = mcu_hw_spi_tx_u08(0);
@@ -213,6 +235,22 @@ static int sdc_write_sector_once(unsigned long sector, const unsigned char *buff
       return -1;
     }
     vTaskDelay(1);
+  }
+  // tell if this sector was slow, see the read path
+  if((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(SDC_SLOW_REPORT_MS))
+    sdc_debugf("write of sector %lu took %lu ms", sector,
+               (unsigned long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS));
+
+  // The fpga reports a failed write in bit 0 of the status byte (upstream).
+  // Our loop above has already ended the command, so this is just the read.
+  sdc_spi_begin();
+  mcu_hw_spi_tx_u08(SPI_SDC_STATUS);
+  status = mcu_hw_spi_tx_u08(0);
+  mcu_hw_spi_end();
+  if(status & 0x01) {
+    sdc_last_error = 5;
+    sdc_debugf("SDC: write error on sector %lu", sector);
+    return -1;
   }
 
   return 0;
