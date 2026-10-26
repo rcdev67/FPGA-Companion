@@ -39,6 +39,7 @@
 #include "sysctrl.h"
 #include "sdc.h"
 #include "menu.h"
+#include "config.h"   // for config_find_role()
 #include "debug.h"
 
 #define NET_PORT          1
@@ -205,10 +206,47 @@ static void net_snapshot(const char *why) {
   net_log(line);
 }
 
+/* ---------------------------------------------------------------------------
+   Which menu entry routes the core's UART to the companion's own port
+
+   Port 1 only exists while the core routes its serial pins to it. Which menu
+   variable does that is the core's business, not ours: the id "E" is the
+   serial port in the Atari ST core and the video standard in the C64 core,
+   where writing it cold boots the machine. So the core declares the entry with
+   role="netport" and we look it up - see config_find_role().
+
+   No role means the running core offers no such port. Then the whole feature
+   stays quiet rather than guessing.
+   --------------------------------------------------------------------------- */
+
+static bool netport_ok = false;      // the running core declares a netport
+static unsigned char netport_id;     // the variable that selects it
+static unsigned char netport_val;    // the value that routes it to port 1
+
+// route the core's UART to our port
+static void netport_select(void) {
+  if(!netport_ok) return;
+  sys_set_val(netport_id, netport_val);
+}
+
+// and give the user's own setting back
+static void netport_restore(void) {
+  if(!netport_ok) return;
+  int v = menu_variable_get(netport_id);
+  sys_set_val(netport_id, (v < 0) ? 0 : v);
+}
+
 static void net_port_reset(void) {
-  sys_set_val('E', 1);
+  if(!netport_ok) return;
+  // Away from our port and back, so the core builds the FIFOs up again. Any
+  // other value will do; the user's own setting is the obvious one, and a 0
+  // if that happens to be our port already.
+  int v = menu_variable_get(netport_id);
+  unsigned char other = (v >= 0 && (unsigned char)v != netport_val) ? (unsigned char)v : 0;
+  if(other == netport_val) other = netport_val ? 0 : 1;
+  sys_set_val(netport_id, other);
   vTaskDelay(pdMS_TO_TICKS(50));
-  sys_set_val('E', 2);
+  sys_set_val(netport_id, netport_val);
   vTaskDelay(pdMS_TO_TICKS(50));
   net_flush();
   net_log("port reset");
@@ -1174,7 +1212,7 @@ static void net_task(__attribute__((unused)) void *parms) {
     if((!modem_ip[0] || !time_set) && link_state != LINK_NONE && state != NET_STATE_BUSY &&
        (int32_t)(xTaskGetTickCount() - next_probe) >= 0) {
       probes++;
-      sys_set_val('E', 2);
+      netport_select();
       vTaskDelay(pdMS_TO_TICKS(50));
       if(!modem_ati()) {
         // Nothing on the port. In its first seconds that is normal: a
@@ -1217,8 +1255,7 @@ static void net_task(__attribute__((unused)) void *parms) {
           state = name_count ? NET_STATE_LIST : NET_STATE_IDLE;
       }
       else if(link_state != LINK_NONE) link_state = wifi_down ? LINK_NO_WIFI : LINK_TRYING;
-      int e0 = menu_variable_get('E');
-      sys_set_val('E', (e0 < 0) ? 0 : e0);
+      netport_restore();
       debugf("NET: modem address probe %d: '%s'", probes, modem_ip);
       {
         // the start-up in NETLOG.TXT, for the day the clock stays wrong
@@ -1241,10 +1278,10 @@ static void net_task(__attribute__((unused)) void *parms) {
     TickType_t wait = hold_release ? pdMS_TO_TICKS(200) :
       ((!modem_ip[0] || !time_set) && link_state != LINK_NONE) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
     if(xQueueReceive(req_queue, &req, wait)) {
-      // Port 1 only exists while the core routes the M0S connector to it
-      // ("Serial: Netz"). Switch it on for the request regardless of the
-      // menu, and put the user's setting back afterwards.
-      sys_set_val('E', 2);
+      // Port 1 only exists while the core routes its serial pins to it.
+      // Switch it on for the request regardless of the menu, and put the
+      // user's setting back afterwards.
+      netport_select();
       vTaskDelay(pdMS_TO_TICKS(50));
 
       if(req == REQ_LIST)          fetch_list();
@@ -1258,25 +1295,27 @@ static void net_task(__attribute__((unused)) void *parms) {
       // the clock, if the probes after power up did not get that far
       if(!time_set && modem_ip[0]) modem_time_sync();
 
-      int e = menu_variable_get('E');
-      sys_set_val('E', (e < 0) ? 0 : e);
+      netport_restore();
     }
   }
 }
 
 void netdl_request_list(void) {
   int req = REQ_LIST;
+  if(!req_queue) return;   // no port in this core, no task, no queue
   if(state != NET_STATE_BUSY) xQueueSendToBack(req_queue, &req, 0);
 }
 
 void netdl_request_joy(bool pair) {
   int req = pair ? REQ_JOY_PAIR : REQ_JOY;
+  if(!req_queue) return;
   if(state != NET_STATE_BUSY && !joy_busy) xQueueSendToBack(req_queue, &req, 0);
 }
 const char *netdl_joy_status(void) { return joy_status; }
 bool netdl_joy_busy(void) { return joy_busy; }
 
 void netdl_request_download(int index) {
+  if(!req_queue) return;
   if(state != NET_STATE_BUSY) xQueueSendToBack(req_queue, &index, 0);
 }
 
@@ -1314,6 +1353,9 @@ int netdl_get_clock_wait(void) { return clock_wait; }
 // returns true and calls release() from the net task then, or when
 // clockwait= seconds are over. Without a modem nothing waits.
 bool netdl_hold_start(void (*release)(void)) {
+  // without a port there is no modem and no clock to wait for, so the core
+  // must not be held back
+  if(!netport_ok) return false;
   if(clock_wait <= 0 || (!wifi_cfg[0] && !server[0])) return false;
   hold_release = release;
   return true;
@@ -1334,7 +1376,17 @@ uint32_t netdl_bytes_done(void) { return bytes_done; }
 uint32_t netdl_bytes_total(void) { return bytes_total; }
 
 void netdl_init(void) {
-  debugf("NET: init");
+  // Ask the running core where its companion port is. A core that offers none
+  // gets no net task at all: it would have nothing to talk to, and writing a
+  // variable on spec is how this feature used to cold boot the C64 over and
+  // over.
+  netport_ok = config_find_role("netport", &netport_id, &netport_val);
+  if(!netport_ok) {
+    debugf("NET: no netport role in this core, net disabled");
+    return;
+  }
+
+  debugf("NET: init, netport is '%c' = %d", netport_id, netport_val);
   rx_stream = xStreamBufferCreate(NET_RX_BUF, 1);
   req_queue = xQueueCreate(2, sizeof(int));
   xTaskCreate(net_task, (char *)"net_task", 4096, NULL, configMAX_PRIORITIES-10, NULL);

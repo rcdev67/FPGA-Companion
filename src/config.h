@@ -67,6 +67,18 @@ typedef struct {
 typedef struct config_listentry_S {
   char *label;
   unsigned char value;
+  // What this entry means to the companion, if anything.
+  //
+  // Variable ids and labels belong to the core: "E" is the serial port on one
+  // core and the video standard on the next, and a label is display text that
+  // may be renamed or translated. So a core that wants a companion feature to
+  // find an entry declares a role for it, and the companion looks up the role
+  // instead of knowing the id. See config_find_role().
+  //
+  // Parsers ignore attributes they do not know, so this is compatible in both
+  // directions: another companion skips our role, and we find none in a core
+  // that declares none - in which case the feature stays off.
+  char *role;
   struct config_listentry_S *next;
 } config_listentry_t;
 
@@ -151,5 +163,11 @@ void config_init(void);
 config_action_t *config_get_action(const char *);
 void config_dump(void);
 const char *config_menuentry_get_type_str(config_menu_entry_t *);
+
+// Find the list entry a core declared for the given role and return the
+// variable id of its list and the value of the entry. Returns false if the
+// running core declares no such role, which is how a companion feature stays
+// quiet on a core that does not offer it.
+bool config_find_role(const char *role, unsigned char *id, unsigned char *value);
 
 #endif // CONFIG_H

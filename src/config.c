@@ -527,6 +527,7 @@ static void config_xml_new_listentry(config_list_t *list) {
   config_listentry_t *listentry = pvPortMalloc(sizeof(config_listentry_t));
   listentry->value = 0;
   listentry->label = NULL;
+  listentry->role = NULL;
   listentry->next = NULL;
 
   // append new menu entry to chain of menu entries
@@ -578,10 +579,13 @@ static void config_xml_listentry_attribute(char *name, char *value) {
     while(le->next) le = le->next;
 
     if(strcasecmp(name, "label") == 0 && !le->label)
-      le->label = StrDup(value);      
+      le->label = StrDup(value);
     else if(strcasecmp(name, "value") == 0)
-      le->value = atoi(value);      
-    
+      le->value = atoi(value);
+    // what this entry means to the companion, see config_find_role()
+    else if(strcasecmp(name, "role") == 0 && !le->role)
+      le->role = StrDup(value);
+
     else
       debugf("WARNING: Unused listentry attribute '%s'", name);
   }
@@ -591,10 +595,50 @@ static void config_dump_list(config_list_t *ls) {
   debugf("List, id='%c', label=\"%s\", default=\"%d\"", ls->id, ls->label, ls->def);
   config_listentry_t *le = ls->listentries;
   while(le) {
-    debugf("  Listentry, label=\"%s\", value=\"%d\"", le->label, le->value);
+    if(le->role) debugf("  Listentry, label=\"%s\", value=\"%d\", role=\"%s\"",
+		        le->label, le->value, le->role);
+    else         debugf("  Listentry, label=\"%s\", value=\"%d\"", le->label, le->value);
     le = le->next;
   }
   if(ls->action) config_dump_action(ls->action);
+}
+
+/* ============================================================================= */
+/* ================================= roles ===================================== */
+/* ============================================================================= */
+
+/* A core declares a role on a list entry to tell the companion what that entry
+   is for, so that companion features do not have to know the core's variable
+   ids. Ids differ between cores - "E" is the serial port in the Atari ST core
+   and the video standard in the C64 core - and writing one blindly resets the
+   wrong machine. */
+
+static bool config_find_role_in_menu(config_menu_t *menu, const char *role,
+				     unsigned char *id, unsigned char *value) {
+  if(!menu) return false;
+
+  for(config_menu_entry_t *me = menu->entries; me; me = me->next) {
+    if(me->type == CONFIG_MENU_ENTRY_MENU) {
+      // submenus are searched as well, a role may sit anywhere
+      if(config_find_role_in_menu(me->menu, role, id, value)) return true;
+    }
+    else if(me->type == CONFIG_MENU_ENTRY_LIST && me->list) {
+      for(config_listentry_t *le = me->list->listentries; le; le = le->next) {
+	if(le->role && strcasecmp(le->role, role) == 0) {
+	  if(id)    *id = me->list->id;
+	  if(value) *value = le->value;
+	  return true;
+	}
+      }
+    }
+  }
+
+  return false;
+}
+
+bool config_find_role(const char *role, unsigned char *id, unsigned char *value) {
+  if(!cfg || !cfg->menu || !role) return false;
+  return config_find_role_in_menu(cfg->menu, role, id, value);
 }
   
 /* ============================================================================= */
