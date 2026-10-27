@@ -52,7 +52,7 @@ void hid_release_joystick(uint8_t idx) {
 // German keyboard the labels lie, and the correction belongs here.
 //
 // Here and not in a core, for three reasons. It costs the FPGA nothing, and
-// that is not a luxury -- the C64 core has seven of its 10368 logic slices
+// that is not a luxury -- the C64 core has a handful of its 10368 logic slices
 // left, so a second table in there would not place at all. It corrects both
 // paths at once, because ps2helper.c derives the raw HID code and the PS/2
 // scancode from the same byte. And one table serves every machine.
@@ -85,25 +85,53 @@ static const struct keymap_entry_S keymap_de[] = {
   { 0x00, 0x00 }
 };
 
+// The shifted number row needs its own table. The C64 core does not map these
+// keys by position: fpga64_keyboard.vhd remaps them from US labels to the C64's,
+// because a US keyboard has & on shift-7 and the C64 on shift-6 ("shift-7 to
+// shift-6", "shift-9 to shift-8", ...). A German keyboard, though, agrees with
+// the C64 there -- & on shift-6, ( on shift-8, ) on shift-9 -- so the core's US
+// remap is exactly what breaks them. These entries hand the core the US key
+// whose remap lands on the C64 key the German one is printed with, which undoes
+// it. Found on the board: at&w could not be typed.
+//
+//   shift + the key printed 6 (&)  -> shift-7, remapped by the core to &
+//   shift + the key printed 7      -> shift-6, the C64's own shift-7, '
+//   shift + the key printed 8 (()  -> shift-9, remapped to (
+//   shift + the key printed 9 ())  -> shift-0, remapped to )
+static const struct keymap_entry_S keymap_de_shift[] = {
+  { 0x23, 0x24 },
+  { 0x24, 0x23 },
+  { 0x25, 0x26 },
+  { 0x26, 0x27 },
+  { 0x00, 0x00 }
+};
+
 // Only on the way to the core. The hotkey and the OSD keep working on the usage
 // the keyboard really sent, so the menu does not move when the layout changes.
 //
 // The setting comes from the ini, which is read by a LOAD action -- in practice
 // at start-up, though a core is free to offer that action in its menu. It is
-// also per core, so a C64 can be German while an ST stays US. If the setting
-// ever changed while a key was held, that key's break would go to a different
-// usage and the core would keep it down until it was pressed again; while the
-// OSD is open neither make nor break reaches the core anyway, which is the only
-// way to reach such an action.
-static uint8_t kbd_map_usage(uint8_t usage) {
+// also per core, so a C64 can be German while an ST stays US.
+static uint8_t kbd_map_usage(uint8_t usage, bool shifted) {
   if(inifile_option_get(INIFILE_OPTION_KEYMAP) != KEYMAP_DE)
     return usage;
+
+  if(shifted)
+    for(const struct keymap_entry_S *e = keymap_de_shift; e->from; e++)
+      if(e->from == usage) return e->to;
 
   for(const struct keymap_entry_S *e = keymap_de; e->from; e++)
     if(e->from == usage) return e->to;
 
   return usage;
 }
+
+// The usage a key was sent as when it went down, so that its release goes to
+// the same one. With the shifted table that is not a nicety: shift released
+// before the key would otherwise send the break to a different usage, and the
+// core would hold the key that was really sent down for ever. Zero means not
+// held, which no usage is.
+static uint8_t kbd_sent[256];
 
 void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
                            const uint8_t keys[32])
@@ -128,8 +156,12 @@ void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
 
     if (!is_pressed) {
       if (!osd_is_visible()) {
-        if (usage != inifile_option_get(INIFILE_OPTION_HOTKEY))
-          kbd_tx_hid_ps2_break(kbd_map_usage((uint8_t)usage), 0);
+        if (usage != inifile_option_get(INIFILE_OPTION_HOTKEY)) {
+          uint8_t sent = kbd_sent[usage] ? kbd_sent[usage]
+                                         : kbd_map_usage((uint8_t)usage, (modifiers & 0x22) != 0);
+          kbd_sent[usage] = 0;
+          kbd_tx_hid_ps2_break(sent, 0);
+        }
       } else {
         menu_notify(MENU_EVENT_KEY_RELEASE);
       }
@@ -143,7 +175,9 @@ void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
       msg = MENU_EVENT_BACK;
     } else {
       if (!osd_is_visible()) {
-        kbd_tx_hid_ps2_make(kbd_map_usage((uint8_t)usage), 0);
+        uint8_t sent = kbd_map_usage((uint8_t)usage, (modifiers & 0x22) != 0);
+        kbd_sent[usage] = sent;
+        kbd_tx_hid_ps2_make(sent, 0);
       } else {
         if (usage == 0x51) msg = MENU_EVENT_DOWN;
         if (usage == 0x52) msg = MENU_EVENT_UP;
