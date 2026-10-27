@@ -10,6 +10,13 @@
 
 #define INIFILE_OPTION_HOTKEY   0   // HID key code
 #define INIFILE_OPTION_LED      1   // 0 = blink, 1 = on, 0 = off
+#define INIFILE_OPTION_KEYMAP   2   // keyboard layout, see KEYMAP_* below
+
+// The layout of the keyboard the user actually has in front of them. The cores
+// map USB usage codes by position with US labels, so anything else needs
+// correcting on the way out -- see kbd_map_usage() in hid.c.
+#define KEYMAP_US               0
+#define KEYMAP_DE               1
 
 // handle the core specific ini file
 int inifile_read(char *);

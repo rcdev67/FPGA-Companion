@@ -45,6 +45,66 @@ void hid_release_joystick(uint8_t idx) {
   usb_debugf("Releasing joystick %d (map = %02x)", idx, joystick_map);
 }
 
+// --------------------------------------------------------- keyboard layout --
+// The cores map USB usage codes by POSITION and label those positions the way a
+// US keyboard is printed: the C64 core's fpga64_keyboard.vhd turns usage 0x1d
+// into its Z key, and 0x1d is the key a German keyboard prints Y on. So on a
+// German keyboard the labels lie, and the correction belongs here.
+//
+// Here and not in a core, for three reasons. It costs the FPGA nothing, and
+// that is not a luxury -- the C64 core has seven of its 10368 logic slices
+// left, so a second table in there would not place at all. It corrects both
+// paths at once, because ps2helper.c derives the raw HID code and the PS/2
+// scancode from the same byte. And one table serves every machine.
+//
+// The German layout comes out as three swaps and one addition, because the keys
+// that differ, differ in pairs. Read each line as "the key the user presses ->
+// the usage that makes the core produce what is printed on it":
+//
+//   the key printed Z   -> the core's Z         0x1c <-> 0x1d
+//   the key printed -   -> the core's -         0x38 <-> 0x2d
+//   the key printed +   -> the core's +         0x30 <-> 0x2e
+//
+// Each swap hands the displaced C64 key to the German key that has no C64
+// equivalent anyway: sharp s takes over / and ?, and acute takes over *. The
+// keypad's own / is mapped as well, since that is where one reaches for it.
+//
+// The keys a German keyboard prints and a C64 has no counterpart for -- the
+// umlauts and # -- keep their US position mapping, which leaves @ next to P and
+// : ; next to L. That is not a leftover; it is where the C64 has them.
+struct keymap_entry_S { uint8_t from, to; };
+
+static const struct keymap_entry_S keymap_de[] = {
+  { 0x1c, 0x1d },  // printed Z   -> Z
+  { 0x1d, 0x1c },  // printed Y   -> Y
+  { 0x38, 0x2d },  // printed -   -> -
+  { 0x2d, 0x38 },  // printed ss  -> / and ?
+  { 0x30, 0x2e },  // printed +   -> +
+  { 0x2e, 0x30 },  // printed '   -> *
+  { 0x54, 0x38 },  // keypad /    -> /
+  { 0x00, 0x00 }
+};
+
+// Only on the way to the core. The hotkey and the OSD keep working on the usage
+// the keyboard really sent, so the menu does not move when the layout changes.
+//
+// The setting comes from the ini, which is read by a LOAD action -- in practice
+// at start-up, though a core is free to offer that action in its menu. It is
+// also per core, so a C64 can be German while an ST stays US. If the setting
+// ever changed while a key was held, that key's break would go to a different
+// usage and the core would keep it down until it was pressed again; while the
+// OSD is open neither make nor break reaches the core anyway, which is the only
+// way to reach such an action.
+static uint8_t kbd_map_usage(uint8_t usage) {
+  if(inifile_option_get(INIFILE_OPTION_KEYMAP) != KEYMAP_DE)
+    return usage;
+
+  for(const struct keymap_entry_S *e = keymap_de; e->from; e++)
+    if(e->from == usage) return e->to;
+
+  return usage;
+}
+
 void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
                            const uint8_t keys[32])
 {
@@ -69,7 +129,7 @@ void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
     if (!is_pressed) {
       if (!osd_is_visible()) {
         if (usage != inifile_option_get(INIFILE_OPTION_HOTKEY))
-          kbd_tx_hid_ps2_break((uint8_t)usage, 0);
+          kbd_tx_hid_ps2_break(kbd_map_usage((uint8_t)usage), 0);
       } else {
         menu_notify(MENU_EVENT_KEY_RELEASE);
       }
@@ -83,7 +143,7 @@ void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
       msg = MENU_EVENT_BACK;
     } else {
       if (!osd_is_visible()) {
-        kbd_tx_hid_ps2_make((uint8_t)usage, 0);
+        kbd_tx_hid_ps2_make(kbd_map_usage((uint8_t)usage), 0);
       } else {
         if (usage == 0x51) msg = MENU_EVENT_DOWN;
         if (usage == 0x52) msg = MENU_EVENT_UP;

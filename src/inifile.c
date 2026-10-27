@@ -28,10 +28,14 @@ static int iswhite(char c) {
 static const struct option_S { char *name; char *info; int index; } option_ids[] = {
   {"hotkey", "; HID key code of OSD/menu hotkey\n",  INIFILE_OPTION_HOTKEY },
   {"led",    "; led state (0=blink, 1=on, 2=off)\n", INIFILE_OPTION_LED },
+  {"keymap", "; keyboard layout (0=US, 1=DE)\n",      INIFILE_OPTION_KEYMAP },
   {NULL,     NULL,                                   -1 }
 };
 
-static int options[2] = { 0x45, 0 };  // default options: hotkey=F12, led=blink
+// Defaults. The keyboard stays US, because that is what every core maps by
+// itself and because whether another layout is an improvement depends on the
+// machine: a German TOS already does its own mapping, a C64 core does not.
+static int options[3] = { 0x45, 0, KEYMAP_US };
 static void inifile_parse_option(char *id, char *value) {
   for(const struct option_S *oid = option_ids;oid->name;oid++) {
     if(!strcasecmp(oid->name, id)) {
@@ -42,7 +46,9 @@ static void inifile_parse_option(char *id, char *value) {
 }
 
 int inifile_option_get(int id) {
-  if((id < 0) || (id > 1)) return -1;
+  // Bound taken from the array, not written out again: the previous literal 1
+  // would have silently cut off every option added after the second.
+  if((id < 0) || (id >= (int)(sizeof(options)/sizeof(options[0])))) return -1;
   return options[id];
 }
 
