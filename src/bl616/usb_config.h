@@ -174,6 +174,12 @@
 #define CONFIG_USBHOST_MAX_VIDEO_CLASS      0
 #define CONFIG_USBHOST_MAX_SERIAL_CLASS     2
 
+/* A USB Bluetooth adapter, see bt_usb.c. Standard HCI over USB: commands
+ * through the control endpoint, events from the interrupt one, data in bulk.
+ * Not CONFIG_USBHOST_BLUETOOTH_HCI_H4, which is one Nordic chip's own way. */
+#define CONFIG_USBHOST_BLUETOOTH_TX_SIZE    1024
+#define CONFIG_USBHOST_BLUETOOTH_RX_SIZE    1024
+
 #define CONFIG_USBHOST_DEV_NAMELEN 16
 
 #ifndef CONFIG_USBHOST_PSC_PRIO

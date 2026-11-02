@@ -60,6 +60,7 @@ target_sources(app PRIVATE
     hid_keyboard_template.c
     ../gowin.c
     sdc_direct.c
+    bt_usb.c
     ../ps2helper.c
 )
 
