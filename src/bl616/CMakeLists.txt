@@ -61,11 +61,57 @@ target_sources(app PRIVATE
     ../gowin.c
     sdc_direct.c
     bt_usb.c
+    bt_hid.c
+    bt_rtk.c
     ../ps2helper.c
 )
 
+# The Realtek RTL8761BU's firmware patch, loaded into the adapter by
+# bt_rtk.c. Realtek's files from linux-firmware, unmodified, with their
+# licence in firmware/rtl_bt; turned into C arrays here, at configure time,
+# so the build output carries them and the sources keep the original files.
+function(embed_binary file name)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/${file} hex HEX)
+  string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+  set(out ${CMAKE_CURRENT_BINARY_DIR}/${name}.c)
+  file(WRITE ${out} "/* generated from ${file} by CMakeLists.txt */\nconst unsigned char ${name}[] = {${bytes}};\nconst unsigned int ${name}_len = sizeof(${name});\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${file})
+  target_sources(app PRIVATE ${out})
+endfunction()
+embed_binary(firmware/rtl_bt/rtl8761bu_fw.bin rtl8761bu_fw)
+embed_binary(firmware/rtl_bt/rtl8761bu_config.bin rtl8761bu_config)
+
 file(GLOB COMPONENT_SRCS ../u8g2/csrc/*.c  ../u8g2/sys/bitmap/common/*.c)
 target_sources(app PRIVATE ${COMPONENT_SRCS})
+
+# Bluetooth through a USB adapter: BTstack (../btstack, a submodule; free
+# for non-commercial use, see its LICENSE) as a classic HID host. Its
+# configuration is btstack_config.h in this directory.
+set(BTSTACK ../btstack)
+sdk_add_include_directories(${BTSTACK}/src ${BTSTACK}/platform/freertos ${BTSTACK}/platform/embedded)
+sdk_add_compile_definitions(-DENABLE_BLUETOOTH)
+target_sources(app PRIVATE
+    ${BTSTACK}/src/ad_parser.c
+    ${BTSTACK}/src/btstack_hid.c
+    ${BTSTACK}/src/btstack_hid_parser.c
+    ${BTSTACK}/src/btstack_linked_list.c
+    ${BTSTACK}/src/btstack_memory.c
+    ${BTSTACK}/src/btstack_memory_pool.c
+    ${BTSTACK}/src/btstack_run_loop.c
+    ${BTSTACK}/src/btstack_run_loop_base.c
+    ${BTSTACK}/src/btstack_tlv.c
+    ${BTSTACK}/src/btstack_util.c
+    ${BTSTACK}/src/hci.c
+    ${BTSTACK}/src/hci_cmd.c
+    ${BTSTACK}/src/hci_dump.c
+    ${BTSTACK}/src/l2cap.c
+    ${BTSTACK}/src/l2cap_signaling.c
+    ${BTSTACK}/src/classic/btstack_link_key_db_memory.c
+    ${BTSTACK}/src/classic/hid_host.c
+    ${BTSTACK}/src/classic/sdp_client.c
+    ${BTSTACK}/src/classic/sdp_util.c
+    ${BTSTACK}/platform/freertos/btstack_run_loop_freertos.c
+)
 
 sdk_set_main_file(../main.c)
 

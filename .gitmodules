@@ -10,3 +10,7 @@
 [submodule "src/rp2040/FreeRTOS-Kernel"]
 	path = src/rp2040/FreeRTOS-Kernel
 	url = https://github.com/raspberrypi/FreeRTOS-Kernel
+[submodule "src/btstack"]
+	path = src/btstack
+	url = https://github.com/bluekitchen/btstack.git
+	shallow = true

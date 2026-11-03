@@ -176,9 +176,12 @@
 
 /* A USB Bluetooth adapter, see bt_usb.c. Standard HCI over USB: commands
  * through the control endpoint, events from the interrupt one, data in bulk.
- * Not CONFIG_USBHOST_BLUETOOTH_HCI_H4, which is one Nordic chip's own way. */
-#define CONFIG_USBHOST_BLUETOOTH_TX_SIZE    1024
-#define CONFIG_USBHOST_BLUETOOTH_RX_SIZE    1024
+ * Not CONFIG_USBHOST_BLUETOOTH_HCI_H4, which is one Nordic chip's own way.
+ * An ACL packet is up to HCI_ACL_PAYLOAD_SIZE (btstack_config.h) plus its
+ * 4 byte header and the type byte; the receive side reads in pieces of the
+ * endpoint's 64 bytes and needs one piece of room beyond that. */
+#define CONFIG_USBHOST_BLUETOOTH_TX_SIZE    1536
+#define CONFIG_USBHOST_BLUETOOTH_RX_SIZE    2048
 
 #define CONFIG_USBHOST_DEV_NAMELEN 16
 
