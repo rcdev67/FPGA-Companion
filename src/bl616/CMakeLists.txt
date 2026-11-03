@@ -63,6 +63,7 @@ target_sources(app PRIVATE
     bt_usb.c
     bt_hid.c
     bt_keys.c
+    bt_tlv.c
     bt_rtk.c
     ../ps2helper.c
 )
@@ -86,13 +87,14 @@ file(GLOB COMPONENT_SRCS ../u8g2/csrc/*.c  ../u8g2/sys/bitmap/common/*.c)
 target_sources(app PRIVATE ${COMPONENT_SRCS})
 
 # Bluetooth through a USB adapter: BTstack (../btstack, a submodule; free
-# for non-commercial use, see its LICENSE) as a classic HID host. Its
-# configuration is btstack_config.h in this directory.
+# for non-commercial use, see its LICENSE) as a HID host, classic and Low
+# Energy. Its configuration is btstack_config.h in this directory.
 set(BTSTACK ../btstack)
-sdk_add_include_directories(${BTSTACK}/src ${BTSTACK}/platform/freertos ${BTSTACK}/platform/embedded)
+sdk_add_include_directories(${BTSTACK}/src ${BTSTACK}/platform/freertos ${BTSTACK}/platform/embedded ${BTSTACK}/3rd-party/micro-ecc)
 sdk_add_compile_definitions(-DENABLE_BLUETOOTH)
 target_sources(app PRIVATE
     ${BTSTACK}/src/ad_parser.c
+    ${BTSTACK}/src/btstack_crypto.c
     ${BTSTACK}/src/btstack_hid.c
     ${BTSTACK}/src/btstack_hid_parser.c
     ${BTSTACK}/src/btstack_linked_list.c
@@ -105,13 +107,24 @@ target_sources(app PRIVATE
     ${BTSTACK}/src/hci.c
     ${BTSTACK}/src/hci_cmd.c
     ${BTSTACK}/src/hci_dump.c
+    ${BTSTACK}/src/hci_event.c
+    ${BTSTACK}/src/hci_event_builder.c
     ${BTSTACK}/src/l2cap.c
     ${BTSTACK}/src/l2cap_signaling.c
     ${BTSTACK}/src/classic/btstack_link_key_db_memory.c
     ${BTSTACK}/src/classic/hid_host.c
     ${BTSTACK}/src/classic/sdp_client.c
     ${BTSTACK}/src/classic/sdp_util.c
+    ${BTSTACK}/src/ble/att_db.c
+    ${BTSTACK}/src/ble/att_db_util.c
+    ${BTSTACK}/src/ble/att_dispatch.c
+    ${BTSTACK}/src/ble/att_server.c
+    ${BTSTACK}/src/ble/gatt_client.c
+    ${BTSTACK}/src/ble/le_device_db_tlv.c
+    ${BTSTACK}/src/ble/sm.c
+    ${BTSTACK}/src/ble/gatt-service/hids_host.c
     ${BTSTACK}/platform/freertos/btstack_run_loop_freertos.c
+    ${BTSTACK}/3rd-party/micro-ecc/uECC.c
 )
 
 sdk_set_main_file(../main.c)

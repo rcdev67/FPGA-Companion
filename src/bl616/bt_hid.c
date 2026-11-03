@@ -9,9 +9,14 @@
   keyboard is paired without a PIN where it allows that, and the first
   scan starts by itself when the stack is up.
 
+  Next to classic Bluetooth, Low Energy: keyboards and controllers that
+  speak only that, like the ROG Azoth X in its Bluetooth mode, are found by
+  their advertising, paired, and read through BTstack's HID over GATT host.
+
   Based on:
   https://github.com/bluekitchen/btstack/tree/master/example/spp_streamer_client.c
   https://github.com/bluekitchen/btstack/tree/master/example/hid_host_demo.c
+  https://github.com/bluekitchen/btstack/tree/master/example/hog_host_demo.c
 */
 
 #include <string.h>
@@ -32,6 +37,16 @@
 #include "hci.h"
 #include "l2cap.h"
 #include "classic/hid_host.h"
+#include "btstack_hid_parser.h"
+#include "ad_parser.h"
+#include "bluetooth_data_types.h"
+#include "bluetooth_gatt.h"
+#include "ble/att_db_util.h"
+#include "ble/att_server.h"
+#include "ble/gatt_client.h"
+#include "ble/le_device_db.h"
+#include "ble/sm.h"
+#include "ble/gatt-service/hids_host.h"
 
 // the first scan, right after the stack is up: 30 x 1.28 s, about 38 s
 #define FIRST_SCAN_UNITS 30
@@ -53,6 +68,13 @@ static struct bt_hid_device_S {
   uint16_t hid_host_cid;
   hid_state_t state[MAX_BT_HID_REPORTS];
   hid_report_t rep[MAX_BT_HID_REPORTS];  
+  // Low Energy only
+  bool le;
+  bd_addr_type_t addr_type;
+  hci_con_handle_t con_handle;
+  uint16_t hids_cid;
+  uint8_t service[MAX_BT_HID_REPORTS];   // the HID service each report is from
+  bool unmatched_logged;
 } bt_hid_device[MAX_BT_HID_DEVICES];
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
@@ -76,9 +98,14 @@ static btstack_timer_source_t first_scan_timer;
 static int first_scan_tries;
 
 int bt_keys_count(void);   // bt_keys.c
+static int le_bonds_count(void);
+static void le_reconnect(void);
+static void le_scan_start(uint32_t ms);
 
 static void first_scan(btstack_timer_source_t *ts) {
-  int paired = bt_keys_count();
+  if(!first_scan_tries)
+    le_reconnect();
+  int paired = bt_keys_count() + le_bonds_count();
   if(paired) {
     // a paired keyboard connects by itself; a scan would only be in its way
     bt_debugf("%d device%s paired, waiting for %s; Scan Bluetooth in the OSD pairs another",
@@ -88,10 +115,12 @@ static void first_scan(btstack_timer_source_t *ts) {
   int ret = gap_inquiry_start(FIRST_SCAN_UNITS);
   if(ret == ERROR_CODE_SUCCESS) {
     bt_debugf("scanning for %d seconds", FIRST_SCAN_UNITS * 128 / 100);
+    le_scan_start(FIRST_SCAN_UNITS * 1280);
     return;
   }
   if(++first_scan_tries > 3) {
-    bt_debugf("scan not started, error 0x%02x", ret);
+    bt_debugf("scan not started, error 0x%02x; Low Energy only", ret);
+    le_scan_start(FIRST_SCAN_UNITS * 1280);
     return;
   }
   gap_inquiry_stop();
@@ -114,15 +143,20 @@ static struct {
   struct bt_hid_device_S *dev;
   int rep;
   uint16_t len;
-  uint8_t data[16];
+  uint8_t data[24];   // the ROG Azoth X: report id and 16 bytes
 } key_queue[KEY_QUEUE_LEN];
 static int key_queue_head, key_queue_count;
 static uint32_t key_last_ms;
 static btstack_timer_source_t key_timer;
 static bool key_timer_armed;
 
+static void le_kbd_apply(struct bt_hid_device_S *dev, int rep, const uint8_t *data, uint16_t len);
+
 static void key_apply(struct bt_hid_device_S *dev, int rep, const uint8_t *data, uint16_t len) {
-  hid_parse(&dev->rep[rep], &dev->state[rep], data, len);
+  if(dev->le)
+    le_kbd_apply(dev, rep, data, len);
+  else
+    hid_parse(&dev->rep[rep], &dev->state[rep], data, len);
   key_last_ms = btstack_run_loop_get_time_ms();
 }
 
@@ -180,27 +214,479 @@ static void bt_hid_release(struct bt_hid_device_S *dev) {
   while(key_queue_count && key_queue[key_queue_head].dev == dev)
     key_timer_handler(NULL);
 
-  for(int i = 0; i < MAX_BT_HID_REPORTS; i++) {
-    if(dev->rep[i].type != REPORT_TYPE_KEYBOARD) continue;
-    uint8_t up[1 + 8] = { 0 };
-    uint16_t len = 8;
-    uint8_t *data = up + 1;
-    if(dev->rep[i].report_id_present) {
-      up[0] = dev->rep[i].report_id;
-      data = up;
-      len = 9;
-    }
-    hid_parse(&dev->rep[i], &dev->state[i], data, len);
-  }
+  static const uint8_t none[32];
+  for(int i = 0; i < MAX_BT_HID_REPORTS; i++)
+    if(dev->rep[i].type == REPORT_TYPE_KEYBOARD)
+      kbd_parse_usage_state(&dev->state[i].kbd, 0, none);
 }
 
 static struct bt_hid_device_S *get_dev_by_hid_cid(uint16_t cid) {
   for(int i=0;i<MAX_BT_HID_DEVICES;i++)
-    if(bt_hid_device[i].dev_state != DEV_UNUSED)
+    if(bt_hid_device[i].dev_state != DEV_UNUSED && !bt_hid_device[i].le)
       if(bt_hid_device[i].hid_host_cid == cid)
 	return &bt_hid_device[i];
   
   return NULL;
+}
+
+// ------------------------------------------------------- Low Energy --
+// A Low Energy device is not found by an inquiry but by its advertising:
+// a scan runs alongside every inquiry. A device that advertises the HID
+// service, or a HID appearance, is connected, paired with bonding, so it is
+// known the next time, and read through hids_host, as in hog_host_demo.c.
+//
+// Bonded devices are connected to again whenever they advertise: they are
+// on the adapter's white list. BTstack stops connecting from it at every
+// connection made or failed, so le_reconnect() starts it again after each.
+// To connect a newly found device directly, the white list is put aside
+// first and the connect sent a moment later, once the adapter has let go.
+
+#define LE_CONNECT_TIMEOUT_MS 10000
+
+static btstack_packet_callback_registration_t sm_event_callback_registration;
+static uint8_t hids_descriptor_storage[1000];
+static btstack_timer_source_t le_scan_timer, le_connect_timer;
+static bool le_scanning;
+static struct bt_hid_device_S *le_pending;   // found by the scan, being connected
+static bool le_connect_sent;
+static int le_connect_tries;
+
+static int le_bonds_count(void) {
+  int n = 0;
+  for(int i = 0; i < le_device_db_max_count(); i++) {
+    int addr_type;
+    bd_addr_t addr;
+    le_device_db_info(i, &addr_type, addr, NULL);
+    if(addr_type != BD_ADDR_TYPE_UNKNOWN) n++;
+  }
+  return n;
+}
+
+static void le_reconnect(void) {
+  if(le_pending) return;   // a new one is being connected
+  for(int i = 0; i < le_device_db_max_count(); i++) {
+    int addr_type;
+    bd_addr_t addr;
+    le_device_db_info(i, &addr_type, addr, NULL);
+    if(addr_type != BD_ADDR_TYPE_UNKNOWN)
+      gap_auto_connection_start((bd_addr_type_t)addr_type, addr);
+  }
+}
+
+static void le_scan_stop(btstack_timer_source_t *ts) {
+  (void)ts;
+  if(!le_scanning) return;
+  gap_stop_scan();
+  le_scanning = false;
+}
+
+static void le_scan_start(uint32_t ms) {
+  // active: a scan response often carries what the advertising leaves out
+  gap_set_scan_parameters(1, 48, 48);
+  gap_start_scan();
+  le_scanning = true;
+  btstack_run_loop_remove_timer(&le_scan_timer);
+  btstack_run_loop_set_timer_handler(&le_scan_timer, &le_scan_stop);
+  btstack_run_loop_set_timer(&le_scan_timer, ms);
+  btstack_run_loop_add_timer(&le_scan_timer);
+}
+
+static bool le_adv_is_hid(const uint8_t *packet) {
+  const uint8_t *ad = gap_event_advertising_report_get_data(packet);
+  uint8_t len = gap_event_advertising_report_get_data_length(packet);
+  if(ad_data_contains_uuid16(len, ad, ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE))
+    return true;
+  // some give only their appearance; 0x03c0 to 0x03ff are the HID ones
+  ad_context_t c;
+  for(ad_iterator_init(&c, len, ad); ad_iterator_has_more(&c); ad_iterator_next(&c))
+    if(ad_iterator_get_data_type(&c) == BLUETOOTH_DATA_TYPE_APPEARANCE &&
+       ad_iterator_get_data_len(&c) == 2 &&
+       (little_endian_read_16(ad_iterator_get_data(&c), 0) >> 6) == 0x0f)
+      return true;
+  return false;
+}
+
+static struct bt_hid_device_S *le_dev_by_handle(hci_con_handle_t handle) {
+  for(int i = 0; i < MAX_BT_HID_DEVICES; i++)
+    if(bt_hid_device[i].dev_state != DEV_UNUSED && bt_hid_device[i].le &&
+       bt_hid_device[i].con_handle == handle)
+      return &bt_hid_device[i];
+  return NULL;
+}
+
+static struct bt_hid_device_S *le_dev_by_hids_cid(uint16_t cid) {
+  for(int i = 0; i < MAX_BT_HID_DEVICES; i++)
+    if(bt_hid_device[i].dev_state != DEV_UNUSED && bt_hid_device[i].le &&
+       bt_hid_device[i].hids_cid == cid)
+      return &bt_hid_device[i];
+  return NULL;
+}
+
+static struct bt_hid_device_S *le_dev_alloc(const bd_addr_t addr, bd_addr_type_t addr_type) {
+  for(int i = 0; i < MAX_BT_HID_DEVICES; i++) {
+    struct bt_hid_device_S *dev = &bt_hid_device[i];
+    if(dev->dev_state != DEV_UNUSED) continue;
+    dev->dev_state = DEV_CONNECTING;
+    dev->le = true;
+    memcpy(dev->bd_addr, addr, 6);
+    dev->addr_type = addr_type;
+    dev->con_handle = HCI_CON_HANDLE_INVALID;
+    dev->hid_host_cid = 0;
+    dev->hids_cid = 0;
+    dev->unmatched_logged = false;
+    memset(dev->state, 0, sizeof(dev->state));   // no keys held
+    for(int r = 0; r < MAX_BT_HID_REPORTS; r++)
+      dev->rep[r].type = REPORT_TYPE_NONE;
+    return dev;
+  }
+  return NULL;
+}
+
+static void le_dev_free(struct bt_hid_device_S *dev) {
+  bt_hid_release(dev);
+  for(int r = 0; r < MAX_BT_HID_REPORTS; r++) {
+    if(dev->rep[r].type == REPORT_TYPE_JOYSTICK)
+      hid_release_joystick(dev->state[r].joystick.js_index);
+    dev->rep[r].type = REPORT_TYPE_NONE;
+  }
+  if(dev == le_pending) {
+    le_pending = NULL;
+    btstack_run_loop_remove_timer(&le_connect_timer);
+  }
+  dev->dev_state = DEV_UNUSED;
+  dev->le = false;
+  dev->con_handle = HCI_CON_HANDLE_INVALID;
+  dev->hids_cid = 0;
+}
+
+static void le_give_up(void) {
+  if(le_pending) le_dev_free(le_pending);
+  le_reconnect();
+}
+
+static void le_connect_timeout(btstack_timer_source_t *ts) {
+  (void)ts;
+  bt_debugf("no answer from %s", le_pending ? bd_addr_to_str(le_pending->bd_addr) : "it");
+  gap_connect_cancel();
+  le_give_up();
+}
+
+static void le_connect_pending(btstack_timer_source_t *ts) {
+  if(!le_pending) return;
+  uint8_t status = gap_connect(le_pending->bd_addr, le_pending->addr_type);
+  if(status == ERROR_CODE_SUCCESS) {
+    le_connect_sent = true;
+    btstack_run_loop_set_timer_handler(ts, &le_connect_timeout);
+    btstack_run_loop_set_timer(ts, LE_CONNECT_TIMEOUT_MS);
+    btstack_run_loop_add_timer(ts);
+    return;
+  }
+  if(++le_connect_tries < 10) {
+    btstack_run_loop_set_timer(ts, 200);
+    btstack_run_loop_add_timer(ts);
+    return;
+  }
+  bt_debugf("cannot connect, error 0x%02x", status);
+  le_give_up();
+}
+
+static void le_advertising_report(const uint8_t *packet) {
+  if(!le_scanning || le_pending) return;
+  // only the connectable ones, and the scan responses to them
+  uint8_t type = gap_event_advertising_report_get_advertising_event_type(packet);
+  if(type == 2 || type == 3) return;
+  if(!le_adv_is_hid(packet)) return;
+
+  bd_addr_t addr;
+  gap_event_advertising_report_get_address(packet, addr);
+  for(int i = 0; i < MAX_BT_HID_DEVICES; i++)
+    if(bt_hid_device[i].dev_state != DEV_UNUSED &&
+       bd_addr_cmp(bt_hid_device[i].bd_addr, addr) == 0)
+      return;   // connected already
+
+  struct bt_hid_device_S *dev = le_dev_alloc(addr,
+      (bd_addr_type_t)gap_event_advertising_report_get_address_type(packet));
+  if(!dev) return;
+  bt_debugf("Low Energy HID device found: %s", bd_addr_to_str(addr));
+
+  le_pending = dev;
+  le_connect_sent = false;
+  le_connect_tries = 0;
+  btstack_run_loop_remove_timer(&le_scan_timer);
+  le_scan_stop(NULL);
+  gap_inquiry_stop();
+  gap_auto_connection_stop_all();
+  btstack_run_loop_remove_timer(&le_connect_timer);
+  btstack_run_loop_set_timer_handler(&le_connect_timer, &le_connect_pending);
+  btstack_run_loop_set_timer(&le_connect_timer, 200);
+  btstack_run_loop_add_timer(&le_connect_timer);
+}
+
+static void le_connection_complete(const uint8_t *packet) {
+  uint8_t status = gap_subevent_le_connection_complete_get_status(packet);
+  bd_addr_t addr;
+  gap_subevent_le_connection_complete_get_peer_address(packet, addr);
+
+  if(status != ERROR_CODE_SUCCESS) {
+    // also the white list put aside for a new device: nothing to do then
+    if(le_pending && le_connect_sent) {
+      bt_debugf("connecting %s failed, status 0x%02x", bd_addr_to_str(le_pending->bd_addr), status);
+      le_give_up();
+    } else
+      le_reconnect();
+    return;
+  }
+
+  hci_con_handle_t handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
+  struct bt_hid_device_S *dev = NULL;
+  if(le_pending && le_connect_sent && bd_addr_cmp(le_pending->bd_addr, addr) == 0) {
+    dev = le_pending;
+    le_pending = NULL;
+    btstack_run_loop_remove_timer(&le_connect_timer);
+  } else {
+    // a bonded one, from the white list
+    dev = le_dev_alloc(addr, (bd_addr_type_t)gap_subevent_le_connection_complete_get_peer_address_type(packet));
+    if(!dev) {
+      bt_debugf("no room for %s", bd_addr_to_str(addr));
+      gap_disconnect(handle);
+      return;
+    }
+  }
+  dev->con_handle = handle;
+  bt_debugf("connected to %s, securing the connection", bd_addr_to_str(addr));
+  // pairs a new device; one bonded already only encrypts with its key
+  sm_request_pairing(handle);
+  le_reconnect();
+}
+
+static void le_disconnected(hci_con_handle_t handle) {
+  struct bt_hid_device_S *dev = le_dev_by_handle(handle);
+  if(!dev) return;
+  bt_debugf("%s disconnected", bd_addr_to_str(dev->bd_addr));
+  bool had_reports = dev->rep[0].type != REPORT_TYPE_NONE;
+  le_dev_free(dev);
+  if(had_reports)
+    menu_notify(MENU_EVENT_BLUETOOTH_DISCONNECTED);
+  le_reconnect();
+}
+
+static void hids_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+
+static void le_hids_connect(struct bt_hid_device_S *dev) {
+  if(dev->hids_cid) return;   // pairing and encryption both end here
+  uint8_t status = hids_host_connect(dev->con_handle, &hids_packet_handler,
+                                     HID_PROTOCOL_MODE_REPORT, &dev->hids_cid);
+  if(status != ERROR_CODE_SUCCESS) {
+    bt_debugf("HID service not read, status 0x%02x", status);
+    gap_disconnect(dev->con_handle);
+  }
+}
+
+static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+  UNUSED(channel);
+  UNUSED(size);
+  if(packet_type != HCI_EVENT_PACKET) return;
+
+  struct bt_hid_device_S *dev;
+  uint8_t status;
+
+  switch(hci_event_packet_get_type(packet)) {
+  case SM_EVENT_JUST_WORKS_REQUEST:
+    sm_just_works_confirm(sm_event_just_works_request_get_handle(packet));
+    break;
+
+  case SM_EVENT_NUMERIC_COMPARISON_REQUEST:
+    // nothing here to show the number on: accepted, as "just works"
+    sm_numeric_comparison_confirm(sm_event_numeric_comparison_request_get_handle(packet));
+    break;
+
+  case SM_EVENT_PASSKEY_DISPLAY_NUMBER:
+    bt_debugf("Passkey to type on the keyboard: %06u, then Return",
+              (unsigned)sm_event_passkey_display_number_get_passkey(packet));
+    break;
+
+  case SM_EVENT_PAIRING_COMPLETE:
+    dev = le_dev_by_handle(sm_event_pairing_complete_get_handle(packet));
+    if(!dev) break;
+    status = sm_event_pairing_complete_get_status(packet);
+    if(status == ERROR_CODE_SUCCESS) {
+      bt_debugf("paired, reading the HID service");
+      le_hids_connect(dev);
+    } else {
+      bt_debugf("pairing failed, status 0x%02x, reason %u", status,
+                sm_event_pairing_complete_get_reason(packet));
+      gap_disconnect(dev->con_handle);
+    }
+    break;
+
+  case SM_EVENT_REENCRYPTION_COMPLETE:
+    dev = le_dev_by_handle(sm_event_reencryption_complete_get_handle(packet));
+    if(!dev) break;
+    status = sm_event_reencryption_complete_get_status(packet);
+    if(status == ERROR_CODE_SUCCESS) {
+      bt_debugf("encrypted with the stored key");
+      le_hids_connect(dev);
+    } else {
+      // the device has forgotten the pairing, paired with something else
+      bt_debugf("stored key refused, status 0x%02x; Scan Bluetooth pairs it again", status);
+      if(status == ERROR_CODE_PIN_OR_KEY_MISSING)
+        gap_delete_bonding(dev->addr_type, dev->bd_addr);
+      gap_disconnect(dev->con_handle);
+    }
+    break;
+
+  default:
+    break;
+  }
+}
+
+static void le_parse_descriptors(struct bt_hid_device_S *dev, int services) {
+  int r = 0;
+  for(int s = 0; s < services && r < MAX_BT_HID_REPORTS; s++) {
+    const uint8_t *desc = hids_host_descriptor_storage_get_descriptor_data(dev->hids_cid, s);
+    uint16_t len = hids_host_descriptor_storage_get_descriptor_len(dev->hids_cid, s);
+    bt_debugf("HID service %d: descriptor, %d bytes", s, len);
+    while(r < MAX_BT_HID_REPORTS && len) {
+      uint16_t rbytes = 0;
+      if(!parse_report_descriptor(desc, len, &dev->rep[r], &rbytes) || !rbytes || rbytes > len) {
+        dev->rep[r].type = REPORT_TYPE_NONE;
+        break;
+      }
+      dev->service[r] = s;
+      if(dev->rep[r].type == REPORT_TYPE_JOYSTICK)
+        dev->state[r].joystick.js_index = hid_allocate_joystick();
+      bt_debugf("  report %d: type %d, id %d, %d bytes", r, dev->rep[r].type,
+                dev->rep[r].report_id_present ? dev->rep[r].report_id : -1,
+                dev->rep[r].report_size);
+      len -= rbytes;
+      desc += rbytes;
+      r++;
+    }
+  }
+}
+
+// A Low Energy keyboard's report is read by its own descriptor, with
+// BTstack's HID parser: kbd_parse() knows only the 8 byte boot layout, and
+// the ROG Azoth X sends 16 bytes, a bit for each key and the modifiers last.
+// Whatever the layout, the keys end up as the bit field hid.c works with.
+static void le_kbd_apply(struct bt_hid_device_S *dev, int rep, const uint8_t *data, uint16_t len) {
+  btstack_hid_parser_t parser;
+  btstack_hid_parser_init(&parser,
+      hids_host_descriptor_storage_get_descriptor_data(dev->hids_cid, dev->service[rep]),
+      hids_host_descriptor_storage_get_descriptor_len(dev->hids_cid, dev->service[rep]),
+      HID_REPORT_TYPE_INPUT, data, len);
+
+  uint8_t modifiers = 0;
+  uint8_t keys[32] = { 0 };
+  while(btstack_hid_parser_has_more(&parser)) {
+    uint16_t page, usage;
+    int32_t value;
+    btstack_hid_parser_get_field(&parser, &page, &usage, &value);
+    if(page != HID_USAGE_PAGE_KEYBOARD || !value) continue;
+    if(usage >= 0xe0 && usage <= 0xe7)
+      modifiers |= (uint8_t)(1U << (usage - 0xe0));
+    else if(usage >= 1 && usage <= 3)
+      return;   // too many keys at once: the state stays as it was
+    else if(usage >= 4 && usage <= 0xff)
+      keys[usage / 8] |= (uint8_t)(1U << (usage % 8));
+  }
+  kbd_parse_usage_state(&dev->state[rep].kbd, modifiers, keys);
+}
+
+static void le_report(struct bt_hid_device_S *dev, uint8_t service, const uint8_t *data, uint16_t len) {
+  // hids_host puts the report id first, 0 for a report without one
+  if(len < 2) return;
+  for(int i = 0; i < MAX_BT_HID_REPORTS; i++) {
+    if(dev->rep[i].type == REPORT_TYPE_NONE || dev->service[i] != service)
+      continue;
+    if(!dev->rep[i].report_id_present) {
+      bt_hid_input(dev, i, data + 1, len - 1);
+      return;
+    }
+    if(data[0] == dev->rep[i].report_id && len - 1 == dev->rep[i].report_size) {
+      bt_hid_input(dev, i, data, len);
+      return;
+    }
+  }
+  if(!dev->unmatched_logged) {
+    // once per connection, enough to see what a new device sends
+    bt_debugf("report %d of %d bytes from service %d not used", data[0], len - 1, service);
+    dev->unmatched_logged = true;
+  }
+}
+
+static void hids_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+  UNUSED(packet_type);
+  UNUSED(channel);
+  UNUSED(size);
+  if(hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
+
+  struct bt_hid_device_S *dev;
+  switch(hci_event_gattservice_meta_get_subevent_code(packet)) {
+  case GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED: {
+    dev = le_dev_by_hids_cid(gattservice_subevent_hid_service_connected_get_hids_cid(packet));
+    if(!dev) break;
+    uint8_t status = gattservice_subevent_hid_service_connected_get_status(packet);
+    if(status != ERROR_CODE_SUCCESS) {
+      bt_debugf("HID service not read, status 0x%02x", status);
+      gap_disconnect(dev->con_handle);
+      break;
+    }
+    le_parse_descriptors(dev, gattservice_subevent_hid_service_connected_get_num_instances(packet));
+    if(dev->rep[0].type == REPORT_TYPE_NONE) {
+      bt_debugf("no usable report");
+      gap_disconnect(dev->con_handle);
+    } else {
+      bt_debugf("HID over GATT ready");
+      menu_notify(MENU_EVENT_BLUETOOTH_CONNECTED);
+    }
+  } break;
+
+  case GATTSERVICE_SUBEVENT_HID_REPORT:
+    dev = le_dev_by_hids_cid(gattservice_subevent_hid_report_get_hids_cid(packet));
+    if(dev)
+      le_report(dev, gattservice_subevent_hid_report_get_service_index(packet),
+                gattservice_subevent_hid_report_get_report(packet),
+                gattservice_subevent_hid_report_get_report_len(packet));
+    break;
+
+  default:
+    break;
+  }
+}
+
+// A device may read the host's own GATT database, as phones and computers
+// have one; a request left unanswered ends the connection after 30 s.
+static uint8_t le_device_name[] = "MiSTle FPGA Companion";
+
+static void le_init(void) {
+  sm_init();
+  sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+  sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION | SM_AUTHREQ_BONDING);
+  sm_event_callback_registration.callback = &sm_packet_handler;
+  sm_add_event_handler(&sm_event_callback_registration);
+
+  // Looking out for bonded devices runs all the time, so only 30 ms in
+  // every 200, not BTstack's half the time, which leaves the radio to
+  // classic Bluetooth. A connection is dropped after 2 s without a word
+  // rather than 0.72 s, for the same reason.
+  gap_set_connection_parameters(0x0140, 0x0030, 0x0008, 0x0018, 4, 0x00c8, 0, 0);
+
+  // hids_host before gatt_client, so it gets a disconnection first. The
+  // other way round gatt_client frees its context for the connection,
+  // hids_host's clean-up then asks for it and gets a new one, and once the
+  // connection is gone that one wants to send for ever: BTstack recursed
+  // until the stack overflowed, each time the ROG Azoth X was switched off.
+  hids_host_init(hids_descriptor_storage, sizeof(hids_descriptor_storage));
+  gatt_client_init();
+
+  att_db_util_init();
+  att_db_util_add_service_uuid16(ORG_BLUETOOTH_SERVICE_GENERIC_ACCESS);
+  att_db_util_add_characteristic_uuid16(ORG_BLUETOOTH_CHARACTERISTIC_GAP_DEVICE_NAME,
+      ATT_PROPERTY_READ, ATT_SECURITY_NONE, ATT_SECURITY_NONE,
+      le_device_name, sizeof(le_device_name) - 1);
+  att_db_util_add_service_uuid16(ORG_BLUETOOTH_SERVICE_GENERIC_ATTRIBUTE);
+  att_server_init(att_db_util_get_address(), NULL, NULL);
 }
 
 static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
@@ -221,6 +707,14 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
       if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
 	bt_debugf("BTStack up and working");
 	first_scan_tries = 0;
+	// what was connected over Low Energy before the adapter went away
+	for(int i=0;i<MAX_BT_HID_DEVICES;i++)
+	  if(bt_hid_device[i].dev_state != DEV_UNUSED && bt_hid_device[i].le)
+	    le_dev_free(&bt_hid_device[i]);
+	le_pending = NULL;
+	le_scanning = false;
+	btstack_run_loop_remove_timer(&le_scan_timer);
+	btstack_run_loop_remove_timer(&le_connect_timer);
 	btstack_run_loop_remove_timer(&first_scan_timer);   // still pending after a quick replug
 	btstack_run_loop_set_timer_handler(&first_scan_timer, &first_scan);
 	btstack_run_loop_set_timer(&first_scan_timer, 100);
@@ -260,6 +754,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	  if(bt_hid_device[i].dev_state == DEV_UNUSED) {
 	    memcpy(bt_hid_device[i].bd_addr, event_addr, 6);
 	    bt_hid_device[i].dev_state = DEV_DETECTED;
+	    bt_hid_device[i].le = false;
 
 	    gap_inquiry_stop();
 	    return;
@@ -301,6 +796,19 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
       }
       break;
       
+    case GAP_EVENT_ADVERTISING_REPORT:
+      le_advertising_report(packet);
+      break;
+
+    case HCI_EVENT_META_GAP:
+      if(hci_event_gap_meta_get_subevent_code(packet) == GAP_SUBEVENT_LE_CONNECTION_COMPLETE)
+	le_connection_complete(packet);
+      break;
+
+    case HCI_EVENT_DISCONNECTION_COMPLETE:
+      le_disconnected(hci_event_disconnection_complete_get_connection_handle(packet));
+      break;
+
     case HCI_EVENT_USER_PASSKEY_NOTIFICATION:
       // the keyboard wants this typed on it, followed by Return
       bt_debugf("Passkey to type on the keyboard: %06u, then Return",
@@ -337,6 +845,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	  if(bt_hid_device[i].dev_state == DEV_UNUSED) {
 	    dev = &bt_hid_device[i];
 	    dev->dev_state = DEV_CONNECTING;   // not DEV_DETECTED, which the end of a scan connects
+	    dev->le = false;
 	    dev->hid_host_cid = hid_cid;
 	    hid_subevent_incoming_connection_get_address(packet, dev->bd_addr);
 	  }
@@ -534,6 +1043,9 @@ void bluetooth_init(void) {
   // Initialize L2CAP
   l2cap_init();
 
+  // Low Energy: Security Manager, GATT client, HID over GATT host
+  le_init();
+
   gap_set_local_name("MiSTle FPGA Companion");
 
   // Initialize HID Host
@@ -574,8 +1086,9 @@ void bluetooth_run(void) {
 // The OSD asks from its own task; BTstack may only be called from its own.
 static void bluetooth_scan_on_main(void *context) {
   (void)context;
-  bt_debugf("Starting a 13 second inquiry scan");
+  bt_debugf("Starting a 13 second scan, classic and Low Energy");
   gap_inquiry_start(10);   // 10 x 1.28 s
+  le_scan_start(13000);
 }
 
 static btstack_context_callback_registration_t bluetooth_scan_registration = {

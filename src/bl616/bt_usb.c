@@ -40,6 +40,8 @@
 #include "hci_dump.h"
 #include "hci_transport.h"
 #include "classic/btstack_link_key_db.h"
+#include "btstack_tlv.h"
+#include "ble/le_device_db_tlv.h"
 #include "hal_time_ms.h"
 
 #include "../debug.h"
@@ -52,7 +54,10 @@ typedef struct {
   uint8_t data[1 + 4 + HCI_ACL_PAYLOAD_SIZE];
 } bt_packet_t;
 
-#define BT_RX_QUEUE_LENGTH 6
+// Three, each the size of the largest packet: a full queue loses nothing,
+// the receive threads wait and the adapter holds on to what it has. Every
+// item is a kilobyte of heap, which Low Energy's stack needs more.
+#define BT_RX_QUEUE_LENGTH 3
 
 static QueueHandle_t bt_rx_queue;
 static bt_packet_t bt_rx_out;           // taken from the queue, on BTstack's task
@@ -67,6 +72,7 @@ static volatile bool bt_packet_sent;    // set after a write, cleared on BTstack
 static volatile bool bt_adapter;        // an adapter is there to talk to
 
 const btstack_link_key_db_t *bt_keys_instance(void);   // bt_keys.c
+const btstack_tlv_t *bt_tlv_instance(void);            // bt_tlv.c
 
 // bt_rtk.c: a Realtek adapter's patch is loaded before BTstack takes over
 bool bt_rtk_active(void);
@@ -207,6 +213,11 @@ uint32_t hal_time_ms(void) {
 // ------------------------------------------------------------ the task --
 static TaskHandle_t bt_task_handle;
 
+// 12 KB: room for micro-ecc's maths while a Low Energy device pairs, on top
+// of the calls from Security Manager and GATT down to the FPGA. More is more
+// than the heap has left in one piece.
+#define BT_TASK_STACK 3072   // words
+
 static void bt_task(void *arg) {
   (void)arg;
 
@@ -214,10 +225,13 @@ static void bt_task(void *arg) {
   btstack_run_loop_init(btstack_run_loop_freertos_get_instance());
   hci_dump_init(&bt_log);
   hci_init(&bt_transport, NULL);
-  // pairings are kept on the SD card, bt_keys.c
+  // pairings are kept on the SD card: classic ones by bt_keys.c, Low
+  // Energy bondings by bt_tlv.c
   hci_set_link_key_db(bt_keys_instance());
+  btstack_tlv_set_instance(bt_tlv_instance(), NULL);
+  le_device_db_tlv_configure(bt_tlv_instance(), NULL);
 
-  bluetooth_init();   // bt_hid.c: L2CAP, HID host, power on
+  bluetooth_init();   // bt_hid.c: L2CAP, HID hosts, power on
   bluetooth_run();    // never returns
 }
 
@@ -239,7 +253,8 @@ static void bt_setup_task(void *arg) {
 
   if(!bt_task_handle) {
     bt_rx_queue = xQueueCreate(BT_RX_QUEUE_LENGTH, sizeof(bt_packet_t));
-    xTaskCreate(bt_task, "bluetooth", 2048, NULL, 10, &bt_task_handle);  // 8 KB
+    if(xTaskCreate(bt_task, "bluetooth", BT_TASK_STACK, NULL, 10, &bt_task_handle) != pdPASS)
+      bt_debugf("no memory for the Bluetooth task");
   } else
     btstack_run_loop_execute_on_main_thread(&bt_power_on);
   vTaskDelete(NULL);
