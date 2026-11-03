@@ -17,7 +17,7 @@
 // features
 #define ENABLE_CLASSIC
 #define ENABLE_LOG_ERROR
-#define ENABLE_LOG_INFO
+// #define ENABLE_LOG_INFO    // BTstack's own account of every step
 #define ENABLE_PRINTF_HEXDUMP
 
 // An ACL packet from the adapter has to fit CherryUSB's receive buffer,

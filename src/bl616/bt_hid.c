@@ -14,6 +14,8 @@
   https://github.com/bluekitchen/btstack/tree/master/example/hid_host_demo.c
 */
 
+#include <string.h>
+
 #include "../debug.h"
 #include "../menu.h"
 #include "../hid.h"
@@ -73,7 +75,16 @@ static hid_protocol_mode_t hid_host_report_mode = HID_PROTOCOL_MODE_REPORT;
 static btstack_timer_source_t first_scan_timer;
 static int first_scan_tries;
 
+int bt_keys_count(void);   // bt_keys.c
+
 static void first_scan(btstack_timer_source_t *ts) {
+  int paired = bt_keys_count();
+  if(paired) {
+    // a paired keyboard connects by itself; a scan would only be in its way
+    bt_debugf("%d device%s paired, waiting for %s; Scan Bluetooth in the OSD pairs another",
+              paired, paired == 1 ? "" : "s", paired == 1 ? "it" : "them");
+    return;
+  }
   int ret = gap_inquiry_start(FIRST_SCAN_UNITS);
   if(ret == ERROR_CODE_SUCCESS) {
     bt_debugf("scanning for %d seconds", FIRST_SCAN_UNITS * 128 / 100);
@@ -86,6 +97,101 @@ static void first_scan(btstack_timer_source_t *ts) {
   gap_inquiry_stop();
   btstack_run_loop_set_timer(ts, 1000);
   btstack_run_loop_add_timer(ts);
+}
+
+// ------------------------------------------------------- key timing --
+// A keyboard in its power saving mode collects reports and sends them in
+// bursts: on the board a key was reported held for 1 to 12 ms, its press and
+// release arriving together. The C64 scans its keyboard every 16.7 ms, so
+// such a key fell between two scans, or went into one scan with the next:
+// keys went missing or came twice. So every keyboard state is held for at
+// least KEY_STATE_MIN_MS before the next one is applied, in order. That only
+// slows anything down beyond about 30 keys a second.
+#define KEY_STATE_MIN_MS 30
+#define KEY_QUEUE_LEN    16
+
+static struct {
+  struct bt_hid_device_S *dev;
+  int rep;
+  uint16_t len;
+  uint8_t data[16];
+} key_queue[KEY_QUEUE_LEN];
+static int key_queue_head, key_queue_count;
+static uint32_t key_last_ms;
+static btstack_timer_source_t key_timer;
+static bool key_timer_armed;
+
+static void key_apply(struct bt_hid_device_S *dev, int rep, const uint8_t *data, uint16_t len) {
+  hid_parse(&dev->rep[rep], &dev->state[rep], data, len);
+  key_last_ms = btstack_run_loop_get_time_ms();
+}
+
+static void key_arm(uint32_t ms);
+
+static void key_timer_handler(btstack_timer_source_t *ts) {
+  (void)ts;
+  key_timer_armed = false;
+  if(!key_queue_count) return;
+  int i = key_queue_head;
+  key_apply(key_queue[i].dev, key_queue[i].rep, key_queue[i].data, key_queue[i].len);
+  key_queue_head = (key_queue_head + 1) % KEY_QUEUE_LEN;
+  key_queue_count--;
+  if(key_queue_count) key_arm(KEY_STATE_MIN_MS);
+}
+
+static void key_arm(uint32_t ms) {
+  btstack_run_loop_remove_timer(&key_timer);   // BTstack asserts on adding it twice
+  btstack_run_loop_set_timer_handler(&key_timer, &key_timer_handler);
+  btstack_run_loop_set_timer(&key_timer, ms);
+  btstack_run_loop_add_timer(&key_timer);
+  key_timer_armed = true;
+}
+
+// a report for one of the device's parsed reports
+static void bt_hid_input(struct bt_hid_device_S *dev, int rep, const uint8_t *data, uint16_t len) {
+  if(dev->rep[rep].type != REPORT_TYPE_KEYBOARD || len > sizeof(key_queue[0].data)) {
+    hid_parse(&dev->rep[rep], &dev->state[rep], data, len);
+    return;
+  }
+
+  uint32_t since = btstack_run_loop_get_time_ms() - key_last_ms;
+  if(!key_queue_count && since >= KEY_STATE_MIN_MS) {
+    key_apply(dev, rep, data, len);
+    return;
+  }
+
+  if(key_queue_count == KEY_QUEUE_LEN) {
+    // a full queue is a keyboard gone mad; apply the oldest now
+    key_timer_handler(NULL);
+  }
+  int i = (key_queue_head + key_queue_count) % KEY_QUEUE_LEN;
+  key_queue[i].dev = dev;
+  key_queue[i].rep = rep;
+  key_queue[i].len = len;
+  memcpy(key_queue[i].data, data, len);
+  key_queue_count++;
+  if(!key_timer_armed)
+    key_arm(since >= KEY_STATE_MIN_MS ? 0 : KEY_STATE_MIN_MS - since);
+}
+
+// The connection is gone: apply what is still queued, then let go of every
+// key, or the C64 would keep the last one pressed.
+static void bt_hid_release(struct bt_hid_device_S *dev) {
+  while(key_queue_count && key_queue[key_queue_head].dev == dev)
+    key_timer_handler(NULL);
+
+  for(int i = 0; i < MAX_BT_HID_REPORTS; i++) {
+    if(dev->rep[i].type != REPORT_TYPE_KEYBOARD) continue;
+    uint8_t up[1 + 8] = { 0 };
+    uint16_t len = 8;
+    uint8_t *data = up + 1;
+    if(dev->rep[i].report_id_present) {
+      up[0] = dev->rep[i].report_id;
+      data = up;
+      len = 9;
+    }
+    hid_parse(&dev->rep[i], &dev->state[i], data, len);
+  }
 }
 
 static struct bt_hid_device_S *get_dev_by_hid_cid(uint16_t cid) {
@@ -115,6 +221,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
       if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
 	bt_debugf("BTStack up and working");
 	first_scan_tries = 0;
+	btstack_run_loop_remove_timer(&first_scan_timer);   // still pending after a quick replug
 	btstack_run_loop_set_timer_handler(&first_scan_timer, &first_scan);
 	btstack_run_loop_set_timer(&first_scan_timer, 100);
 	btstack_run_loop_add_timer(&first_scan_timer);
@@ -276,8 +383,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	  if(status == ERROR_CODE_SUCCESS) {
 	    const uint8_t *hid_descriptor = hid_descriptor_storage_get_descriptor_data(dev->hid_host_cid);
 	    uint16_t hid_descriptor_len = hid_descriptor_storage_get_descriptor_len(dev->hid_host_cid);
-	    bt_debugf("hid descriptor (%d):", hid_descriptor_len);
-	    hexdump(hid_descriptor, hid_descriptor_len);
+	    bt_debugf("hid descriptor, %d bytes", hid_descriptor_len);
 
 	    // Bluetooth devices have a tendency to report mutliple report types. This happens less often with
 	    // USB devices as these can have multiple interfaces and can expose different capabilities that way.
@@ -324,14 +430,6 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	  uint8_t const* data = hid_subevent_report_get_report(packet);
 	  uint16_t len = hid_subevent_report_get_report_len(packet);
 
-	  // one line per report, with the time in ms: for the timing of key
-	  // presses and releases while Bluetooth input is brought up
-	  char hex[3 * 10 + 1];
-	  uint16_t n = len < 10 ? len : 10;
-	  for(uint16_t i = 0; i < n; i++) sprintf(hex + 3 * i, "%02x ", data[i]);
-	  hex[3 * n] = '\0';
-	  bt_debugf("report at %lu ms: %s", (unsigned long)btstack_run_loop_get_time_ms(), hex);
-
 	  if(data[0] == 0xa1) {	   // report type: "input report"
 	    data++; len--;         // skip report type
 	    
@@ -339,7 +437,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	    // one type of report can exist as otherwise the different
 	    // reports could not be distinguished.
 	    if(!dev->rep[0].report_id_present) {
-	      hid_parse(&dev->rep[0], &dev->state[0], data, len);
+	      bt_hid_input(dev, 0, data, len);
 	    } else {
 	      // report id's are present, so check which report description
 	      // the current report matches
@@ -347,7 +445,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 		// check report id if present
 		if(dev->rep[i].report_id_present && (len-1 == dev->rep[i].report_size)) {
 		  if(data[0] == dev->rep[i].report_id) {
-		    hid_parse(&dev->rep[i], &dev->state[i], data, len);
+		    bt_hid_input(dev, i, data, len);
 		  }
 		}
 	      }
@@ -387,6 +485,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	else {	
 	  bt_debugf("HID Host disconnected.");
 	  // The connection was closed.
+	  bt_hid_release(dev);
 
 	  // release all joysticks
 	  for(int i=0;i<MAX_BT_HID_REPORTS;i++)

@@ -39,7 +39,7 @@
 #include "hci.h"
 #include "hci_dump.h"
 #include "hci_transport.h"
-#include "classic/btstack_link_key_db_memory.h"
+#include "classic/btstack_link_key_db.h"
 #include "hal_time_ms.h"
 
 #include "../debug.h"
@@ -65,6 +65,8 @@ static void (*bt_packet_handler)(uint8_t type, uint8_t *packet, uint16_t size);
 static btstack_data_source_t bt_data_source;
 static volatile bool bt_packet_sent;    // set after a write, cleared on BTstack's task
 static volatile bool bt_adapter;        // an adapter is there to talk to
+
+const btstack_link_key_db_t *bt_keys_instance(void);   // bt_keys.c
 
 // bt_rtk.c: a Realtek adapter's patch is loaded before BTstack takes over
 bool bt_rtk_active(void);
@@ -170,8 +172,12 @@ static const hci_transport_t bt_transport = {
 // --------------------------------------------------------------- logging --
 static void bt_log_reset(void) { }
 
-// every packet, shortened: for bringing a new adapter up
+// Every packet, shortened, when BT_LOG_PACKETS is 1: for bringing a new
+// adapter up. It was how the stalled inquiry and the Realtek patch were found.
+#define BT_LOG_PACKETS 0
+
 static void bt_log_packet(uint8_t type, uint8_t in, uint8_t *packet, uint16_t len) {
+  if(!BT_LOG_PACKETS) return;
   char hex[3 * 12 + 1];
   uint16_t n = len < 12 ? len : 12;
   for(uint16_t i = 0; i < n; i++)
@@ -208,8 +214,8 @@ static void bt_task(void *arg) {
   btstack_run_loop_init(btstack_run_loop_freertos_get_instance());
   hci_dump_init(&bt_log);
   hci_init(&bt_transport, NULL);
-  // pairings are kept until power off for now
-  hci_set_link_key_db(btstack_link_key_db_memory_instance());
+  // pairings are kept on the SD card, bt_keys.c
+  hci_set_link_key_db(bt_keys_instance());
 
   bluetooth_init();   // bt_hid.c: L2CAP, HID host, power on
   bluetooth_run();    // never returns

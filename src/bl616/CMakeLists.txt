@@ -62,6 +62,7 @@ target_sources(app PRIVATE
     sdc_direct.c
     bt_usb.c
     bt_hid.c
+    bt_keys.c
     bt_rtk.c
     ../ps2helper.c
 )
