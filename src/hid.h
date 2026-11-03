@@ -9,6 +9,7 @@
 struct hid_kbd_state_S {
   unsigned char last_report[8];
   uint8_t modifiers;
+  uint8_t core_modifiers;   // the ones the core was told are held, see hid.c
   uint8_t keys[32];
 };
 

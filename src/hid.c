@@ -133,16 +133,40 @@ static uint8_t kbd_map_usage(uint8_t usage, bool shifted) {
 // held, which no usage is.
 static uint8_t kbd_sent[256];
 
+// While the OSD is open the keys go to the menu, not to the core. A key
+// pressed before it opened and let go while it is open would stay held in
+// the core for good: Shift+F12, the companion's menu, left the C64 with
+// Shift held, and everything typed afterwards came out wrong. So with the
+// OSD open the core is told to let go of all this keyboard holds there;
+// once it closes, the modifiers still held are pressed again.
+static void kbd_release_core(struct hid_kbd_state_S *state)
+{
+  for (int bit = 0; bit < 8; bit++)
+    if (state->core_modifiers & (1U << bit))
+      kbd_tx_hid_ps2_break(bit, 1);
+  state->core_modifiers = 0;
+
+  for (uint16_t usage = 4; usage <= UINT8_MAX; usage++) {
+    if (!kbd_sent[usage] || !(state->keys[usage / 8] & (1U << (usage % 8))))
+      continue;
+    kbd_tx_hid_ps2_break(kbd_sent[usage], 0);
+    kbd_sent[usage] = 0;
+  }
+}
+
 void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
                            const uint8_t keys[32])
 {
-  if (modifiers != state->modifiers && !osd_is_visible()) {
+  if (osd_is_visible())
+    kbd_release_core(state);
+  else if (modifiers != state->core_modifiers) {
     for (int bit = 0; bit < 8; bit++) {
-      if ((state->modifiers & (1U << bit)) && !(modifiers & (1U << bit)))
+      if ((state->core_modifiers & (1U << bit)) && !(modifiers & (1U << bit)))
         kbd_tx_hid_ps2_break(bit, 1);
-      if (!(state->modifiers & (1U << bit)) && (modifiers & (1U << bit)))
+      if (!(state->core_modifiers & (1U << bit)) && (modifiers & (1U << bit)))
         kbd_tx_hid_ps2_make(bit, 1);
     }
+    state->core_modifiers = modifiers;
   }
 
   for (uint16_t usage = 4; usage <= UINT8_MAX; usage++) {

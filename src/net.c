@@ -39,7 +39,7 @@
 #include "sysctrl.h"
 #include "sdc.h"
 #include "menu.h"
-#include "config.h"   // for config_find_role()
+#include "config.h"   // for config_find_role() and the core's name
 #include "debug.h"
 
 #define NET_PORT          1
@@ -67,11 +67,18 @@ static int modem = MODEM_UNKNOWN;
 static bool wifi_down = false;      // the modem reported no WiFi on the last ATI
 static bool in_body = false;        // file data is streaming, keep it out of the tail
 // The core's network UART: system value N selects 0=19200 1=38400 2=57600
-// 3=115200 4=460800. Transfers run at the fastest one; the port FIFOs in
-// the core hold 255 bytes, enough for the few milliseconds the companion
-// may be busy with the card while a block arrives.
+// 3=115200 4=460800. Transfers run at the fastest one the core's port
+// FIFOs allow: the ST's hold 255 bytes, enough for the few milliseconds
+// the companion may be busy with the card while a block arrives. The
+// C64's hold 15, filled in 0.3 ms at 460800 -- on the board one transfer
+// in three was cancelled there, and at 115200, 1.3 ms, three in seven.
+// With FIFOs that small the transfer runs at 38400: 3.9 ms for the
+// companion to fetch them, a 30 KB program in 8 s.
 #define NET_FAST_BAUD   "460800"
 #define NET_FAST_N      4
+#define NET_SMALL_BAUD  "38400"
+#define NET_SMALL_N     1
+#define NET_SMALL_FIFO  64        // free bytes of an empty FIFO below this: small
 
 static char wifi_cfg[80];
 static bool wifi_tried = false;      // the ini's network is offered once per boot
@@ -479,7 +486,7 @@ static bool modem_detect(void) {
     // still nothing: the modem may have been left at a fast rate when a
     // request was cut short (a reset from the OSD, for instance). Look
     // for it at the rates we use and bring it back to 19200.
-    static const int8_t fast_n[] = { NET_FAST_N, 3 };
+    static const int8_t fast_n[] = { NET_FAST_N, 3, NET_SMALL_N };
     for(unsigned i = 0; i < sizeof(fast_n) && !ok; i++) {
       debugf("NET: no answer at 19200, looking at N=%d", fast_n[i]);
       sys_set_val('N', fast_n[i]);
@@ -576,17 +583,20 @@ static bool net_server_parse(char *host, int max, int *port, char *base, int bma
 
 // --------------------------------------------------------- bit rate ----
 // The modem talks 19200 for the ST. For a file it is worth switching to
-// 115200 for the duration: Zimodem changes its rate the moment it sees
-// ATB and already answers at the new one, so the core's port follows
-// right behind the command. Whatever happens, the request loop puts
-// 19200 back at the end.
+// a fast rate for the duration, see NET_FAST_BAUD: Zimodem changes its
+// rate the moment it sees ATB and already answers at the new one, so the
+// core's port follows right behind the command. Whatever happens, the
+// request loop puts 19200 back at the end.
 
 static bool net_baud_fast(void) {
   if(modem != MODEM_ZIMODEM) return false;
   net_flush();
-  net_puts("ATB" NET_FAST_BAUD "\r");
+  // the space of the empty FIFO towards the modem tells its size
+  unsigned char rx = 0, tx = 0;
+  bool small = sys_port_status(NET_PORT, &rx, &tx) && tx < NET_SMALL_FIFO;
+  net_puts(small ? "ATB" NET_SMALL_BAUD "\r" : "ATB" NET_FAST_BAUD "\r");
   vTaskDelay(pdMS_TO_TICKS(80));         // the command must leave the port at 19200
-  sys_set_val('N', NET_FAST_N);
+  sys_set_val('N', small ? NET_SMALL_N : NET_FAST_N);
   vTaskDelay(pdMS_TO_TICKS(50));
   net_flush();
   fast = true;
@@ -1357,6 +1367,9 @@ bool netdl_hold_start(void (*release)(void)) {
   // must not be held back
   if(!netport_ok) return false;
   if(clock_wait <= 0 || (!wifi_cfg[0] && !server[0])) return false;
+  // Only TOS looks at its clock when it starts. The C64 has no clock to
+  // wait for, and its start is not held back for one.
+  if(!cfg || !cfg->name || strcasecmp(cfg->name, "MiSTeryNano") != 0) return false;
   hold_release = release;
   return true;
 }
