@@ -1,11 +1,16 @@
-# stserve on a Synology NAS, without building an image.
+# stserve on a Synology NAS, without building an image: one server for the
+# Atari ST's collection and one for the C64's, each with its catalogue in
+# a browser at http://<nas-ip>:<port>/_/
 #
 # Put this file and stserve.py into one folder on the NAS, for example
 # /volume1/docker/stserve, then in Container Manager: Project -> Create,
 # pick that folder, "Use an existing docker-compose.yml", start.
 #
-# Change the one line under volumes: to the folder your disk images are
-# in. It is mounted read only; stserve never writes to your collection.
+# Change the line marked "your collection" in each service to the folder
+# its games are in. It is mounted read only; stserve never writes to your
+# collection. The pictures of the catalogue and the games sent from it are
+# kept in ./cache-st and ./cache-c64 next to this file instead. Only one of
+# the two machines? Delete the other service.
 
 services:
   stserve:
@@ -16,6 +21,7 @@ services:
     volumes:
       - /volume1/games/atari:/games:ro    # <-- your collection
       - ./stserve.py:/stserve.py:ro
+      - ./cache-st:/cache                 # pictures and sent games
 
     ports:
       - "8888:8888"                       # server=<nas-ip>:8888 in atarist.ini
@@ -23,6 +29,9 @@ services:
     environment:
       ST_ROOT: /games
       ST_PORT: "8888"
+      ST_CACHE: /cache
+      ST_SYSTEM: "Atari - ST"             # libretro's name, for the pictures
+      ST_TITLE: "Atari ST collection"
       # Entries per menu page. The companion shows at most 32.
       ST_MAX_ENTRIES: "30"
       # Hide what the core cannot read anyway, e.g. the Pasti folders of a
@@ -36,5 +45,34 @@ services:
     # that always works: files there belong to whoever put them there.
     # The mount above is read only, so root or not, nothing can change
     # your collection. To run as someone else, put their id here (ssh to
-    # the NAS, "id -u"), and make sure that user may read the folder.
+    # the NAS, "id -u"), and make sure that user may read the folder and
+    # write ./cache-st.
     # user: "1026:100"
+
+  stserve-c64:
+    image: python:3.12-alpine
+    container_name: stserve-c64
+    restart: unless-stopped
+
+    volumes:
+      - /volume1/games/c64:/games:ro      # <-- your collection
+      - ./stserve.py:/stserve.py:ro
+      - ./cache-c64:/cache                # pictures and sent games
+
+    ports:
+      - "8889:8889"                       # server=<nas-ip>:8889 in c64.ini
+
+    environment:
+      ST_ROOT: /games
+      ST_PORT: "8889"
+      ST_CACHE: /cache
+      ST_SYSTEM: "Commodore - 64"
+      ST_TITLE: "C64 collection"
+      # What the C64 core loads: disk and tape images, programs, cartridges.
+      # "*": an archive is named after the image inside, so a .prg in a
+      # .zip arrives on the card as a .prg and the OSD loads it as one.
+      ST_EXT: "d64,g64,prg,t64,crt,tap"
+      ST_ZIP_EXT: "*"
+      ST_MAX_ENTRIES: "30"
+
+    command: ["python3", "/stserve.py"]

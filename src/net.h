@@ -57,6 +57,7 @@ int netdl_state(void);
 const char *netdl_message(void);
 int netdl_entry_count(void);
 const char *netdl_entry_name(int index);
+bool netdl_entry_marked(int index);   // sent from the catalogue, shown with "> "
 uint32_t netdl_bytes_done(void);
 uint32_t netdl_bytes_total(void);
 const char *netdl_tail(void);   // the last characters exchanged with the modem

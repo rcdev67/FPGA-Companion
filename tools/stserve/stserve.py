@@ -21,6 +21,10 @@ Content-Length, never chunked, no compression, no cookies, no redirects
 except one for a missing trailing slash. That is what the modem's own
 HTTP client can digest.
 
+For a browser the same collection is at /_/: every game in one place,
+searchable, with libretro's pictures, and a button that offers a game at
+the top of the companion's list. See "catalogue" below.
+
 Nothing but the Python standard library, and the collection is only ever
 read. Configuration is in environment variables, see the README.
 """
@@ -56,7 +60,11 @@ NAME_LEN = int(env("ST_NAME_LEN", "30"))
 # .stx (Pasti) and .ipf hold flux data no FPGA floppy here can use.
 IMAGE_EXT = [e.strip().lower() for e in env("ST_EXT", "st,msa,dim,img,rom").split(",") if e.strip()]
 # The ending an archive's image is offered under. What is really inside
-# decides when it is fetched; this only names it in the menu.
+# decides when it is fetched; this only names it in the menu -- and on the
+# SD card, where the core's file selector goes by it. "*" takes the ending
+# of the image inside, for a collection that mixes them, the C64's: a game
+# in an archive is a .d64, a .prg or a .crt. That opens every archive of a
+# folder to list it, once; the answer is kept.
 ZIP_EXT = env("ST_ZIP_EXT", "st")
 # Look into the archives of a page before showing them, so that an archive
 # holding nothing this core can read does not appear at all. That is one
@@ -270,7 +278,15 @@ def listing(path):
             continue
 
         ext = de.name.rsplit(".", 1)[-1].lower() if "." in de.name else ""
-        if ext == "zip":
+        if ext == "zip" and ZIP_EXT == "*":
+            # named after what is inside, so it has to be looked at now
+            m = zip_member(de.path, st)
+            if not m:
+                continue
+            name = unique(names, short_name(de.name, m[2]))
+            names.add(name.lower())
+            out.append(Entry(name, de.path, member=m[0], size=m[1]))
+        elif ext == "zip":
             # What is inside is looked at when the page is rendered and when
             # the file is fetched, never for the whole folder: the name of
             # the archive is enough to sort and to find it again.
@@ -427,6 +443,631 @@ def buckets(entries, depth=1):
     return out
 
 
+# ------------------------------------------------------------ catalogue ----
+#
+# The same collection for a browser, at /_/: every game of every folder in
+# one place, with its year, its publisher and a picture, searchable, and a
+# button that sends it to the computer. A game sent is offered at the top of
+# every listing the companion fetches, under its usual name and marked
+# "> ", so on the computer it is one key away: Download..., Reload list,
+# Return. Once fetched it is no longer offered.
+#
+# Favourites stay: the games starred in the browser are a folder of their
+# own at the top of the collection, "Favourites", for the few a player
+# comes back to out of thousands.
+#
+# The pictures are libretro's (thumbnails.libretro.com), named after the
+# TOSEC sets this collection most likely comes from. They are fetched when
+# a page shows them and kept in ST_CACHE, never in the collection. Without
+# a writable ST_CACHE there are no pictures and no list of sent games kept
+# over a restart; everything else works the same.
+
+import hashlib
+import json
+import threading
+import urllib.request
+
+CACHE = env("ST_CACHE", "")
+# the system's name at libretro: "Atari - ST", "Commodore - 64"
+SYSTEM = env("ST_SYSTEM", "Atari - ST")
+THUMBS = env("ST_THUMBS", "https://thumbnails.libretro.com").rstrip("/")
+TITLE = env("ST_TITLE", "stserve")
+THUMB_KINDS = {"snap": "Named_Snaps", "title": "Named_Titles",
+               "box": "Named_Boxarts", "logo": "Named_Logos"}
+THUMB_DAYS = 30            # how long a list of libretro's names is kept
+MISS_DAYS = 7              # how long "no picture" is believed
+
+
+def cache_dir(*parts):
+    """A folder in the cache, made on the way; None without a cache."""
+    if not CACHE:
+        return None
+    d = os.path.join(CACHE, *parts)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+_TOSEC = re.compile(r"^(?P<title>[^\(\[]*)(?P<rest>.*)$")
+_YEAR = re.compile(r"\((\d{4}|19\d\d-\d\d(?:-\d\d)?|19xx|198x|199x)\)", re.I)
+_GROUP = re.compile(r"\(([^\)]*)\)")
+
+
+def tosec(stem):
+    """Title, year, publisher and the remaining marks of a TOSEC name."""
+    m = _TOSEC.match(stem)
+    title = m.group("title").strip()
+    rest = m.group("rest")
+    m = _ARTICLE.search(title)
+    if m:   # "Pyramid, The" reads "The Pyramid"
+        title = m.group(1).capitalize() + " " + title[:m.start()].strip()
+    year = ""
+    y = _YEAR.search(rest)
+    if y:
+        year = y.group(1)[:4]
+    groups = _GROUP.findall(rest)
+    publisher = groups[1] if len(groups) > 1 and y and groups[0] == y.group(1) else ""
+    marks = []
+    d = _DISK.search(rest)
+    if d:
+        marks.append("disk %s" % d.group(1))
+    s = _SIDE.search(rest)
+    if s:
+        marks.append("side %s" % s.group(1).upper())
+    a = _ALT.search(rest)
+    if a:
+        marks.append(a.group(1).lower())
+    return title or stem, year, publisher, ", ".join(marks)
+
+
+def norm(title):
+    """A title as it is compared: no case, no article, letters and digits."""
+    t = _ARTICLE.sub("", title.strip())
+    t = re.sub(r"^(the|a|an)\s+", "", t, flags=re.I)
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
+
+
+class Game:
+    __slots__ = ("id", "title", "year", "publisher", "marks", "folder",
+                 "real", "_name", "ext", "key", "stem")
+
+    @property
+    def name(self):
+        """The name its listing shows, the one it gets on the SD card."""
+        if self._name is None:
+            f = os.path.basename(self.real)
+            ext = self.ext
+            if ext == "zip":
+                ext = ZIP_EXT
+                if ZIP_EXT == "*":
+                    try:
+                        m = zip_member(self.real, os.stat(self.real))
+                    except OSError:
+                        m = None
+                    ext = m[2] if m else "zip"
+            self._name = short_name(f, ext)
+        return self._name
+
+    def to_json(self):
+        return {"id": self.id, "title": self.title, "year": self.year,
+                "publisher": self.publisher, "marks": self.marks,
+                "folder": self.folder, "name": self.name}
+
+
+class Catalogue:
+    """Every game of the collection, read in once and again now and then."""
+
+    REFRESH = 600
+
+    def __init__(self):
+        self.games = []
+        self.by_id = {}
+        self.when = 0
+        self.busy = False
+        self.lock = threading.Lock()
+
+    def get(self):
+        if not self.busy and time.time() - self.when > self.REFRESH:
+            self.busy = True
+            threading.Thread(target=self.scan, daemon=True).start()
+        return self.games
+
+    def scan(self):
+        games = []
+        try:
+            for top, dirs, files in os.walk(ROOT):
+                dirs[:] = sorted(d for d in dirs
+                                 if not d.startswith(".") and not hidden(d, os.path.join(top, d)))
+                rel_top = os.path.relpath(top, ROOT)
+                folder = "" if rel_top == "." else rel_top.replace(os.sep, "/")
+                for f in files:
+                    if f.startswith(".") or hidden(f, os.path.join(top, f)):
+                        continue
+                    ext = f.rsplit(".", 1)[-1].lower() if "." in f else ""
+                    if ext != "zip" and ext not in IMAGE_EXT:
+                        continue
+                    g = Game()
+                    g.real = os.path.join(top, f)
+                    g.stem = f.rsplit(".", 1)[0]
+                    g.ext = ext
+                    g.title, g.year, g.publisher, g.marks = tosec(g.stem)
+                    g.folder = folder
+                    g._name = None      # worked out when it is shown
+                    g.key = norm(g.title)
+                    rel = (folder + "/" + f) if folder else f
+                    g.id = hashlib.sha1(rel.encode("utf-8", "replace")).hexdigest()[:12]
+                    games.append(g)
+        except OSError:
+            pass
+        games.sort(key=lambda g: (g.key, g.year, g.stem.lower()))
+        with self.lock:
+            self.games = games
+            self.by_id = {g.id: g for g in games}
+            self.when = time.time()
+        self.busy = False
+        sys.stdout.write("catalogue: %d games\n" % len(games))
+        sys.stdout.flush()
+
+    def find(self, gid):
+        self.get()
+        return self.by_id.get(gid)
+
+
+catalogue = Catalogue()
+
+
+# ------------------------------------------------------------- pictures ----
+
+class Thumbs:
+    """libretro's names for one kind of picture, and which game has which."""
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.folder = THUMB_KINDS[kind]
+        self.names = None          # sanitised name -> as listed
+        self.by_title = {}         # norm(title) -> [names]
+        self.by_title_year = {}
+        self.tried = 0
+        self.lock = threading.Lock()
+
+    def load(self):
+        with self.lock:
+            if self.names is not None or time.time() - self.tried < 3600:
+                return self.names is not None
+            self.tried = time.time()
+            d = cache_dir("thumbs", SYSTEM)
+            if not d:
+                return False
+            path = os.path.join(d, self.folder + ".txt")
+            names = None
+            try:
+                if time.time() - os.path.getmtime(path) < THUMB_DAYS * 86400:
+                    with open(path, encoding="utf-8") as f:
+                        names = [l.rstrip("\n") for l in f if l.strip()]
+            except OSError:
+                pass
+            if names is None:
+                names = self.fetch_names()
+                if names is None:
+                    return False
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(names) + "\n")
+                except OSError:
+                    pass
+            self.names = set(names)
+            for n in names:
+                t, y, _, _ = tosec(n)
+                k = norm(t)
+                self.by_title.setdefault(k, []).append(n)
+                if y:
+                    self.by_title_year.setdefault(k + "|" + y, []).append(n)
+            sys.stdout.write("pictures: %d %s for %s\n" % (len(names), self.folder, SYSTEM))
+            sys.stdout.flush()
+            return True
+
+    def fetch_names(self):
+        url = "%s/%s/%s/" % (THUMBS, urllib.parse.quote(SYSTEM), self.folder)
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                text = r.read().decode("utf-8", "replace")
+        except Exception as e:      # no network, a moved server: no pictures
+            sys.stdout.write("pictures: cannot list %s: %s\n" % (url, e))
+            return None
+        out = []
+        for m in re.finditer(r'href="([^"?/][^"]*\.png)"', text):
+            out.append(urllib.parse.unquote(m.group(1))[:-4])
+        return out
+
+    def match(self, g):
+        if not self.load():
+            return None
+        # libretro writes these characters as _ in its file names
+        exact = re.sub(r'[&*/:`<>?\\|"]', "_", g.stem)
+        if exact in self.names:
+            return exact
+        for table, key in ((self.by_title_year, g.key + "|" + g.year), (self.by_title, g.key)):
+            c = table.get(key)
+            if c:
+                # the plainest of them: fewest marks, a release, not a crack
+                return min(c, key=lambda n: (n.count("["), n.count("("), len(n)))
+        return None
+
+
+thumbs = {k: Thumbs(k) for k in THUMB_KINDS}
+
+
+def picture(g, kind):
+    """The picture's bytes, from the cache or fetched into it; None if none."""
+    d = cache_dir("thumbs", SYSTEM, kind)
+    if not d:
+        return None
+    png = os.path.join(d, g.id + ".png")
+    miss = os.path.join(d, g.id + ".none")
+    try:
+        with open(png, "rb") as f:
+            return f.read()
+    except OSError:
+        pass
+    try:
+        if time.time() - os.path.getmtime(miss) < MISS_DAYS * 86400:
+            return None
+    except OSError:
+        pass
+    name = thumbs[kind].match(g)
+    data = None
+    if name:
+        url = "%s/%s/%s/%s.png" % (THUMBS, urllib.parse.quote(SYSTEM),
+                                   THUMB_KINDS[kind], urllib.parse.quote(name))
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = r.read()
+        except Exception:
+            data = None
+    try:
+        if data:
+            with open(png + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(png + ".tmp", png)
+        else:
+            open(miss, "w").close()
+    except OSError:
+        pass
+    return data
+
+
+# ------------------------------------------------------------ sent games ----
+
+class Sent:
+    """The games sent from the browser, offered first in every listing."""
+
+    def __init__(self):
+        self.ids = []
+        self.lock = threading.Lock()
+        d = cache_dir()
+        self.path = os.path.join(d, "sent.json") if d else None
+        if self.path:
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    self.ids = [i for i in json.load(f) if isinstance(i, str)]
+            except (OSError, ValueError):
+                pass
+
+    def save(self):
+        if not self.path:
+            return
+        try:
+            with open(self.path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(self.ids, f)
+            os.replace(self.path + ".tmp", self.path)
+        except OSError:
+            pass
+
+    def add(self, gid):
+        with self.lock:
+            if gid in self.ids:
+                self.ids.remove(gid)
+            self.ids.insert(0, gid)
+            del self.ids[8:]         # a handful, the menu shows few lines
+            self.save()
+
+    def remove(self, gid):
+        with self.lock:
+            if gid in self.ids:
+                self.ids.remove(gid)
+                self.save()
+
+    def games(self):
+        out = []
+        for gid in list(self.ids):
+            g = catalogue.find(gid)
+            if g:
+                out.append(g)
+        return out
+
+    def entry(self, name):
+        """The sent game a listing offered under this name, as an entry."""
+        for g in self.games():
+            if g.name.lower() == name.lower():
+                e = Entry(g.name, g.real, member="?" if g.ext == "zip" else None)
+                return e, g
+        return None, None
+
+
+sent = Sent()
+
+FAV_DIR = "Favourites"
+
+
+class Favourites(Sent):
+    """The games starred in the browser: a folder at the top, for good."""
+
+    def __init__(self):
+        Sent.__init__(self)
+        d = cache_dir()
+        self.path = os.path.join(d, "favourites.json") if d else None
+        self.ids = []
+        if self.path:
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    self.ids = [i for i in json.load(f) if isinstance(i, str)]
+            except (OSError, ValueError):
+                pass
+
+    def add(self, gid):
+        with self.lock:
+            if gid not in self.ids:
+                self.ids.append(gid)
+                self.save()
+
+    def games(self):
+        return sorted(Sent.games(self), key=lambda g: (g.key, g.year, g.stem.lower()))
+
+    def entries(self):
+        names, out = set(), []
+        for g in self.games():
+            name = unique(names, g.name)
+            names.add(name.lower())
+            out.append(Entry(name, g.real, member="?" if g.ext == "zip" else None))
+        return out
+
+
+favourites = Favourites()
+
+
+def sent_lines():
+    """The sent games as the first lines of a listing, marked "> "."""
+    return ["<li><a href=\"%s\">&gt; %s</a></li>" % (urllib.parse.quote(g.name), html.escape(g.name))
+            for g in sent.games()]
+
+
+def state():
+    """What the page shows besides the games: sent ones and favourites."""
+    return {"sent": [g.to_json() for g in sent.games()], "favourites": list(favourites.ids)}
+
+
+def query_games(q, letter, start, n, fav=False):
+    games = catalogue.get()
+    if fav:
+        ids = set(favourites.ids)
+        games = [g for g in games if g.id in ids]
+    if q:
+        words = [norm(w) for w in q.split() if norm(w)]
+        games = [g for g in games
+                 if all(w in g.key or w in norm(g.publisher) or w == g.year for w in words)]
+    if letter:
+        if letter == "#":
+            games = [g for g in games if not g.key[:1].isalpha()]
+        else:
+            games = [g for g in games if g.key[:1] == letter.lower()]
+    out = {"total": len(games), "ready": catalogue.when > 0,
+           "games": [g.to_json() for g in games[start:start + n]],
+           "pictures": bool(CACHE), "title": TITLE}
+    out.update(state())
+    return out
+
+# The browser's page, one file, no library: the server is reached on a home
+# network and must work without the internet as well (only the pictures
+# need it).
+CATALOGUE_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root { --bg:#16161d; --panel:#20202a; --line:#33333f; --text:#e8e6e3; --dim:#9a98a8;
+        --accent:#7aa2f7; --ok:#9ece6a; }
+@media (prefers-color-scheme: light) {
+  :root { --bg:#f4f3ef; --panel:#ffffff; --line:#d8d6cf; --text:#22222a; --dim:#6a6878;
+          --accent:#3355bb; --ok:#3b7a1e; }
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text);
+       font:15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { position:sticky; top:0; z-index:2; background:var(--bg);
+         border-bottom:1px solid var(--line); padding:12px 16px; }
+h1 { font-size:18px; margin:0 0 8px; }
+h1 small { color:var(--dim); font-weight:normal; }
+#q { width:100%; max-width:420px; padding:8px 10px; font:inherit; color:var(--text);
+     background:var(--panel); border:1px solid var(--line); border-radius:6px; }
+#letters { display:flex; flex-wrap:wrap; gap:2px; margin-top:8px; }
+#letters button { min-width:28px; padding:4px 6px; font:inherit; font-size:13px;
+  background:var(--panel); color:var(--text); border:1px solid var(--line);
+  border-radius:4px; cursor:pointer; }
+#letters button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+#sent { margin-top:8px; font-size:13px; color:var(--dim); }
+#sent span.g { display:inline-block; margin:2px 4px 2px 0; padding:2px 8px;
+  background:var(--panel); border:1px solid var(--ok); border-radius:12px; color:var(--text); }
+#sent span.g b { cursor:pointer; color:var(--dim); margin-left:6px; }
+main { padding:16px; }
+#info { color:var(--dim); margin:0 0 12px; }
+#grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:12px; }
+.card { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:8px;
+        overflow:hidden; cursor:pointer; }
+.star { position:absolute; top:4px; right:6px; font-size:22px; line-height:1; color:#fff8;
+        text-shadow:0 0 3px #000; cursor:pointer; user-select:none; }
+.star.on { color:#f5c542; }
+.card:hover { border-color:var(--accent); }
+.pic { aspect-ratio:4/3; background:#000 center/contain no-repeat;
+       display:flex; align-items:center; justify-content:center;
+       color:#555; font-size:28px; font-weight:bold; }
+.card .t { padding:6px 8px 0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.card .s { padding:0 8px 8px; font-size:12px; color:var(--dim); overflow:hidden;
+           text-overflow:ellipsis; white-space:nowrap; }
+#more[hidden] { display:none; }
+#more { display:block; margin:16px auto; padding:8px 20px; font:inherit; cursor:pointer;
+        background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; }
+#detail { position:fixed; inset:0; z-index:3; background:rgba(0,0,0,.6); display:none;
+          align-items:flex-start; justify-content:center; overflow:auto; padding:24px 16px; }
+#detail .box { background:var(--panel); border-radius:10px; max-width:760px; width:100%; padding:16px; }
+#detail h2 { margin:0 0 4px; font-size:20px; }
+#detail .facts { color:var(--dim); margin-bottom:12px; }
+#detail .pics { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+#detail .pics img { max-width:calc(50% - 4px); max-height:260px; border-radius:4px; background:#000; }
+#detail button { padding:9px 16px; font:inherit; cursor:pointer; border-radius:6px; border:0; }
+#send { background:var(--accent); color:#fff; }
+#fav { background:var(--line); color:var(--text); margin-left:8px; }
+#close { background:var(--line); color:var(--text); margin-left:8px; }
+#hint { color:var(--dim); font-size:13px; margin-top:10px; }
+</style></head><body>
+<header>
+  <h1>__TITLE__ <small id="count"></small></h1>
+  <input id="q" type="search" placeholder="Search: title, publisher or year" autocomplete="off">
+  <div id="letters"></div>
+  <div id="sent"></div>
+</header>
+<main>
+  <p id="info"></p>
+  <div id="grid"></div>
+  <button id="more" hidden>More</button>
+</main>
+<div id="detail"><div class="box">
+  <h2 id="dt"></h2><div class="facts" id="df"></div>
+  <div class="pics" id="dp"></div>
+  <button id="send">Send to the computer</button><button id="fav"></button><button id="close">Close</button>
+  <div id="hint"></div>
+</div></div>
+<script>
+const $ = id => document.getElementById(id);
+let q = "", letter = "", start = 0, total = 0, timer = null, current = null;
+let favs = new Set(), onlyFav = false;
+const N = 60;
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]); }
+function line(g) { return [g.year, g.publisher, g.marks].filter(x => x).join(" · "); }
+
+function picture(el, g, kinds) {
+  // the first picture libretro has for it, the title's letters otherwise
+  const k = kinds.shift();
+  if (!k) { el.textContent = (g.title.match(/[A-Za-z0-9]/g) || ["?"]).slice(0, 2).join("").toUpperCase(); return; }
+  const img = new Image();
+  img.onload = () => { el.style.backgroundImage = "url('" + img.src + "')"; el.textContent = ""; };
+  img.onerror = () => picture(el, g, kinds);
+  img.src = "/_/img/" + g.id + "/" + k;
+}
+
+function card(g) {
+  const c = document.createElement("div");
+  c.className = "card";
+  c.innerHTML = '<div class="pic"></div><div class="t">' + esc(g.title) + '</div><div class="s">' +
+                esc(line(g) || g.name) + '</div><span class="star" title="favourite"></span>';
+  const pic = c.firstChild;
+  const star = c.querySelector(".star");
+  const paint = () => { const on = favs.has(g.id); star.textContent = on ? "\u2605" : "\u2606"; star.className = "star" + (on ? " on" : ""); };
+  paint(); c.paintStar = paint; c.gameId = g.id;
+  star.onclick = e => { e.stopPropagation(); toggleFav(g); };
+  // pictures only once the card is on the screen: a collection is long
+  const io = new IntersectionObserver(es => es.forEach(e => {
+    if (e.isIntersecting) { io.disconnect(); picture(pic, g, ["snap", "title", "box"]); }
+  }), { rootMargin: "200px" });
+  io.observe(c);
+  c.onclick = () => show(g);
+  return c;
+}
+
+function apply(st) {
+  favs = new Set(st.favourites);
+  document.querySelectorAll(".card").forEach(c => c.paintStar && c.paintStar());
+  if (current) $("fav").textContent = favs.has(current.id) ? "\u2605 Favourite" : "\u2606 Add to favourites";
+  showSent(st.sent);
+}
+
+function toggleFav(g) {
+  fetch("/_/" + (favs.has(g.id) ? "unfav" : "fav") + "?id=" + g.id, { method: "POST" })
+    .then(r => r.json()).then(st => { apply(st); if (onlyFav && !favs.has(g.id)) load(true); });
+}
+
+function showSent(list) {
+  $("sent").innerHTML = list.length ? "Sent to the computer: " + list.map(g =>
+    '<span class="g">' + esc(g.title) + ' <small>' + esc(g.name) + '</small><b data-id="' + g.id +
+    '" title="remove">×</b></span>').join("") : "";
+  $("sent").querySelectorAll("b").forEach(b => b.onclick = () =>
+    fetch("/_/unsend?id=" + b.dataset.id, { method: "POST" }).then(r => r.json()).then(apply));
+}
+
+function load(reset) {
+  if (reset) { start = 0; $("grid").innerHTML = ""; }
+  const u = "/_/api/games?q=" + encodeURIComponent(q) + "&letter=" + encodeURIComponent(letter) +
+            "&start=" + start + "&n=" + N + (onlyFav ? "&fav=1" : "");
+  fetch(u).then(r => r.json()).then(d => {
+    document.title = d.title; total = d.total;
+    if (!d.ready) { $("info").textContent = "Reading the collection ..."; setTimeout(() => load(true), 1500); return; }
+    $("count").textContent = total + (total == 1 ? " game" : " games");
+    $("info").textContent = total ? "" : (onlyFav ? "No favourites yet: the star on a game makes it one." : "Nothing found.");
+    favs = new Set(d.favourites);
+    d.games.forEach(g => $("grid").appendChild(card(g)));
+    start += d.games.length;
+    $("more").hidden = start >= total;
+    showSent(d.sent);
+  });
+}
+
+function show(g) {
+  current = g;
+  $("dt").textContent = g.title;
+  $("df").textContent = [line(g), (g.folder ? g.folder + " · " : "") + "on the card as " + g.name]
+                        .filter(x => x).join("  —  ");
+  $("dp").innerHTML = "";
+  ["box", "title", "snap", "logo"].forEach(k => {
+    const i = new Image(); i.alt = k; i.onerror = () => i.remove();
+    i.src = "/_/img/" + g.id + "/" + k; $("dp").appendChild(i);
+  });
+  $("hint").textContent = "";
+  $("fav").textContent = favs.has(g.id) ? "\u2605 Favourite" : "\u2606 Add to favourites";
+  $("detail").style.display = "flex";
+}
+
+$("send").onclick = () => fetch("/_/send?id=" + current.id, { method: "POST" })
+  .then(r => r.json()).then(st => {
+    apply(st);
+    $("hint").textContent = "On the computer: Shift+F12, Download..., Reload list -- " +
+                            "> " + current.name + " is at the top.";
+  });
+$("fav").onclick = () => { toggleFav(current); };
+$("close").onclick = () => $("detail").style.display = "none";
+$("detail").onclick = e => { if (e.target === $("detail")) $("detail").style.display = "none"; };
+document.onkeydown = e => { if (e.key === "Escape") $("detail").style.display = "none"; };
+$("more").onclick = () => load(false);
+$("q").oninput = () => { clearTimeout(timer); timer = setTimeout(() => { q = $("q").value.trim(); load(true); }, 250); };
+
+["\u2605"].concat("#ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")).concat([""]).forEach(l => {
+  const b = document.createElement("button");
+  b.textContent = l || "All";
+  b.title = l === "\u2605" ? "favourites" : "";
+  if (l === letter) b.className = "on";
+  b.onclick = () => {
+    onlyFav = l === "\u2605"; letter = onlyFav ? "" : l;
+    document.querySelectorAll("#letters button").forEach(x => x.className = "");
+    b.className = "on"; load(true);
+  };
+  $("letters").appendChild(b);
+});
+load(true);
+</script></body></html>
+"""
+
+
 # ------------------------------------------------------------ the server ----
 
 
@@ -487,11 +1128,17 @@ def page(url_path, entries, depth, full):
     if url_path:
         head += "<li><a href=\"../\">../</a></li>"
 
-    lines = []
+    lines = sent_lines()
+    offered = {g.name.lower() for g in sent.games()}
+    if not url_path and favourites.ids:
+        lines.append("<li><a href=\"%s/\">%s/</a> <small>%d</small></li>"
+                     % (FAV_DIR, FAV_DIR, len(favourites.games())))
     for lab, chunk in ranges:
         lines.append("<li><a href=\"%s/\">%s/</a> <small>%d</small></li>"
                      % (urllib.parse.quote(lab), html.escape(lab), len(chunk)))
     for e in shown:
+        if not e.is_dir and e.name.lower() in offered:
+            continue                          # at the top already, sent from the browser
         if PEEK and e.member and not e.is_dir and zip_of(e):
             continue                          # an archive without a usable image
         line = "<li><a href=\"%s\">%s</a>" % (e.href, html.escape(e.name))
@@ -511,7 +1158,7 @@ def page(url_path, entries, depth, full):
 
     tail = "</ul>"
     if not full:
-        tail += "<p><a href=\"?full=1\">names and sizes</a></p>"
+        tail += "<p><a href=\"?full=1\">names and sizes</a> &middot; <a href=\"/_/\">catalogue</a></p>"
     return (head + "".join(lines) + tail + "</body></html>").encode("utf-8", "replace")
 
 
@@ -549,6 +1196,60 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.serve(True)
 
+    def do_POST(self):
+        url = urllib.parse.urlsplit(self.path)
+        gid = urllib.parse.parse_qs(url.query).get("id", [""])[0]
+        if url.path == "/_/send" and catalogue.find(gid):
+            sent.add(gid)
+        elif url.path == "/_/unsend":
+            sent.remove(gid)
+        elif url.path == "/_/fav" and catalogue.find(gid):
+            favourites.add(gid)
+        elif url.path == "/_/unfav":
+            favourites.remove(gid)
+        else:
+            return self.fail(404, "Not Found")
+        self.send_data(json.dumps(state()).encode(), "application/json")
+
+    def send_data(self, data, ctype, body=True, cache=False):
+        self.send_response(200, "OK")
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        if cache:
+            self.send_header("Cache-Control", "max-age=86400")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if body:
+            self.wfile.write(data)
+        self.close_connection = True
+
+    def catalogue_get(self, url, parts, body):
+        """/_/ for the browser: the page, its data and the pictures."""
+        qs = urllib.parse.parse_qs(url.query)
+        if len(parts) == 1:
+            if not url.path.endswith("/"):
+                parts = []      # fall through to the redirect below
+            else:
+                page_html = CATALOGUE_HTML.replace("__TITLE__", html.escape(TITLE))
+                return self.send_data(page_html.encode("utf-8"), "text/html; charset=utf-8", body)
+        if parts[1:2] == ["api"] and parts[2:3] == ["games"]:
+            def num(k, d):
+                try:
+                    return max(0, int(qs.get(k, [d])[0]))
+                except ValueError:
+                    return d
+            data = query_games(qs.get("q", [""])[0], qs.get("letter", [""])[0][:1],
+                               num("start", 0), min(num("n", 60), 200),
+                               qs.get("fav", [""])[0] == "1")
+            return self.send_data(json.dumps(data).encode(), "application/json", body)
+        if parts[1:2] == ["img"] and len(parts) == 4 and parts[3] in THUMB_KINDS:
+            g = catalogue.find(parts[2])
+            data = picture(g, parts[3]) if g else None
+            if not data:
+                return self.fail(404, "Not Found")
+            return self.send_data(data, "image/png", body, cache=True)
+        return self.fail(404, "Not Found")
+
     def serve(self, body):
         url = urllib.parse.urlsplit(self.path)
         full = "full" in urllib.parse.parse_qs(url.query)
@@ -556,6 +1257,43 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in path.split("/") if p]
         if any(p in (".", "..") for p in parts):
             return self.fail(403, "Forbidden")
+
+        if parts[:1] == ["_"]:
+            if path.endswith("/_"):
+                self.send_response(301, "Moved Permanently")
+                self.send_header("Location", "/_/")
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                return
+            return self.catalogue_get(url, parts, body)
+
+        # a game sent from the browser, offered at the top of every listing
+        if parts and not path.endswith("/"):
+            e, g = sent.entry(parts[-1])
+            if e:
+                return self.send_image(e, body, g)
+
+        # the starred ones, a folder of their own at the top
+        if parts[:1] == [FAV_DIR]:
+            entries = favourites.entries()
+            if len(parts) == 2:
+                for e in entries:
+                    if e.name.lower() == parts[1].lower():
+                        return self.send_image(e, body)
+                return self.fail(404, "Not Found")
+            if len(parts) > 2:
+                return self.fail(404, "Not Found")
+            if not path.endswith("/"):
+                self.send_response(301, "Moved Permanently")
+                self.send_header("Location", "/%s/" % FAV_DIR)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                return
+            return self.send_data(page(FAV_DIR, entries, 1, full), "text/html; charset=utf-8", body)
 
         r = resolve(parts)
         if r.kind is None:
@@ -584,7 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_image(r.entry, body)
 
-    def send_image(self, e, body):
+    def send_image(self, e, body, sent_game=None):
         if e.member and zip_of(e):
             self.log_message("no image inside %s", e.real)
             return self.fail(404, "Not Found")
@@ -607,6 +1345,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if body:
                 shutil.copyfileobj(src, self.wfile, BLOCK)
+                if sent_game:
+                    sent.remove(sent_game.id)     # it is on the card now
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             self.log_message("transfer of %s broke off", e.name)
         finally:
@@ -657,7 +1397,10 @@ def main(argv):
     sys.stdout.write(
         "stserve on port %d, serving %s (%d entries at the top, %d per page)\n"
         % (PORT, ROOT, n, MAX_ENTRIES))
+    sys.stdout.write("catalogue at /_/, pictures of %s %s\n"
+                     % (SYSTEM, ("cached in " + CACHE) if CACHE else "off: no ST_CACHE"))
     sys.stdout.flush()
+    catalogue.get()
     try:
         Server(("", PORT), Handler).serve_forever()
     except KeyboardInterrupt:

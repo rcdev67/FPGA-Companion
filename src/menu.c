@@ -1233,11 +1233,16 @@ static bool menu_is_systemmenu(void) {
   return false;
 }  
 
+static bool net_dialog_jump(uint8_t code);
+
 static void menu_handle_latin1(uint8_t code) {
   // this function receives lagtin1 encoded keyboard events and
   // is meant to be used for complex text input in custom dialogs  
   if(code > 31) menu_debugf("menu_handle_latin1(%d/%c)", code, code);
   else          menu_debugf("menu_handle_latin1(%d)", code);
+
+  // in the download list a letter goes to the first entry starting with it
+  if(net_dialog_jump(code)) menu_do(MENU_EVENT_NONE);
 }
 
 static void net_dialog_update(void);
@@ -1617,10 +1622,14 @@ static const config_menu_entry_t system_menu_usb_core_fsel = {
 
 static const config_custom_t net_dialog;
 
+// With a list, its first line fetches it again: the companion holds one
+// list per folder until it is told otherwise, and a server's collection
+// grows -- a game sent from stserve's catalogue in the browser shows up at
+// the top of the list once it is fetched again.
 static int net_dialog_length(void) {
-  // the file list, or the single entry that loads it
+  // "Reload list" and the file list, or the single entry that loads it
   int n = netdl_entry_count();
-  return n ? n : 1;
+  return n ? n + 1 : 1;
 }
 
 static void net_dialog_draw(void) {
@@ -1697,19 +1706,51 @@ static void net_dialog_draw(void) {
     u8g2_SetFont(&u8g2, font_helvR08_te);
   }
 
-  // the list, four lines, scrolled like a menu
-  for(int i=0;i<4 && i+menu_state->scroll < n;i++) {
+  // the list, four lines, scrolled like a menu, "Reload list" first
+  for(int i=0;i<4 && i+menu_state->scroll < n+1;i++) {
+    int row = i + menu_state->scroll;
     int y = MENU_LINE_Y + (i+1)*MENU_ENTRY_H;
-    u8g2_DrawStr(&u8g2, 2, y, netdl_entry_name(i + menu_state->scroll));
-    if(i + menu_state->scroll == menu_state->selected - 1)
+    char label[NET_NAME_LEN + 3];
+    if(!row)                             snprintf(label, sizeof(label), "Reload list");
+    else if(netdl_entry_marked(row - 1)) snprintf(label, sizeof(label), "> %s", netdl_entry_name(row - 1));
+    else                                 snprintf(label, sizeof(label), "%s", netdl_entry_name(row - 1));
+    u8g2_DrawStr(&u8g2, 2, y, label);
+    if(row == menu_state->selected - 1)
       u8g2_DrawButtonFrame(&u8g2, 0, y, U8G2_BTN_INV, width, 1, 1);
   }
 }
 
 static void net_dialog_select(int selected) {
   if(netdl_state() == NET_STATE_BUSY) return;
-  if(!netdl_entry_count()) netdl_request_list();
-  else                   netdl_request_download(selected - 1);
+  if(!netdl_entry_count() || selected == 1) netdl_request_list();
+  else                                      netdl_request_download(selected - 2);
+}
+
+// A typed letter or digit selects the first entry starting with it, the
+// next one on the next press of the same key. Returns whether it moved.
+static bool net_dialog_jump(uint8_t code) {
+  if(!menu_state || menu_state->type != MENU_TYPE_CUSTOM || menu_state->custom != &net_dialog)
+    return false;
+  int n = netdl_entry_count();
+  if(!n || netdl_state() == NET_STATE_BUSY) return false;
+  if(!((code >= '0' && code <= '9') || (code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z')))
+    return false;
+  if(code >= 'a') code -= 'a' - 'A';
+
+  // start after the current entry, so the same key walks through them
+  int cur = menu_state->selected - 2;   // index of the selected entry
+  for(int k = 1; k <= n; k++) {
+    int i = (cur + k + n) % n;
+    unsigned char c = (unsigned char)netdl_entry_name(i)[0];
+    if(c >= 'a' && c <= 'z') c -= 'a' - 'A';
+    if(c != code) continue;
+    int row = i + 1;                     // the row on the screen, after "Reload list"
+    menu_state->selected = row + 1;
+    if(row < menu_state->scroll) menu_state->scroll = row;
+    if(row > menu_state->scroll + 3) menu_state->scroll = row - 3;
+    return true;
+  }
+  return false;
 }
 
 static const config_custom_t net_dialog = {

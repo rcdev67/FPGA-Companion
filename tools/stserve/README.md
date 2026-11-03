@@ -1,4 +1,4 @@
-# stserve — your disk image collection on the ST's menu
+# stserve — your game collection on the computer's menu, and in a browser
 
 `Download...` in the companion's menu fetches files from a web server on
 your network. Any web server will do for a handful of images, and
@@ -20,9 +20,15 @@ of ZIP archives in folders, and the companion shows 32 entries at a time.
 - **Folders that hold nothing but one folder are skipped**, so the three
   levels TOSEC needs before the first game are not three menus with one
   entry each.
+- **A catalogue for the browser** at `/_/`, see below: the whole
+  collection with pictures, search and favourites, and a button that puts
+  a game at the top of the computer's list.
 
 It reads your collection and never writes to it. Python only, no
-dependencies, about 400 lines — you can read what it does.
+dependencies, one file — you can read what it does.
+
+The same server works for the Atari ST and the C64; `docker-compose.yml`
+runs one for each, see "For the C64" below.
 
 This needs the companion of this fork from **2026-09-19** or later, the
 one that can walk into folders. An older one shows the files of the top
@@ -58,6 +64,53 @@ To check it without the ST, open `http://192.168.1.10:8888/` in a browser
 on the PC. You see the same list; `names and sizes` at the bottom of the
 page shows which file of your collection is behind each name.
 
+**Changing an existing project**, to a new `stserve.py` or the compose file
+below: stop the project in Container Manager, replace the files in its
+folder, then **Action → Build** (or `docker compose up -d` in that folder).
+
+## The catalogue in a browser
+
+`http://<nas-ip>:8888/_/` shows the collection for a person rather than for
+the modem: every game of every folder on one page, with year and publisher
+from its TOSEC name, a search box, a bar of first letters, and pictures --
+screenshot, title screen, box and logo where there are any.
+
+- **Send to the computer**, in a game's view: the game is offered at the
+  top of every list the companion fetches, marked `> `. On the computer:
+  Shift+F12, *Download...*, *Reload list*, and it is the first entry. Once
+  it has been fetched it is no longer offered.
+- **The star** makes a game a favourite. Favourites are a folder of their
+  own at the top of the computer's list, `Favourites/`, for the few games
+  a player comes back to out of thousands; **★** in the letter bar shows
+  only them in the browser.
+
+The **pictures** are libretro's, from `thumbnails.libretro.com`, named
+after the TOSEC sets. stserve fetches a picture the first time a page shows
+it and keeps it in `ST_CACHE`; the first one takes a few seconds longer,
+as it loads libretro's list of names (some 30 MB, kept for a month). A
+game whose name matches no picture exactly is matched by title and year,
+then by title alone; one that matches nothing shows its initials. The
+pictures are not part of this repository, and they stay on your NAS.
+
+Sent games and favourites are kept in `ST_CACHE` as well, so they survive
+a restart. Without `ST_CACHE` the catalogue works without pictures, and
+favourites last until the server stops.
+
+## For the C64
+
+`docker-compose.yml` has a second service, `stserve-c64`, for a C64
+collection: its own container, its own folder, port **8889**, its own
+cache. Change its line marked `<-- your collection`, and in `c64.ini` on
+the C64's SD card:
+
+    server=192.168.1.10:8889
+
+What is different from the ST is all in its environment: the endings the
+C64 core loads (`ST_EXT=d64,g64,prg,t64,crt,tap`), `ST_SYSTEM=Commodore -
+64` for the pictures, and `ST_ZIP_EXT=*`, which names a game in an archive
+after the image inside: a `.prg` arrives on the card as a `.prg`, a cartridge
+as a `.crt`, and the OSD loads each the way it should.
+
 **Docker without Container Manager**, same thing from a shell:
 
     docker compose up -d
@@ -88,10 +141,14 @@ All of them are optional; the defaults are what the companion can handle.
 | `ST_MAX_BYTES` | `3400` | a page is trimmed to this; the companion reads 4 KB |
 | `ST_NAME_LEN` | `30` | how long a name on the SD card may get |
 | `ST_EXT` | `st,msa,dim,img,rom` | endings that count as an image |
-| `ST_ZIP_EXT` | `st` | the ending an image out of an archive is offered under |
+| `ST_ZIP_EXT` | `st` | the ending an image out of an archive is offered under; `*` takes the ending of the image inside, for the C64 |
 | `ST_HIDE` | — | patterns to leave out, e.g. `*[STX]*,*.txt` |
 | `ST_PEEK` | `1` | look into the archives of a page and drop those without a usable image. Turn it off (`0`) for a slow disk |
 | `ST_QUIET` | `0` | `1` stops the line per request in the log |
+| `ST_CACHE` | — | a folder stserve may write to: pictures, sent games, favourites. The compose file mounts `./cache-st` and `./cache-c64` there |
+| `ST_SYSTEM` | `Atari - ST` | libretro's name of the machine, for the pictures: `Atari - ST`, `Commodore - 64` |
+| `ST_THUMBS` | `https://thumbnails.libretro.com` | where the pictures come from |
+| `ST_TITLE` | `stserve` | the catalogue's heading |
 
 ## What it will not do
 
@@ -101,7 +158,10 @@ All of them are optional; the defaults are what the companion can handle.
 - **Nothing is written.** The collection is mounted read only on purpose.
   Save games belong on the SD card, not on the NAS.
 - **No HTTPS, no user name, no password.** This is for your own network.
-  Do not forward the port to the internet.
+  Do not forward the port to the internet. The catalogue lets anyone on
+  that network send games and set favourites.
+- **The pictures need the internet**, the rest does not. Without it the
+  catalogue shows initials instead.
 - **One image per archive.** An archive holding several disks offers the
   first image; a set of disks is several archives in TOSEC anyway.
 

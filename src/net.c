@@ -61,6 +61,10 @@ static char message[48] = "";
 static char names[NET_MAX_ENTRIES][NET_NAME_LEN];   // shown, and the name on the card
 static char cwd[NET_PATH_LEN];                      // the folder shown, "" at the top
 static char hrefs[NET_MAX_ENTRIES][NET_HREF_LEN];   // as the server wants it in the URL
+// A link whose text starts with "> " is marked in the menu: stserve offers a
+// game sent from its catalogue in the browser that way, at the top of every
+// list. The name on the card is the link's, without the mark.
+static bool marked[NET_MAX_ENTRIES];
 static int name_count = 0;
 static uint32_t bytes_done = 0, bytes_total = 0;
 static int modem = MODEM_UNKNOWN;
@@ -924,7 +928,7 @@ static void url_decode(const char *in, char *out, int max) {
 // One link of the listing. Folders keep their slash and are shown with
 // it, so the list tells them apart at a glance and download() knows what
 // to do with them; ".." is the way back up.
-static void add_entry(const char *href) {
+static void add_entry(const char *href, bool mark) {
   if(name_count >= NET_MAX_ENTRIES) return;
   int hl = strlen(href);
   if(hl == 0 || hl >= NET_HREF_LEN) return;
@@ -941,6 +945,7 @@ static void add_entry(const char *href) {
   if(!name[0]) return;
   strcpy(hrefs[name_count], href);
   strcpy(names[name_count], name);
+  marked[name_count] = mark;
   name_count++;
 }
 
@@ -969,7 +974,9 @@ static void fetch_list(void) {
       char *e = strchr(p, '"');
       if(!e) break;
       *e = '\0';
-      add_entry(p);
+      // the link's text follows the closing quote of the href
+      char *text = strchr(e + 1, '>');
+      add_entry(p, text && !strncmp(text + 1, "&gt; ", 5));
       p = e + 1;
     }
   } else {
@@ -982,7 +989,7 @@ static void fetch_list(void) {
       if(*e) e++;
       while(end > p && (end[-1] == '\r' || end[-1] == ' ')) end--;
       *end = '\0';
-      if(*p && *p != ';' && *p != '#') add_entry(p);
+      if(*p && *p != ';' && *p != '#') add_entry(p, false);
       p = e;
     }
   }
@@ -1385,6 +1392,7 @@ int netdl_state(void) { return state; }
 const char *netdl_message(void) { return message; }
 int netdl_entry_count(void) { return (state == NET_STATE_LIST || state == NET_STATE_DONE || state == NET_STATE_ERROR) ? name_count : 0; }
 const char *netdl_entry_name(int index) { return (index >= 0 && index < name_count) ? names[index] : ""; }
+bool netdl_entry_marked(int index) { return index >= 0 && index < name_count && marked[index]; }
 uint32_t netdl_bytes_done(void) { return bytes_done; }
 uint32_t netdl_bytes_total(void) { return bytes_total; }
 
