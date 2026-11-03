@@ -3012,11 +3012,9 @@ void usbh_msc_run(struct usbh_msc *msc_class)
 volatile size_t xMallocFailedSize = 0;
 
 // overrides the SDK's weak hook to report the heap state before aborting
-void vApplicationMallocFailedHook(void)
+// every heap with what is left of it; also bt_hid.c, once Bluetooth is up
+void mcu_hw_print_heaps(void)
 {
-  usb_debugf("vApplicationMallocFailedHook: request %u bytes, task %s\r\n",
-         (unsigned)xMallocFailedSize, pcTaskGetName(NULL));
-
   for (uint32_t i = 0; i < CONFIG_MM_HEAP_COUNT; i++) {
     mm_heap_t *heap = g_mem_manager.heaps[i];
     if (!heap || !heap->is_active) continue;
@@ -3033,7 +3031,13 @@ void vApplicationMallocFailedHook(void)
            (unsigned)i, heap->name, (unsigned)usage.total_size,
            (unsigned)usage.free_size, (unsigned)usage.max_free_size);
   }
+}
 
+void vApplicationMallocFailedHook(void)
+{
+  usb_debugf("vApplicationMallocFailedHook: request %u bytes, task %s\r\n",
+         (unsigned)xMallocFailedSize, pcTaskGetName(NULL));
+  mcu_hw_print_heaps();
   abort();
 }
 

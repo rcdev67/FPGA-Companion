@@ -53,7 +53,12 @@
 
 #define MAX_ATTRIBUTE_VALUE_SIZE 300
 
-#define MAX_BT_HID_DEVICES  2
+// Four: a keyboard, a mouse and two controllers, as much as a computer of
+// the time had; more goes on USB. Each slot is about a kilobyte of RAM,
+// and the RAM here is the heap's as well. Each connection takes some
+// 3 KB of heap: measured with two USB devices on the hub and three
+// Bluetooth ones connected, 10 KB were left.
+#define MAX_BT_HID_DEVICES  4
 #define MAX_BT_HID_REPORTS  4  // up to four different resports per device supported
 
 typedef enum {
@@ -98,6 +103,7 @@ static btstack_timer_source_t first_scan_timer;
 static int first_scan_tries;
 
 int bt_keys_count(void);   // bt_keys.c
+void mcu_hw_print_heaps(void);   // mcu_hw.c
 static int le_bonds_count(void);
 static void le_reconnect(void);
 static void le_scan_start(uint32_t ms);
@@ -386,7 +392,10 @@ static void le_connect_pending(btstack_timer_source_t *ts) {
     btstack_run_loop_add_timer(ts);
     return;
   }
-  bt_debugf("cannot connect, error 0x%02x", status);
+  if(status == BTSTACK_MEMORY_ALLOC_FAILED)
+    bt_debugf("cannot connect: no memory left for another connection");
+  else
+    bt_debugf("cannot connect, error 0x%02x", status);
   le_give_up();
 }
 
@@ -706,6 +715,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
     case BTSTACK_EVENT_STATE:
       if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
 	bt_debugf("BTStack up and working");
+	mcu_hw_print_heaps();   // what the connections have to share
 	first_scan_tries = 0;
 	// what was connected over Low Energy before the adapter went away
 	for(int i=0;i<MAX_BT_HID_DEVICES;i++)

@@ -1357,7 +1357,10 @@ void menu_init(void) {
   menu_queue = xQueueCreate(10, sizeof( long ) );
   
   // start a thread for the on screen display    
-  xTaskCreate(menu_task, (char *)"menu_task", 4096, NULL, configMAX_PRIORITIES-3, &menu_handle);
+#ifndef MENU_TASK_STACK
+#define MENU_TASK_STACK 4096
+#endif
+  xTaskCreate(menu_task, (char *)"menu_task", MENU_TASK_STACK, NULL, configMAX_PRIORITIES-3, &menu_handle);
 
   // At this point, the USB may already be ready. But since the
   // menu task wasn't ready by now, it never had a chance to be mounted properly

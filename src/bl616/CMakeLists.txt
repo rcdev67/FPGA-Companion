@@ -92,6 +92,12 @@ target_sources(app PRIVATE ${COMPONENT_SRCS})
 set(BTSTACK ../btstack)
 sdk_add_include_directories(${BTSTACK}/src ${BTSTACK}/platform/freertos ${BTSTACK}/platform/embedded ${BTSTACK}/3rd-party/micro-ecc)
 sdk_add_compile_definitions(-DENABLE_BLUETOOTH)
+
+# The heap is short: four Bluetooth devices take some 13 KB of it. The
+# menu's thread used 0.6 KB of its 16 KB, measured with the OSD open and a
+# Bluetooth scan running; 8 KB it is. The shell's thread, in defconfig,
+# likewise.
+sdk_add_compile_definitions(-DMENU_TASK_STACK=2048)
 target_sources(app PRIVATE
     ${BTSTACK}/src/ad_parser.c
     ${BTSTACK}/src/btstack_crypto.c

@@ -213,10 +213,10 @@ uint32_t hal_time_ms(void) {
 // ------------------------------------------------------------ the task --
 static TaskHandle_t bt_task_handle;
 
-// 12 KB: room for micro-ecc's maths while a Low Energy device pairs, on top
-// of the calls from Security Manager and GATT down to the FPGA. More is more
-// than the heap has left in one piece.
-#define BT_TASK_STACK 3072   // words
+// 8 KB. Measured with both keyboards connecting and one dropping out: 2.6 KB
+// used; pairing a Low Energy device, micro-ecc's maths included, worked with
+// as much. The heap is short, every connection takes some of it.
+#define BT_TASK_STACK 2048   // words
 
 static void bt_task(void *arg) {
   (void)arg;
