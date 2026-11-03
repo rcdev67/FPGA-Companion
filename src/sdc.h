@@ -8,6 +8,10 @@
 // fatfs mounts the card under /sd
 #define CARD_MOUNTPOINT "/sd"
 
+// the file selector slot of "From USB" in the companion's menu, after the
+// drives, the images and the cores, see menu.c
+#define SDC_COPY_SLOT (MAX_DRIVES+MAX_IMAGES+MAX_CORES)
+
 typedef struct sdc_dir {
   char *name;
   unsigned long len;

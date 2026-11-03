@@ -810,7 +810,7 @@ static void menu_file_selector_open(config_menu_entry_t *entry) {
     menu_debugf("opening drive image selector");
     fsel_state.ext = entry->fsel->ext;
     fsel_state.index = entry->fsel->index;
-    fsel_state.none_str = NULL;
+    fsel_state.none_str = (entry->fsel->index == SDC_COPY_SLOT) ? "Back" : NULL;
     fsel_state.none_icn = NULL;
     fsel_state.action = entry->fsel->action;
   }
@@ -889,6 +889,8 @@ static void menu_pop(void) {
   vPortFree(m);
 }
 
+static void usb_copy(const char *dir, const char *name);
+
 static void menu_fileselector_select(sdc_dir_entry_t *entry) {
   int drive = fsel_state.index;
   menu_debugf("%s %d: file selected '%s'", drive>=MAX_DRIVES?"IMG":"DRV",
@@ -902,8 +904,8 @@ static void menu_fileselector_select(sdc_dir_entry_t *entry) {
       // User selected the "No Disk" entry
       // return to parent form
       menu_pop();
-      // Eject
-      sdc_image_open(drive, NULL);
+      // Eject; "From USB" has nothing to eject
+      if(drive != SDC_COPY_SLOT) sdc_image_open(drive, NULL);
     } else {	
       // check if we are going up one dir and try to select the
       // directory we are coming from
@@ -936,6 +938,10 @@ static void menu_fileselector_select(sdc_dir_entry_t *entry) {
 	}
       }
     }
+  } else if(drive == SDC_COPY_SLOT) {
+    // "From USB": onto the card, then back to the menu
+    menu_pop();
+    usb_copy(sdc_get_cwd(drive), entry->name);
   } else {
     // request insertion of this image
     sdc_image_open(drive, entry->name);
@@ -1308,13 +1314,21 @@ static void menu_task(__attribute__((unused)) void *parms) {
       if ( (fres = f_mount(&usb_fs, "/usb", 1)) != FR_OK ) menu_debugf("/usb mount failed: %d", fres);
       else {
 	menu_debugf("/usb mounted");
-	menu_draw_dialog("USB", "A USB mass storage device has been detected!");
+	menu_draw_dialog_for("USB", "The USB stick is ready: Shift+F12, From USB", pdMS_TO_TICKS(3000));
       }
     } else if(cmd == MENU_EVENT_USB_UMOUNTED) {
       if (f_unmount("/usb") != FR_OK )	menu_debugf("/usb unmount failed");
       else	                        menu_debugf("/usb unmounted");
       menu_draw_dialog("USB", "A USB mass storage device has been removed!");
     }
+
+    // A stick takes a moment to answer, and one that never does would
+    // otherwise leave nothing on the screen at all.
+    else if(cmd == MENU_EVENT_USB_DETECTED)
+      menu_draw_dialog_for("USB", "USB stick found, reading it ...", pdMS_TO_TICKS(8000));
+    else if(cmd == MENU_EVENT_USB_FAILED)
+      menu_draw_dialog_for("USB", "The USB stick does not answer. Plug it in again, or try another one.",
+			   pdMS_TO_TICKS(5000));
 
     else if((cmd & 0xffffff00) == MENU_EVENT_KEY_LATIN1)
       menu_handle_latin1(cmd & 0xff);
@@ -1875,11 +1889,86 @@ static const config_menu_entry_t system_menu_joy = {
   .next = (config_menu_entry_t*)&system_menu_usb_core_fsel
 };
 
+/* ---- "From USB": a file from a USB stick onto the SD card ----
+   For whoever keeps the games on a stick and has no server. The core's
+   floppy reads a disk image straight from the SD card, the companion only
+   tells it which sectors of the card hold it -- a disk on the stick is out
+   of its reach. So the file is copied into the card's root first, where
+   every file selector of every core finds it, as a download lands. */
+
+static char *usb_copy_exts[] = { "*", NULL };
+
+static const config_fsel_t usb_copy_fsel = {
+  .index = SDC_COPY_SLOT,
+  .label = "From USB",
+  .def = "/usb",
+  .ext = (char**)usb_copy_exts
+};
+
+static const config_menu_entry_t system_menu_usb_copy = {
+  .type = CONFIG_MENU_ENTRY_FILESELECTOR,
+  .fsel = (config_fsel_t*)&usb_copy_fsel,
+  .next = (config_menu_entry_t*)&system_menu_joy
+};
+
+static void usb_copy(const char *dir, const char *name) {
+  static const char tmp[] = CARD_MOUNTPOINT "/USBCOPY.TMP";
+  char src[strlen(dir) + strlen(name) + 2];
+  char dst[strlen(CARD_MOUNTPOINT) + strlen(name) + 2];
+  snprintf(src, sizeof(src), "%s/%s", dir, name);
+  snprintf(dst, sizeof(dst), "%s/%s", CARD_MOUNTPOINT, name);
+  menu_debugf("copying %s to %s", src, dst);
+  menu_draw_dialog_for("From USB", "Copying to the SD card ...", pdMS_TO_TICKS(60000));
+
+  FIL in, out;
+  const char *why = NULL;
+  sdc_lock();
+  if(f_open(&in, src, FA_OPEN_EXISTING | FA_READ) != FR_OK)
+    why = "Cannot read it from the stick";
+  else if(f_open(&out, tmp, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) {
+    f_close(&in);
+    why = "Cannot write to the SD card";
+  }
+  sdc_unlock();
+
+  // a piece at a time, so the core's own card access gets its turns
+  if(!why) {
+    unsigned char buf[1024];
+    UINT n = 0, w = 0;
+    do {
+      sdc_lock();
+      FRESULT r = f_read(&in, buf, sizeof(buf), &n);
+      if(r == FR_OK && n) r = f_write(&out, buf, n, &w);
+      sdc_unlock();
+      if(r != FR_OK || (n && w != n)) { why = "Copying failed"; break; }
+    } while(n == sizeof(buf));
+    sdc_lock();
+    f_close(&in);
+    if(f_close(&out) != FR_OK && !why) why = "Copying failed";
+    // the old copy goes only once the new one is complete
+    if(!why) {
+      f_unlink(dst);
+      if(f_rename(tmp, dst) != FR_OK) why = "Cannot name it on the card";
+    } else
+      f_unlink(tmp);
+    sdc_unlock();
+  }
+
+  if(why) {
+    menu_debugf("copy failed: %s", why);
+    menu_draw_dialog_for("From USB", why, pdMS_TO_TICKS(3000));
+  } else {
+    char msg[48 + 32];
+    snprintf(msg, sizeof(msg), "%.47s is on the SD card now", name);
+    menu_draw_dialog_for("From USB", msg, pdMS_TO_TICKS(3000));
+  }
+}
+
 // second entry in main system menu
 static const config_menu_entry_t system_menu_net = {
   .type = CONFIG_MENU_ENTRY_BUTTON,
   .button = (config_button_t*)&net_btn,
-  .next = (config_menu_entry_t*)&system_menu_joy
+  .next = (config_menu_entry_t*)&system_menu_usb_copy
 };
 
 // first entry in main system menu

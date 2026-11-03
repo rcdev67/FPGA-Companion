@@ -483,7 +483,7 @@ static int fs_init() {
 // keep track of working directory for each drive and a core that may
 // be selected from the system menu on setups that supports USB/SD card
 // loadimg of cores
-static char *cwd[MAX_DRIVES+MAX_IMAGES+MAX_CORES];
+static char *cwd[SDC_COPY_SLOT+1];   // +1: "From USB", see menu.c
 static char *image_name[MAX_DRIVES+MAX_IMAGES];
 
 // a FreeRTOS'd version of strdup
@@ -1065,7 +1065,7 @@ sdc_dir_entry_t *sdc_readdir(int drive, char *name, const char *ext) {
       char **ext = (char**)exts;
       
       for(int i=0;ext[i];i++)
-	if(!strcasecmp(dot+1, ext[i]))
+	if(!strcmp(ext[i], "*") || !strcasecmp(dot+1, ext[i]))   // "*": any file
 	  return 1;
 
     } else {    
@@ -1180,7 +1180,7 @@ int sdc_init(void) {
   }
 
   // clear the cwd for the core slots as 
-  for(int d=MAX_DRIVES+MAX_IMAGES;d<MAX_DRIVES+MAX_IMAGES+MAX_CORES;d++)
+  for(int d=MAX_DRIVES+MAX_IMAGES;d<=SDC_COPY_SLOT;d++)
     cwd[d] = NULL;
 
   // no pending image transfers, yet

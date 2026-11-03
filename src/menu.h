@@ -32,6 +32,8 @@
 #define MENU_EVENT_NETWORK_GOT_IP       18
 #define MENU_EVENT_NETWORK_DISCONNECTED 19
 #define MENU_EVENT_NET_UPDATE           20  // download state changed, see net.c
+#define MENU_EVENT_USB_DETECTED         21  // a USB stick is plugged in, being read
+#define MENU_EVENT_USB_FAILED           22  // ... and never answered
 
 #define MENU_EVENT_KEY_LATIN1    256  // 256..511
 

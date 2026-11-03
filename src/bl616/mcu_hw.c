@@ -2981,10 +2981,21 @@ static void usbh_msc_thread(void *arg)
       goto delete;
   }
 
-  ret = usbh_msc_scsi_init(msc_class);
-  if (ret < 0) {
-      sdc_debugf("scsi_init error,ret:%d", ret);
+  // Something to see right away: a stick takes a moment to answer.
+  menu_notify(MENU_EVENT_USB_DETECTED);
+
+  // A stick may need a second or two after it is plugged in. CherryUSB asks
+  // "ready?" ten times, 100 ms apart with sdk_fixes.py; this asks it again
+  // a few times more before giving up -- and says so on the screen.
+  for (int tries = 0; ; tries++) {
+    ret = usbh_msc_scsi_init(msc_class);
+    if (ret >= 0) break;
+    if (tries >= 3) {
+      usb_debugf("USB storage not ready after %d tries, error %d", tries + 1, ret);
+      menu_notify(MENU_EVENT_USB_FAILED);
       goto delete;
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));
   }
 
   fatfs_usbh_driver_register(msc_class);
