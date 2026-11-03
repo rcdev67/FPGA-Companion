@@ -1275,7 +1275,9 @@ static void menu_task(__attribute__((unused)) void *parms) {
     } else if(cmd == MENU_EVENT_BLUETOOTH_DISCONNECTED) {
       menu_draw_dialog("Bluetooth", "A device has been disconnected!");
     } else if(cmd == MENU_EVENT_BLUETOOTH_SCAN) {
-      menu_draw_dialog("Bluetooth", "Searching for 10 seconds for devices ...");
+      // as long as the scan runs, 10 x 1.28 s; menu_draw_dialog() is 2 s
+      menu_draw_dialog_for("Bluetooth", "Searching for devices for 13 seconds ...",
+                           pdMS_TO_TICKS(13000));
     } else if(cmd == MENU_EVENT_BLUETOOTH_PIN_CODE_REQUEST) {
       menu_draw_dialog("Bluetooth", "Please enter pin '123456'");
     } else

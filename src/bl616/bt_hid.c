@@ -246,6 +246,15 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 		  (class_of_device == 0x540)?"Keyboard":
 		  "Mouse", bd_addr_to_str(event_addr));
 
+	// One already connected answers a scan too. Connecting it again failed
+	// and the clean-up dropped the working connection; seen on the board.
+	for(int i=0;i<MAX_BT_HID_DEVICES;i++)
+	  if(bt_hid_device[i].dev_state != DEV_UNUSED &&
+	     bd_addr_cmp(bt_hid_device[i].bd_addr, event_addr) == 0) {
+	    bt_debugf("%s is connected already", bd_addr_to_str(event_addr));
+	    return;
+	  }
+
 	// search a free hid slot
 	for(int i=0;i<MAX_BT_HID_DEVICES;i++) {
 	  if(bt_hid_device[i].dev_state == DEV_UNUSED) {
@@ -279,8 +288,8 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	    // is actually connected, anyway.	    
 	    bt_debugf("HID host connect failed, status 0x%02x.", status);
 	    bt_hid_device[i].dev_state = DEV_UNUSED;
-
-	    hid_host_disconnect(bt_hid_device[i].hid_host_cid);
+	    // nothing to disconnect: no connection was made, and the cid in the
+	    // slot is stale
 	  } else {
 	    bt_debugf("HID host connected, cid 0x%x.", bt_hid_device[i].hid_host_cid);
 	    bt_hid_device[i].dev_state = DEV_CONNECTING;
@@ -327,7 +336,7 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 	for(int i=0;i<MAX_BT_HID_DEVICES&&!dev;i++) {
 	  if(bt_hid_device[i].dev_state == DEV_UNUSED) {
 	    dev = &bt_hid_device[i];
-	    dev->dev_state = DEV_DETECTED;
+	    dev->dev_state = DEV_CONNECTING;   // not DEV_DETECTED, which the end of a scan connects
 	    dev->hid_host_cid = hid_cid;
 	    hid_subevent_incoming_connection_get_address(packet, dev->bd_addr);
 	  }
