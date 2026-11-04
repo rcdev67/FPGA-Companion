@@ -1263,14 +1263,39 @@ static bool menu_is_systemmenu(void) {
 
 static bool net_dialog_jump(uint8_t code);
 
+// Delete key on a drive entry in the menu or inside its file selector: eject the
+// drive and return to the menu, which then shows the empty icon. Only real
+// drives, not rom image slots and not "From USB".
+// (taken from upstream, MiSTle-Dev/FPGA-Companion 9a62d8c and a35ba9e)
+static void menu_eject_drive(void) {
+  if(!menu_state || !osd_is_visible()) return;
+
+  int drive = -1;
+  if(menu_state->type == MENU_TYPE_FILESELECTOR) {
+    drive = fsel_state.index;
+  } else if(menu_state->type == MENU_TYPE_MENU && menu_state->selected > 0) {
+    config_menu_entry_t *entry = menu_get_selected_entry();
+    if(entry && entry->type == CONFIG_MENU_ENTRY_FILESELECTOR) drive = entry->fsel->index;
+  }
+
+  if(drive < 0 || drive >= MAX_DRIVES || !sdc_get_image_name(drive)) return;
+
+  menu_debugf("DRV %d: eject", drive);
+  menu_timer_enable(false);
+  if(menu_state->type == MENU_TYPE_FILESELECTOR) menu_pop();
+  sdc_image_open(drive, NULL);
+  menu_do(MENU_EVENT_NONE);   // redraw
+}
+
 static void menu_handle_latin1(uint8_t code) {
   // this function receives lagtin1 encoded keyboard events and
-  // is meant to be used for complex text input in custom dialogs  
+  // is meant to be used for complex text input in custom dialogs
   if(code > 31) menu_debugf("menu_handle_latin1(%d/%c)", code, code);
   else          menu_debugf("menu_handle_latin1(%d)", code);
 
   // in the download list a letter goes to the first entry starting with it
   if(net_dialog_jump(code)) menu_do(MENU_EVENT_NONE);
+  else if(code == 127) menu_eject_drive();   // the Delete key on a drive
 }
 
 static void net_dialog_update(void);
