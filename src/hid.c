@@ -126,6 +126,17 @@ static uint8_t kbd_map_usage(uint8_t usage, bool shifted) {
   return usage;
 }
 
+// A German keyboard prints * on shift and +, the C64 has * on a key of its
+// own, unshifted -- shift and that key give one of its graphics, a big
+// cross. So shift + the key printed + sends the C64's * with shift let go
+// for as long as the key is held: typed the German way, LOAD"*",8,1 comes
+// out as LOAD"*",8,1. The acute key keeps giving * as well.
+static bool kbd_unshifted(uint8_t usage, bool shifted) {
+  return shifted && usage == 0x30 &&
+         inifile_option_get(INIFILE_OPTION_KEYMAP) == KEYMAP_DE;
+}
+static bool kbd_unshift[256];   // key sent with shift let go, see above
+
 // The usage a key was sent as when it went down, so that its release goes to
 // the same one. With the shifted table that is not a nicety: shift released
 // before the key would otherwise send the break to a different usage, and the
@@ -151,6 +162,7 @@ static void kbd_release_core(struct hid_kbd_state_S *state)
       continue;
     kbd_tx_hid_ps2_break(kbd_sent[usage], 0);
     kbd_sent[usage] = 0;
+    kbd_unshift[usage] = false;
   }
 }
 
@@ -185,6 +197,13 @@ void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
                                          : kbd_map_usage((uint8_t)usage, (modifiers & 0x22) != 0);
           kbd_sent[usage] = 0;
           kbd_tx_hid_ps2_break(sent, 0);
+          if (kbd_unshift[usage]) {
+            // the shift keys still held go down again
+            kbd_unshift[usage] = false;
+            for (int bit = 1; bit <= 5; bit += 4)
+              if (modifiers & state->core_modifiers & (1U << bit))
+                kbd_tx_hid_ps2_make(bit, 1);
+          }
         }
       } else {
         menu_notify(MENU_EVENT_KEY_RELEASE);
@@ -200,6 +219,14 @@ void kbd_parse_usage_state(struct hid_kbd_state_S *state, uint8_t modifiers,
     } else {
       if (!osd_is_visible()) {
         uint8_t sent = kbd_map_usage((uint8_t)usage, (modifiers & 0x22) != 0);
+        if (kbd_unshifted((uint8_t)usage, (modifiers & 0x22) != 0)) {
+          // the core's own *, with the shift keys let go first
+          for (int bit = 1; bit <= 5; bit += 4)
+            if (state->core_modifiers & (1U << bit))
+              kbd_tx_hid_ps2_break(bit, 1);
+          sent = 0x30;
+          kbd_unshift[usage] = true;
+        }
         kbd_sent[usage] = sent;
         kbd_tx_hid_ps2_make(sent, 0);
       } else {
