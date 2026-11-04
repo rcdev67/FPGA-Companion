@@ -1106,12 +1106,24 @@ static void menu_select(void) {
 }
 
 // timer implementing key repeat
-static TimerHandle_t menu_key_repeat_timer = NULL;  
+static TimerHandle_t menu_key_repeat_timer = NULL;
 static int menu_key_last_event = -1;
 
-static void menu_key_repeat(__attribute__((unused)) TimerHandle_t arg) { 
+// menu_notify() drops an event when the queue is full. A dropped release
+// left the key repeating for good: the OSD ran up or down by itself until
+// another key was let go, once for more than four minutes. So a release
+// that did not fit is remembered here and stops the repeat all the same.
+static volatile bool menu_release_lost = false;
+static volatile unsigned long menu_events_dropped = 0;
+
+static void menu_key_repeat(__attribute__((unused)) TimerHandle_t arg) {
+  if(menu_release_lost) {
+    menu_release_lost = false;
+    menu_key_last_event = -1;
+    return;
+  }
   if(menu_key_last_event >= 0) {
-  
+
     if(menu_key_last_event == MENU_EVENT_UP)     menu_entry_go(-1);
     if(menu_key_last_event == MENU_EVENT_DOWN)   menu_entry_go( 1);
 
@@ -1180,6 +1192,7 @@ void menu_do(int event) {
        event == MENU_EVENT_PGUP || event == MENU_EVENT_PGDOWN) {
       
       if(menu_key_repeat_timer) {
+	menu_release_lost = false;   // a new press; an old lost release is over
 	menu_key_last_event = event;
 	xTimerChangePeriod( menu_key_repeat_timer, pdMS_TO_TICKS(500), 0);
 	xTimerStart( menu_key_repeat_timer, 0 );
@@ -1218,9 +1231,18 @@ void menu_timer_enable(bool on) {
 
 // a 25Hz timer that can be activated by the menu whenever animations
 // are displayed and which should be updated constantly
+// The 25 Hz tick for scrolling names. It shares the queue with the keys,
+// and whenever the OSD took longer than 40 ms to draw, ticks piled up until
+// the queue was full and keys were dropped -- a release among them, see
+// menu_release_lost. Now one tick at most waits in the queue.
+static volatile bool menu_tick_pending = false;
+
 static void menu_timer(__attribute__((unused)) TimerHandle_t pxTimer) {
   static long msg = -1;
-  xQueueSendToBack(menu_queue, &msg,  ( TickType_t ) 0);
+  if(menu_tick_pending) return;
+  menu_tick_pending = true;
+  if(xQueueSendToBack(menu_queue, &msg,  ( TickType_t ) 0) != pdTRUE)
+    menu_tick_pending = false;
 }
 
 static const config_menu_t system_menu_main;
@@ -1261,7 +1283,12 @@ static void menu_task(__attribute__((unused)) void *parms) {
     // receive events from usb    
     long cmd;
     xQueueReceive(menu_queue, &cmd, 0xffffffffUL);
-    menu_debugf("command %04lx", cmd);
+    if(cmd == -1) menu_tick_pending = false;
+    else          menu_debugf("command %04lx", cmd);   // not 25 lines a second for the tick
+    if(menu_events_dropped) {
+      menu_debugf("%lu events dropped, the queue was full", menu_events_dropped);
+      menu_events_dropped = 0;
+    }
 
     if(cmd == MENU_EVENT_SYSTEM) {
       menu_debugf("system menu requested");
@@ -1373,7 +1400,7 @@ void menu_init(void) {
 				   NULL, menu_timer);
   
   // message queue from USB to OSD
-  menu_queue = xQueueCreate(10, sizeof( long ) );
+  menu_queue = xQueueCreate(32, sizeof( long ) );   // 4 bytes each
   
   // start a thread for the on screen display    
 #ifndef MENU_TASK_STACK
@@ -1392,8 +1419,12 @@ void menu_init(void) {
 // queue an event for the menu task
 void menu_notify(unsigned long msg) {
   if(menu_queue) 
-    xQueueSendToBackFromISR(menu_queue, &msg,  ( TickType_t ) 0);
-  else
+  {
+    if(xQueueSendToBackFromISR(menu_queue, &msg,  ( TickType_t ) 0) != pdTRUE) {
+      menu_events_dropped++;
+      if(msg == MENU_EVENT_KEY_RELEASE) menu_release_lost = true;
+    }
+  } else
     menu_debugf("menu_notify(): queue/menu task not ready!");
 }
 
