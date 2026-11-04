@@ -684,7 +684,10 @@ static bool xmodem_get(const char *host, int port, const char *path, bool (*sink
 
   bytes_total = 0;
   bool announced = false;
-  while(net_read_line(line, sizeof(line), 60000)) {
+  // The modem takes the whole file in before it answers, and over a weak
+  // WiFi link it may ask the server again a few times for the rest; it
+  // gives up after 100 s (Zimodem, xFetchToMemory()). Wait for that.
+  while(net_read_line(line, sizeof(line), 120000)) {
     debugf("NET: xmodem '%s'", line);
     if(!strncmp(line, "XMODEM ", 7)) { bytes_total = strtoul(line + 7, NULL, 10); announced = true; break; }
     if(!strcmp(line, "ERROR") || !strncmp(line, "NO CARRIER", 10)) break;
