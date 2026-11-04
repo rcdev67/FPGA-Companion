@@ -23,7 +23,7 @@ different companion images: see [TANG_NANO_20K.md](TANG_NANO_20K.md) for
 the difference, how to tell them apart, flashing and the debug console.
 
 It also raises the USB hub limits of the BL616 build to four hubs with up
-to 16 ports each; the stock limit of four ports turned a 7-port hub away
+to 10 ports each; the stock limit of four ports turned a 7-port hub away
 at the door. A plain hub works without its own supply, keyboard and mouse
 on it. A USB-C dock that delivers power (tested: Anker, with LAN and card
 reader inside) works too, but then it has to be the Tang's only supply:

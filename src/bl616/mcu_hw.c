@@ -3044,6 +3044,24 @@ void mcu_hw_print_heaps(void)
   }
 }
 
+// How much of its stack each task has never touched. The stacks come out
+// of the same heaps as the Bluetooth connections, so this says where room
+// can be found; bt_hid.c prints it a minute after the start.
+void mcu_hw_print_stacks(void)
+{
+  UBaseType_t n = uxTaskGetNumberOfTasks();
+  TaskStatus_t *st = pvPortMalloc(n * sizeof(TaskStatus_t));
+  if (!st) {
+    usb_debugf("  task list: no memory for it\r\n");
+    return;
+  }
+  n = uxTaskGetSystemState(st, n, NULL);
+  for (UBaseType_t i = 0; i < n; i++)
+    usb_debugf("  task %-14s never used %5u bytes of its stack\r\n",
+               st[i].pcTaskName, (unsigned)st[i].usStackHighWaterMark * sizeof(StackType_t));
+  vPortFree(st);
+}
+
 void vApplicationMallocFailedHook(void)
 {
   usb_debugf("vApplicationMallocFailedHook: request %u bytes, task %s\r\n",

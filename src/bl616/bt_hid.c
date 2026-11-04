@@ -104,6 +104,7 @@ static int first_scan_tries;
 
 int bt_keys_count(void);   // bt_keys.c
 void mcu_hw_print_heaps(void);   // mcu_hw.c
+void mcu_hw_print_stacks(void);  // mcu_hw.c
 static int le_bonds_count(void);
 static void le_reconnect(void);
 static void le_scan_start(uint32_t ms);
@@ -268,15 +269,57 @@ static int le_bonds_count(void) {
   return n;
 }
 
+// A bonded device the heap had no room for. It used to be let go and taken
+// back at once, several times a second for as long as it was switched on:
+// the radio was busy with that, and the classic keyboard waited a minute
+// for its turn. It now waits 30 s before it is taken again.
+#define LE_NO_MEMORY_PAUSE_MS 30000
+static bd_addr_t le_no_memory_addr;
+static bool le_no_memory;
+static btstack_timer_source_t le_no_memory_timer;
+
 static void le_reconnect(void) {
   if(le_pending) return;   // a new one is being connected
   for(int i = 0; i < le_device_db_max_count(); i++) {
     int addr_type;
     bd_addr_t addr;
     le_device_db_info(i, &addr_type, addr, NULL);
-    if(addr_type != BD_ADDR_TYPE_UNKNOWN)
-      gap_auto_connection_start((bd_addr_type_t)addr_type, addr);
+    if(addr_type == BD_ADDR_TYPE_UNKNOWN) continue;
+    if(le_no_memory && bd_addr_cmp(addr, le_no_memory_addr) == 0) continue;
+    gap_auto_connection_start((bd_addr_type_t)addr_type, addr);
   }
+}
+
+static btstack_timer_source_t bt_report_timer;
+
+static void bt_report(btstack_timer_source_t *ts) {
+  static int n;
+  if(n++ == 0) bt_debugf("a minute after the start:");
+  else         bt_debugf("%d minutes after the start:", 1 + 10 * (n - 1));
+  mcu_hw_print_heaps();
+  mcu_hw_print_stacks();
+  // and every ten minutes after, to catch what a download or the menu used
+  btstack_run_loop_set_timer(ts, 600000);
+  btstack_run_loop_add_timer(ts);
+}
+
+static void le_no_memory_over(btstack_timer_source_t *ts) {
+  (void)ts;
+  le_no_memory = false;
+  le_reconnect();
+}
+
+static void le_no_memory_pause(struct bt_hid_device_S *dev) {
+  bt_debugf("no memory for %s as well; it is taken again in %d s",
+            bd_addr_to_str(dev->bd_addr), LE_NO_MEMORY_PAUSE_MS / 1000);
+  mcu_hw_print_heaps();
+  gap_auto_connection_stop(dev->addr_type, dev->bd_addr);
+  memcpy(le_no_memory_addr, dev->bd_addr, sizeof(bd_addr_t));
+  le_no_memory = true;
+  btstack_run_loop_remove_timer(&le_no_memory_timer);
+  btstack_run_loop_set_timer_handler(&le_no_memory_timer, &le_no_memory_over);
+  btstack_run_loop_set_timer(&le_no_memory_timer, LE_NO_MEMORY_PAUSE_MS);
+  btstack_run_loop_add_timer(&le_no_memory_timer);
 }
 
 static void le_scan_stop(btstack_timer_source_t *ts) {
@@ -487,6 +530,7 @@ static void le_hids_connect(struct bt_hid_device_S *dev) {
                                      HID_PROTOCOL_MODE_REPORT, &dev->hids_cid);
   if(status != ERROR_CODE_SUCCESS) {
     bt_debugf("HID service not read, status 0x%02x", status);
+    if(status == BTSTACK_MEMORY_ALLOC_FAILED) le_no_memory_pause(dev);
     gap_disconnect(dev->con_handle);
   }
 }
@@ -716,6 +760,12 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
       if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
 	bt_debugf("BTStack up and working");
 	mcu_hw_print_heaps();   // what the connections have to share
+	// and again a minute later, with the devices in, and the stacks too
+	btstack_run_loop_remove_timer(&bt_report_timer);
+	btstack_run_loop_set_timer_handler(&bt_report_timer, &bt_report);
+	btstack_run_loop_set_timer(&bt_report_timer, 60000);
+	btstack_run_loop_add_timer(&bt_report_timer);
+	le_no_memory = false;
 	first_scan_tries = 0;
 	// what was connected over Low Energy before the adapter went away
 	for(int i=0;i<MAX_BT_HID_DEVICES;i++)
@@ -1081,7 +1131,14 @@ void bluetooth_init(void) {
 
   // make discoverable to allow HID device to initiate connection
   gap_discoverable_control(1);
-  
+
+  // A paired classic keyboard calls us when a key is pressed. With the
+  // default page scan, 11 ms in every 1.28 s, a K380 took up to a minute of
+  // key presses; twice as often, twice as long and interlaced it finds us
+  // within its first tries. Costs some 7 % of the radio's time.
+  gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
+  gap_set_page_scan_activity(0x0400, 0x0024);
+
   // turn on!
   hci_power_control(HCI_POWER_ON);
 }

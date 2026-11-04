@@ -162,7 +162,11 @@
 
 #define CONFIG_USBHOST_MAX_RHPORTS          1
 #define CONFIG_USBHOST_MAX_EXTHUBS          4   /* a 7 port hub is two hubs in one box, a dock adds a tier */
-#define CONFIG_USBHOST_MAX_EHPORTS          16  /* the hub class rejects a hub with more ports than this; a dock reports 9 */
+/* The hub class rejects a hub with more ports than this; a dock reports 9,
+   the 7 port hub here 7. Every port of every hub is reserved up front, some
+   1.4 KB each: at 16 the hubs took 90 KB, and the heap had no room left for a
+   third Bluetooth device. 10 keeps both and gives back 34 KB. */
+#define CONFIG_USBHOST_MAX_EHPORTS          10
 #define CONFIG_USBHOST_MAX_INTERFACES       8
 #define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 2
 #define CONFIG_USBHOST_MAX_ENDPOINTS        8

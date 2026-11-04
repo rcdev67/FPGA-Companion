@@ -161,7 +161,11 @@ int main( void )
   telnetd_init();
   
   // run FPGA com thread
-  xTaskCreate( com_task, "FPGA Com", 4096, NULL, CONFIG_MAX_PRIORITY-1, &com_task_handle );
+  // the BL616 build sets 2048 words, see its CMakeLists.txt
+#ifndef COM_TASK_STACK
+#define COM_TASK_STACK 4096
+#endif
+  xTaskCreate( com_task, "FPGA Com", COM_TASK_STACK, NULL, CONFIG_MAX_PRIORITY-1, &com_task_handle );
 
   mcu_hw_main_loop();
 

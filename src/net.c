@@ -1413,5 +1413,9 @@ void netdl_init(void) {
   debugf("NET: init, netport is '%c' = %d", netport_id, netport_val);
   rx_stream = xStreamBufferCreate(NET_RX_BUF, 1);
   req_queue = xQueueCreate(2, sizeof(int));
-  xTaskCreate(net_task, (char *)"net_task", 4096, NULL, configMAX_PRIORITIES-10, NULL);
+  // the BL616 build sets 2048 words, see its CMakeLists.txt
+#ifndef NET_TASK_STACK
+#define NET_TASK_STACK 4096
+#endif
+  xTaskCreate(net_task, (char *)"net_task", NET_TASK_STACK, NULL, configMAX_PRIORITIES-10, NULL);
 }

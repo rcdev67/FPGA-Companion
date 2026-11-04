@@ -98,6 +98,12 @@ sdk_add_compile_definitions(-DENABLE_BLUETOOTH)
 # Bluetooth scan running; 8 KB it is. The shell's thread, in defconfig,
 # likewise.
 sdk_add_compile_definitions(-DMENU_TASK_STACK=2048)
+
+# The FPGA communication and the net task had 16 KB each and used 3.2 KB
+# and 3.1 KB, measured with the C64, three Bluetooth devices and the report
+# bt_hid.c prints a minute after the start. With 8 KB each the heap has
+# room for the third Bluetooth device, which it had not.
+sdk_add_compile_definitions(-DCOM_TASK_STACK=2048 -DNET_TASK_STACK=2048)
 target_sources(app PRIVATE
     ${BTSTACK}/src/ad_parser.c
     ${BTSTACK}/src/btstack_crypto.c
