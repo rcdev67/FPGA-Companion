@@ -505,8 +505,17 @@ void sdc_set_default(int drive, const char *name) {
     // name should consist of path and image name
     char *p = strrchr(name+strlen(CARD_MOUNTPOINT), '/');
     if(p && *p) {
+      // not strndup(): that allocates from the libc heap while everything
+      // here is released with vPortFree(), i.e. into the FreeRTOS heap. This
+      // corrupted the heap the second time a default was set for a drive
+      // (taken from upstream, MiSTle-Dev/FPGA-Companion a367ab6)
+      size_t len = p-name;
+      char *dir = pvPortMalloc(len+1);
+      if(!dir) return;
+      memcpy(dir, name, len);
+      dir[len] = '\0';
       if(cwd[drive]) vPortFree(cwd[drive]);
-      cwd[drive] = strndup(name, p-name);
+      cwd[drive] = dir;
       if(image_name[drive]) vPortFree(image_name[drive]);
       image_name[drive] = StrDup(p+1);
     }
@@ -558,31 +567,30 @@ bool sdc_image_upload_in_progress(void) {
   return false;
 }
 
-static void image_send_chunk(int image, uint32_t len) {  
-  
-  // send as many bytes as buffer space is available
-  if(!image_bytes2send[image]) {
+static void image_send_chunk(int image, uint32_t len) {
+  // The state of the image is only looked at with the file system locked. The menu task
+  // sets it up under that lock, and the core may ask for the first data right after the
+  // image has been selected, before that is done. The request used to be dropped then.
+  // (taken from upstream, MiSTle-Dev/FPGA-Companion a367ab6)
+  sdc_lock();
+
+  if(!image_bytes2send[image] || !fil[MAX_DRIVES+image].flag) {
+    sdc_unlock();
     sdc_debugf("IMG %d: no image to send!", image);
     return;
   }
-    
-  if(!fil[MAX_DRIVES+image].flag) {
-    sdc_debugf("IMG %d: no image to send!", image);
-    return;
-  }
-    
+
   // send as many bytes as buffer space is available
   if(!len) {
+    sdc_unlock();
     sdc_debugf("IMG %d: no data requested", image);
     return;
   }
-    
+
   // don't send more bytes then left in file
   if(len > image_bytes2send[image]) len = image_bytes2send[image];
 
   sdc_debugf("IMG %d: sending %lu of %lu", image, len, image_bytes2send[image]);
-
-  sdc_lock();
 
   // read data from image file
   unsigned char buffer[len];
@@ -598,11 +606,11 @@ static void image_send_chunk(int image, uint32_t len) {
   unsigned char *p = buffer;
   while(len--) mcu_hw_spi_tx_u08(*p++);
   mcu_hw_spi_end();
-  
-  sdc_unlock();
 
-  // check if last block has been sent
-  if(!image_bytes2send[image]) {
+  // check if last block has been sent. The file is closed and the core is told that the
+  // image is gone under the same lock, the slot may be used again right after.
+  bool done = !image_bytes2send[image];
+  if(done) {
     sdc_debugf("IMG %d: download done, closing file", image);
 
     f_close(&fil[MAX_DRIVES+image]);
@@ -615,12 +623,14 @@ static void image_send_chunk(int image, uint32_t len) {
     mcu_hw_spi_tx_u08(image);    
     for(int i=0;i<4;i++) mcu_hw_spi_tx_u08(0);    // send size of 0
     mcu_hw_spi_end();
-
-    // the image download have either been triggered by the ini file at
-    // boot time or by the user. run image action will take care of both
-    // cases.    
-    menu_run_current_image_action();
   }
+
+  sdc_unlock();
+
+  // the image download have either been triggered by the ini file at
+  // boot time or by the user. run image action will take care of both
+  // cases. This is done without the lock, it runs actions.
+  if(done) menu_run_current_image_action();
 }
     
 static int sdc_rom_image_get_buffer(char image) {
@@ -670,17 +680,22 @@ int sdc_handle_event(void) {
       sdc_debugf("%lu sectors at tick %lu", (unsigned long)sdc_sector_requests,
                  (unsigned long)xTaskGetTickCount());
 
+    // The drive may just be re-mounted by the menu task, so look at it with
+    // the file system locked. Otherwise the file and its link table could
+    // vanish while the sector is being looked up.
+    // (taken from upstream, MiSTle-Dev/FPGA-Companion a367ab6)
+    sdc_lock();
     if(!fil[drive].flag) {
       // no file selected
       // this should actually never happen as the core won't request
       // data if it hasn't been told that an image is inserted
+      sdc_unlock();
       return -1;
     }
-    
+
     // ---- figure out which physical sector to use ----
-  
+
     // translate sector into a cluster number inside image
-    sdc_lock();
 #ifdef USE_FSEEK
     f_lseek(&fil[drive], (rsector+1)*512);
     // and add sector offset within cluster    
@@ -858,22 +873,37 @@ bool sdc_check_for_pending_image_uploads(void) {
 int sdc_image_open(int drive, char *name) {
   unsigned long start_sector = 0;
 
-  // close any file that may be open for this drive
+  // (taken from upstream, MiSTle-Dev/FPGA-Companion a367ab6)
+  // tell the core first that the "disk" has been removed, so it stops
+  // asking for sectors of the file that is closed below
+  if(drive < MAX_DRIVES)
+    sdc_image_inserted(drive, 0);
+
+  // Close any file that may be open for this drive. The file system is locked
+  // as sdc_handle_event() serves core requests from fil[] and lktbl[] on
+  // another task. The link table is released here, too. It used to be checked
+  // after the file had been cleared and thus never was released at all: every
+  // disk change lost it.
+  sdc_lock();
   if(fil[drive].flag) {
     sdc_debugf("%s %d: closing file '%s'", (drive < MAX_DRIVES)?"DRV":"IMG",
 	       (drive < MAX_DRIVES)?drive:(drive-MAX_DRIVES),
 	       image_name[drive]?image_name[drive]:"<unknown>");
+    // A rom transfer that is still running is cancelled: the core is told that the image
+    // is gone. Its rest must not be sent as part of the next image.
+    if(drive >= MAX_DRIVES && drive < MAX_DRIVES+MAX_IMAGES)
+      sdc_rom_image_selected(drive-MAX_DRIVES, 0);
     f_close(&fil[drive]);
     memset(&fil[drive], 0, sizeof(FIL));
   }
-  
-  if(drive < MAX_DRIVES) {
-    // tell core that the "disk" has been removed
-    sdc_image_inserted(drive, 0);
-  } else if(drive < MAX_DRIVES+MAX_IMAGES) {
-    // report image de-selection
-    sdc_rom_image_selected(drive-MAX_DRIVES, 0);
+  if(drive >= MAX_DRIVES && drive < MAX_DRIVES+MAX_IMAGES)
+    image_bytes2send[drive-MAX_DRIVES] = 0;     // also for one that was delayed or rejected
+  if(drive < MAX_DRIVES && lktbl[drive]) {
+    sdc_debugf("DRV %d: freeing link table", drive);
+    vPortFree(lktbl[drive]);
+    lktbl[drive] = NULL;
   }
+  sdc_unlock();
 
   if(drive < MAX_DRIVES+MAX_IMAGES) {
     // forget about any previous name
@@ -895,15 +925,7 @@ int sdc_image_open(int drive, char *name) {
   // check whether a drive is being mounted or if a rom image is being loaded
   if(drive < MAX_DRIVES) {
     sdc_lock();
-  
-    // close any previous image, especially free the link table
-    if(fil[drive].cltbl) {
-      sdc_debugf("DRV %d: freeing link table", drive);
-      vPortFree(lktbl[drive]);
-      lktbl[drive] = NULL;
-      fil[drive].cltbl = NULL;
-    }
-    
+
     sdc_debugf("DRV %d: Mounting %s", drive, fname);
     
     if(f_open(&fil[drive], fname, FA_OPEN_EXISTING | FA_READ) != 0) {
@@ -918,28 +940,50 @@ int sdc_image_open(int drive, char *name) {
 		 (unsigned long)fil[drive].obj.objsize / 512 / fs.csize);      
       
       // try with a 16 entry link table
-      lktbl[drive] = pvPortMalloc(16 * sizeof(DWORD));    
+      lktbl[drive] = pvPortMalloc(16 * sizeof(DWORD));
+      if(!lktbl[drive]) {
+	sdc_debugf("DRV %d: out of memory", drive);
+	f_close(&fil[drive]);
+	memset(&fil[drive], 0, sizeof(FIL));
+	sdc_unlock();
+	return -1;
+      }
       fil[drive].cltbl = lktbl[drive];
       lktbl[drive][0] = 16;
-      
+
       if(f_lseek(&fil[drive], CREATE_LINKMAP)) {
 	// this isn't really a problem. But sector access will
 	// be slower
 	sdc_debugf("DRV %d: Short link table creation failed, "
 		   "required size: %lu", drive, (unsigned long)lktbl[drive][0]);
-	
-	// re-alloc sufficient memory
+
+	// re-alloc sufficient memory. The size has to be read before the
+	// table is released: it used to be read from the freed block.
+	DWORD entries = lktbl[drive][0];
 	vPortFree(lktbl[drive]);
-	lktbl[drive] = pvPortMalloc(sizeof(DWORD) * lktbl[drive][0]);
-	
+	lktbl[drive] = pvPortMalloc(sizeof(DWORD) * entries);
+	if(!lktbl[drive]) {
+	  sdc_debugf("DRV %d: out of memory for link table", drive);
+	  f_close(&fil[drive]);
+	  memset(&fil[drive], 0, sizeof(FIL));
+	  sdc_unlock();
+	  return -1;
+	}
+	fil[drive].cltbl = lktbl[drive];
+	lktbl[drive][0] = entries;
+
 	// and retry link table creation
 	if(f_lseek(&fil[drive], CREATE_LINKMAP)) {
 	  sdc_debugf("DRV %d: Link table creation finally failed, "
 		     "required size: %lu", drive, (unsigned long)lktbl[drive][0]);
 	  vPortFree(lktbl[drive]);
 	  lktbl[drive] = NULL;
-	  fil[drive].cltbl = NULL;
-	  
+
+	  // don't leave a half mounted file around, the core is not told
+	  // about this image
+	  f_close(&fil[drive]);
+	  memset(&fil[drive], 0, sizeof(FIL));
+
 	  sdc_unlock();
 	  return -1;
 	} else 
