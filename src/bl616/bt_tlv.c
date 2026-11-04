@@ -35,7 +35,7 @@ static int bt_tlv_num;
 static bool bt_tlv_loaded;
 
 static void bt_tlv_load(void) {
-  if(bt_tlv_loaded) return;
+  if(bt_tlv_loaded || !sdc_is_initialized()) return;
   bt_tlv_num = 0;
 
   FIL fil;
@@ -66,6 +66,7 @@ static void bt_tlv_load(void) {
 }
 
 static void bt_tlv_save(void) {
+  if(!sdc_is_initialized()) return;
   FIL fil;
   sdc_lock();
   if(f_open(&fil, BT_TLV_FILE, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {

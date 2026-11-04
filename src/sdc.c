@@ -38,6 +38,9 @@
 #include "mcu_hw.h"
 
 static SemaphoreHandle_t sdc_sem;
+// set once sdc_init() has run: before that neither the card lock nor
+// FatFs' own locks exist, see sdc_is_initialized()
+static volatile bool sdc_initialized = false;
 
 static FATFS fs;
 
@@ -1187,7 +1190,15 @@ int sdc_init(void) {
   for(int d=0;d<MAX_IMAGES;d++)
     image_bytes2send[d] = 0;
 
+  sdc_initialized = true;
  return 0;
+}
+
+// sdc_init() runs once the FPGA answers: after 10 ms with the C64, after
+// 2.4 s with the Atari ST. Whatever else wants the card, Bluetooth with its
+// pairings, asks here first.
+bool sdc_is_initialized(void) {
+  return sdc_initialized;
 }
 
 void sdc_set_cwd(int drive, char *path) {

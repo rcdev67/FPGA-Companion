@@ -62,8 +62,18 @@ static void com_task(__attribute__((unused)) void *p ) {
       }    
       f_close(&fil);
 
-      config_dump();
-    } else {
+      // A file that held no menu -- empty, or not the XML it should be --
+      // left the companion with nothing to set up, and it stopped right
+      // there on an Atari ST. The core's own menu then.
+      if(!cfg->menu) {
+	debugf("%s holds no menu, taking the core's", sys_get_config_name());
+	vPortFree(cfg);
+	cfg = NULL;
+      } else
+	config_dump();
+    }
+
+    if(!cfg) {
       // no XML on SD card, try to load from core itself
       char *cfg_str = sys_get_config();
       if(cfg_str) {

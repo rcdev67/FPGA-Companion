@@ -46,6 +46,7 @@
 
 #include "../debug.h"
 #include "../bluetooth.h"
+#include "../sdc.h"
 
 // ------------------------------------------------------------- receiving --
 // One item per received packet: the H4 type byte, then the packet.
@@ -252,6 +253,14 @@ static void bt_setup_task(void *arg) {
   bt_adapter = true;
 
   if(!bt_task_handle) {
+    // The pairings are on the SD card. A paired keyboard calls within a
+    // second, and the Atari ST's FPGA answers only after 2.4 s, the card
+    // comes after that: asked for a key before, the companion stopped. So
+    // the stack starts with the card, or after ten seconds without one.
+    for(int i = 0; i < 100 && !sdc_is_initialized(); i++) {
+      if(i == 0) bt_debugf("waiting for the SD card before starting");
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
     bt_rx_queue = xQueueCreate(BT_RX_QUEUE_LENGTH, sizeof(bt_packet_t));
     if(xTaskCreate(bt_task, "bluetooth", BT_TASK_STACK, NULL, 10, &bt_task_handle) != pdPASS)
       bt_debugf("no memory for the Bluetooth task");

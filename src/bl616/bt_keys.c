@@ -67,7 +67,7 @@ static bool bt_keys_parse(const char *s, bd_addr_t addr, link_key_t key, link_ke
 }
 
 static void bt_keys_load(void) {
-  if(bt_keys_loaded) return;
+  if(bt_keys_loaded || !sdc_is_initialized()) return;
   bt_keys_num = 0;
 
   FIL fil;
@@ -93,6 +93,7 @@ static void bt_keys_load(void) {
 }
 
 static void bt_keys_save(void) {
+  if(!sdc_is_initialized()) return;
   FIL fil;
   sdc_lock();
   if(f_open(&fil, BT_KEYS_FILE, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
