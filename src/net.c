@@ -1371,7 +1371,10 @@ int netdl_get_clock_wait(void) { return clock_wait; }
 // clockwait= seconds are over. Without a modem nothing waits.
 bool netdl_hold_start(void (*release)(void)) {
   // without a port there is no modem and no clock to wait for, so the core
-  // must not be held back
+  // must not be held back. main.c asks before netdl_init() has run, so the
+  // core's menu is asked here; without that the ST never waited and booted
+  // with the date TOS keeps, 1989 on TOS 1.04.
+  if(!netport_ok) netport_ok = config_find_role("netport", &netport_id, &netport_val);
   if(!netport_ok) return false;
   if(clock_wait <= 0 || (!wifi_cfg[0] && !server[0])) return false;
   // Only TOS looks at its clock when it starts. The C64 has no clock to
