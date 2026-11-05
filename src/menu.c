@@ -1757,7 +1757,7 @@ static void core_switch_note(const char *line) {
 // shown in the OSD and on the modem's display, and copied to the card.
 static bool core_switch_result(void) {
   FIL f;
-  char line[120];
+  char line[170];
   if(f_open(&f, CORE_SWITCH_RESULT, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
   if(!f_gets(line, sizeof(line), &f)) line[0] = 0;
   f_close(&f);
@@ -1775,7 +1775,7 @@ static bool core_switch_result(void) {
   }
   sdc_unlock();
 
-  char m[140];
+  char m[190];
   snprintf(m, sizeof(m), "30:Core changed|%s", line);
   if(!netdl_display_message(m, 0)) netdl_boot_message(m);
   menu_draw_dialog_long("Change core", line);
@@ -1783,7 +1783,7 @@ static bool core_switch_result(void) {
 }
 
 static void core_switch(const char *dir, const char *file) {
-  static char result[120];
+  static char result[160];
   char path[128], machine[24], msg[120];
   FILINFO fno;
 
@@ -1817,8 +1817,8 @@ static void core_switch(const char *dir, const char *file) {
   if(!strcmp(machine, "Atari ST") && !tos) lacks = " No TOS in the flash yet, see the ST guide.";
   if(!strcmp(machine, "C64") && !cbm)      lacks = " No 1541 ROMs in the flash yet, see the C64 guide.";
   if(!err)
-    snprintf(result, sizeof(result), "%s written (%lu KB), from now on at every start.%s",
-             machine, (unsigned long)(written / 1024), lacks);
+    snprintf(result, sizeof(result), "%s written (%lu KB), from now on at every start.%s [%s]",
+             machine, (unsigned long)(written / 1024), lacks, gowin_flash_diag());
   else
     snprintf(result, sizeof(result), "%s NOT written: %s. It runs until power off.", machine, err);
   menu_debugf("change core: %s", result);

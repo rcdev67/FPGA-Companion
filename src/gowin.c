@@ -551,6 +551,12 @@ bool gowin_upload_core(const char *name) {
    Gwenhael Goavec-Merou and contributors). The SRAM has to be erased
    first: the running core lets go of the flash only then. */
 
+// Bits shifted after a command that only sends (rx NULL). Reading needs a
+// byte more for the answer, which comes a bit late; whether sending loses
+// a bit the same way is found out at the flash itself, see
+// gowin_flash_core(): its write enable latch shows whether a command got in.
+static uint8_t spi_tx_extra = 0;
+
 // One SPI transaction: tx out, the same number of bytes in, rx may be NULL
 static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
   uint16_t n = len + (rx ? 1 : 0);       // one byte more to catch the late bit
@@ -567,9 +573,11 @@ static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
   mcu_hw_jtag_tms(0, 0b0, 1);
 
   // all but the last bit, the last one with the step out of SHIFT-DR
-  mcu_hw_jtag_data(jtx, jrx, 8 * n - 1);
-  uint8_t lrx = mcu_hw_jtag_tms((jtx[n - 1] & 0x80) ? 1 : 0, 0b1, 1);
-  jrx[n - 1] = (jrx[n - 1] & 0x7f) | (lrx & 0x80);
+  uint32_t bits = 8 * n + (rx ? 0 : spi_tx_extra);
+  uint32_t last = bits - 1;
+  mcu_hw_jtag_data(jtx, jrx, last);
+  uint8_t lrx = mcu_hw_jtag_tms((jtx[last / 8] >> (last % 8)) & 1, 0b1, 1);
+  if(rx) jrx[n - 1] = (jrx[n - 1] & 0x7f) | (lrx & 0x80);
   mcu_hw_jtag_tms(1, 0b01, 2);           // EXIT1-DR -> UPDATE-DR -> RUN-TEST/IDLE
 
   if(rx)
@@ -746,8 +754,12 @@ static void gowin_flash_roms(bool *tos, bool *cbm) {
 // Write the core in name into the flash. NULL if it went through, else a
 // short reason. *written gets the bytes written, *tos and *cbm whether the
 // ST's TOS and the 1541's DOS are in the flash.
+static char flash_diag[32];
+const char *gowin_flash_diag(void) { return flash_diag; }
+
 const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, bool *cbm) {
-  static char why[48];
+  static char why[64];
+  flash_diag[0] = 0;
   *written = 0; *tos = *cbm = false;
   size_t nl = strlen(name);
   bool fs = (nl > 3) && !strcasecmp(name + nl - 3, ".fs");
@@ -766,16 +778,40 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
 
   gowin_flash_roms(tos, cbm);
 
+  // Does a command that only sends get into the flash? Its write enable
+  // latch (status bit 1) tells: set after WREN. If not with the exact
+  // number of bits, then with one more -- reading needs a late bit too.
+  uint8_t sr0 = gowin_flash_status(), sr1, sr2 = 0;
+  spi_tx_extra = 0;
+  gowin_flash_wren();
+  sr1 = gowin_flash_status();
+  if(!(sr1 & 0x02)) {
+    spi_tx_extra = 1;
+    gowin_flash_wren();
+    sr2 = gowin_flash_status();
+    if(!(sr2 & 0x02)) {
+      spi_tx_extra = 0;
+      snprintf(why, sizeof(why), "write enable does not take (%02x %02x %02x)", sr0, sr1, sr2);
+      err = why;
+      goto out;
+    }
+  }
+  snprintf(flash_diag, sizeof(flash_diag), "sr %02x, %s", sr0, spi_tx_extra ? "+1 bit" : "exact");
+  gowin_debugf("FLASH: %s", flash_diag);
+
   // Block protection bits set? Gowin's programmer clears them before it
   // writes, and so do we; the region written is limited anyway.
-  uint8_t sr = gowin_flash_status();
-  if(sr & 0x1c) {
-    uint8_t tx[2] = { 0x01, sr & ~0x9c };   // BP0-2 and SRP0 off
-    gowin_debugf("FLASH: status %02x, lifting the write protection", sr);
+  if(sr0 & 0x1c) {
+    uint8_t tx[2] = { 0x01, sr0 & ~0x9c };   // BP0-2 and SRP0 off
     gowin_flash_wren();
     gowin_spi_xfer(tx, NULL, sizeof(tx));
     gowin_flash_wait(100);
-    if(gowin_flash_status() & 0x1c) { err = "the flash stays write protected"; goto out; }
+    uint8_t sr = gowin_flash_status();
+    if(sr & 0x1c) {
+      snprintf(why, sizeof(why), "the flash stays write protected (%02x)", sr);
+      err = why;
+      goto out;
+    }
   }
 
   uint8_t page[256], back[256];
