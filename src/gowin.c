@@ -581,8 +581,8 @@ static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
 // something known: 0x100000, the ST's first TOS slot (a TOS starts with a
 // BRA.S, 0x60), and 0x20C000, the 1541's CBM DOS (97 AA AA AA). A board
 // has at least one of them if a machine ever ran on it. Nothing is
-// written. The core is gone afterwards and the FPGA is configured from the
-// flash again: the caller waits for it to come back. out gets one line.
+// written. The FPGA is empty afterwards; the caller loads a core into its
+// SRAM. out gets one line.
 static void gowin_flash_read(uint32_t addr, uint8_t *d, uint16_t len) {
   uint8_t tx[4 + len], rx[4 + len];
   memset(tx, 0, sizeof(tx));
@@ -629,36 +629,11 @@ bool gowin_flash_probe(char *out, size_t size) {
   snprintf(out, size, "%02x%02x%02x T:%02x%02x C:%02x%02x %s",
            idrx[1], idrx[2], idrx[3], tos[0], tos[1], cbm[0], cbm[1], ok ? "OK" : "??");
 
-  // Out of SPI mode, and the core back from the flash. The first try did
-  // not bring it back on a 3921 (black screen, no result on the card), so
-  // check DONE_FINAL and try the reload the companion uses on the other
-  // Gowin parts if it is not set: within CONFIG_ENABLE. The status words
-  // go into the result: R1 if the plain reload did it, R2 the second way,
-  // R- if neither.
+  // Out of SPI mode. The FPGA stays empty: on the Tang Nano 20K a reload
+  // from the flash through JTAG does not bring the core back -- Gowin's own
+  // programmer cannot either (Reprogram leaves status 0x0020) -- so the
+  // caller loads a core into the SRAM, which works.
   mcu_hw_jtag_tms(1, 0b11111, 5);
-  gowin_fpgaReset();
-  jtag_clk_us(300000);
-  uint32_t st = gowin_readStatusReg();
-  char how[24];
-  if(st & GOWIN_STATUS_DONE_FINAL)
-    snprintf(how, sizeof(how), " R1 %04lx", (unsigned long)(st & 0xffff));
-  else {
-    uint32_t st1 = st;
-    jtag_command_u08(GOWIN_COMMAND_NOOP);
-    jtag_command_u08(GOWIN_COMMAND_CONFIG_ENABLE);
-    jtag_command_u08(GOWIN_COMMAND_RECONFIG);
-    jtag_command_u08(GOWIN_COMMAND_NOOP);
-    jtag_clk_us(100000);
-    jtag_command_u08(GOWIN_COMMAND_CONFIG_DISABLE);
-    jtag_command_u08(GOWIN_COMMAND_NOOP);
-    jtag_clk_us(300000);
-    st = gowin_readStatusReg();
-    snprintf(how, sizeof(how), " %s %04lx/%04lx", (st & GOWIN_STATUS_DONE_FINAL) ? "R2" : "R-",
-             (unsigned long)(st1 & 0xffff), (unsigned long)(st & 0xffff));
-  }
-  gowin_debugf("FLASH: reload%s", how);
-  size_t used = strlen(out);
-  if(used < size) snprintf(out + used, size - used, "%s", how);
   jtag_close();
   return ok;
 }

@@ -33,6 +33,8 @@ static void core_ready(void) {
 }
 
 #ifdef ENABLE_JTAG
+#include <stdio.h>
+#include <string.h>
 #include "gowin.h"
 
 // The flash test, asked for from the system menu with FLASHTST.REQ on the
@@ -58,9 +60,32 @@ static void flash_test_at_boot(void) {
   bool ok = gowin_flash_probe(flash_test_result, sizeof(flash_test_result));
   debugf("Flash test: %s (%s)", flash_test_result, ok ? "ok" : "failed");
 
-  // the core is configured from the flash again
-  if(!sys_wait4fpga())
-    debugf("Flash test: the core did not come back");
+  // The FPGA is empty now, and the SD card out of reach. The USB stick hangs
+  // on the companion itself: the result goes there first, then the core
+  // comes from it into the SRAM -- a reload from the flash through JTAG does
+  // not work on this board.
+  for(int i = 0; i < 50 && !mcu_hw_usb_msc_present(); i++) vTaskDelay(pdMS_TO_TICKS(100));
+  if(mcu_hw_usb_msc_present() &&
+     f_open(&f, "/usb/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(flash_test_result, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+  static const char *cores[] = { "/usb/atarist.fs", "/usb/c64nano.fs", "/usb/core.fs" };
+  const char *core = NULL;
+  for(unsigned i = 0; i < sizeof(cores)/sizeof(cores[0]) && !core; i++)
+    if(mcu_hw_usb_msc_present() && f_stat(cores[i], &fno) == FR_OK) core = cores[i];
+  size_t used = strlen(flash_test_result);
+  if(!core) {
+    snprintf(flash_test_result + used, sizeof(flash_test_result) - used, ", no core on the stick");
+    debugf("Flash test: no core on the stick, power cycle");
+    return;
+  }
+  mcu_hw_upload_core((char*)core);
+  bool back = sys_wait4fpga();
+  snprintf(flash_test_result + used, sizeof(flash_test_result) - used, ", %s %s",
+           core + 5, back ? "loaded" : "NOT loaded");
+  debugf("Flash test: %s", flash_test_result);
 
   if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
     f_puts(flash_test_result, &f);
