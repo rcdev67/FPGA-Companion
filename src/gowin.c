@@ -706,6 +706,21 @@ static bool core_header_ok(const char *name) {
   return ok;
 }
 
+static uint8_t gowin_flash_reg(uint8_t cmd) {
+  uint8_t tx[2] = { cmd, 0 }, rx[2];
+  gowin_spi_xfer(tx, rx, sizeof(tx));
+  return rx[1];
+}
+
+// Protected as far as the status registers tell: with WPS (register 3,
+// bit 2) the individual block locks count, which only a Global Block
+// Unlock is known to have lifted; else BP0-2 in register 1.
+static bool gowin_flash_unlocked_all = false;
+static bool gowin_flash_protected(void) {
+  if(gowin_flash_reg(0x15) & 0x04) return !gowin_flash_unlocked_all;
+  return (gowin_flash_reg(0x05) & 0x1c) != 0;
+}
+
 static uint8_t gowin_flash_status(void) {
   uint8_t tx[2] = { 0x05, 0 }, rx[2];
   gowin_spi_xfer(tx, rx, sizeof(tx));
@@ -754,12 +769,13 @@ static void gowin_flash_roms(bool *tos, bool *cbm) {
 // Write the core in name into the flash. NULL if it went through, else a
 // short reason. *written gets the bytes written, *tos and *cbm whether the
 // ST's TOS and the 1541's DOS are in the flash.
-static char flash_diag[32];
+static char flash_diag[64];
 const char *gowin_flash_diag(void) { return flash_diag; }
 
 const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, bool *cbm) {
-  static char why[64];
+  static char why[80];
   flash_diag[0] = 0;
+  gowin_flash_unlocked_all = false;
   *written = 0; *tos = *cbm = false;
   size_t nl = strlen(name);
   bool fs = (nl > 3) && !strcasecmp(name + nl - 3, ".fs");
@@ -796,23 +812,49 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
       goto out;
     }
   }
-  snprintf(flash_diag, sizeof(flash_diag), "sr %02x, %s", sr0, spi_tx_extra ? "+1 bit" : "exact");
-  gowin_debugf("FLASH: %s", flash_diag);
 
-  // Block protection bits set? Gowin's programmer clears them before it
-  // writes, and so do we; the region written is limited anyway.
-  if(sr0 & 0x1c) {
-    uint8_t tx[2] = { 0x01, sr0 & ~0x9c };   // BP0-2 and SRP0 off
-    gowin_flash_wren();
-    gowin_spi_xfer(tx, NULL, sizeof(tx));
-    gowin_flash_wait(100);
-    uint8_t sr = gowin_flash_status();
-    if(sr & 0x1c) {
-      snprintf(why, sizeof(why), "the flash stays write protected (%02x)", sr);
+  // Protected? The W25Q32 has block protection bits in status register 1
+  // (BP0-2, with TB/SEC/CMP choosing the area), a lock of the status
+  // register itself (SRP0/SRP1 with the /WP pin), and on the newer ones
+  // individual block locks instead (WPS in register 3). Gowin's programmer
+  // writes this flash, so one way works: the usual ones are tried, each
+  // checked, and the result says which did it.
+  uint8_t r1 = gowin_flash_reg(0x05), r2 = gowin_flash_reg(0x35), r3 = gowin_flash_reg(0x15);
+  const char *way = "none needed";
+  if(gowin_flash_protected()) {
+    way = NULL;
+    // 1. status register 1 written, non-volatile
+    { uint8_t tx[2] = { 0x01, r1 & ~0x9c };
+      gowin_flash_wren(); gowin_spi_xfer(tx, NULL, sizeof(tx)); gowin_flash_wait(100);
+      if(!gowin_flash_protected()) way = "sr1"; }
+    // 2. registers 1 and 2 at once: CMP, SRP1 and the lock off as well
+    if(!way) { uint8_t tx[3] = { 0x01, r1 & ~0x9c, r2 & ~0x41 };
+      gowin_flash_wren(); gowin_spi_xfer(tx, NULL, sizeof(tx)); gowin_flash_wait(100);
+      if(!gowin_flash_protected()) way = "sr1+2"; }
+    // 3. register 2 on its own, then 1 again
+    if(!way) { uint8_t tx2[2] = { 0x31, r2 & ~0x41 }, tx1[2] = { 0x01, r1 & ~0x9c };
+      gowin_flash_wren(); gowin_spi_xfer(tx2, NULL, sizeof(tx2)); gowin_flash_wait(100);
+      gowin_flash_wren(); gowin_spi_xfer(tx1, NULL, sizeof(tx1)); gowin_flash_wait(100);
+      if(!gowin_flash_protected()) way = "sr2,sr1"; }
+    // 4. volatile, until power off
+    if(!way) { uint8_t tv[1] = { 0x50 }, tx[2] = { 0x01, 0x00 };
+      gowin_spi_xfer(tv, NULL, sizeof(tv)); gowin_spi_xfer(tx, NULL, sizeof(tx));
+      if(!gowin_flash_protected()) way = "volatile"; }
+    // 5. all individual block locks off (WPS = 1)
+    if(!way) { uint8_t tu[1] = { 0x98 };
+      gowin_flash_wren(); gowin_spi_xfer(tu, NULL, sizeof(tu)); gowin_flash_wait(100);
+      gowin_flash_unlocked_all = true;
+      if(!gowin_flash_protected()) way = "block unlock"; }
+    if(!way) {
+      snprintf(why, sizeof(why), "stays protected: sr %02x %02x %02x -> %02x %02x %02x",
+               r1, r2, r3, gowin_flash_reg(0x05), gowin_flash_reg(0x35), gowin_flash_reg(0x15));
       err = why;
       goto out;
     }
   }
+  snprintf(flash_diag, sizeof(flash_diag), "sr %02x %02x %02x, %s, %s", r1, r2, r3,
+           spi_tx_extra ? "+1 bit" : "exact", way);
+  gowin_debugf("FLASH: %s", flash_diag);
 
   uint8_t page[256], back[256];
   uint32_t addr = 0;
