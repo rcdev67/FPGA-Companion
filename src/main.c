@@ -39,12 +39,20 @@ static void core_ready(void) {
 // card. It stops the core, so it runs here, before anything else talks to
 // the FPGA; the core comes back from the flash and start-up goes on. The
 // result goes to FLASHTST.TXT on the card and into the OSD.
-static char flash_test_result[64];
+static char flash_test_result[96];
 
 static void flash_test_at_boot(void) {
   FILINFO fno;
   if(f_stat(CARD_MOUNTPOINT "/FLASHTST.REQ", &fno) != FR_OK) return;
   f_unlink(CARD_MOUNTPOINT "/FLASHTST.REQ");   // once, whatever happens
+
+  // While the card can still be reached: the test has begun. If the core
+  // does not come back, this line is all there is.
+  FIL f;
+  if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts("started, the core did not come back afterwards\r\n", &f);
+    f_close(&f);
+  }
 
   debugf("Flash test requested");
   bool ok = gowin_flash_probe(flash_test_result, sizeof(flash_test_result));
@@ -54,7 +62,6 @@ static void flash_test_at_boot(void) {
   if(!sys_wait4fpga())
     debugf("Flash test: the core did not come back");
 
-  FIL f;
   if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
     f_puts(flash_test_result, &f);
     f_puts("\r\n", &f);

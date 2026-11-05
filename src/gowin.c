@@ -629,9 +629,36 @@ bool gowin_flash_probe(char *out, size_t size) {
   snprintf(out, size, "%02x%02x%02x T:%02x%02x C:%02x%02x %s",
            idrx[1], idrx[2], idrx[3], tos[0], tos[1], cbm[0], cbm[1], ok ? "OK" : "??");
 
-  // out of SPI mode, and the core back from the flash
+  // Out of SPI mode, and the core back from the flash. The first try did
+  // not bring it back on a 3921 (black screen, no result on the card), so
+  // check DONE_FINAL and try the reload the companion uses on the other
+  // Gowin parts if it is not set: within CONFIG_ENABLE. The status words
+  // go into the result: R1 if the plain reload did it, R2 the second way,
+  // R- if neither.
   mcu_hw_jtag_tms(1, 0b11111, 5);
   gowin_fpgaReset();
+  jtag_clk_us(300000);
+  uint32_t st = gowin_readStatusReg();
+  char how[24];
+  if(st & GOWIN_STATUS_DONE_FINAL)
+    snprintf(how, sizeof(how), " R1 %04lx", (unsigned long)(st & 0xffff));
+  else {
+    uint32_t st1 = st;
+    jtag_command_u08(GOWIN_COMMAND_NOOP);
+    jtag_command_u08(GOWIN_COMMAND_CONFIG_ENABLE);
+    jtag_command_u08(GOWIN_COMMAND_RECONFIG);
+    jtag_command_u08(GOWIN_COMMAND_NOOP);
+    jtag_clk_us(100000);
+    jtag_command_u08(GOWIN_COMMAND_CONFIG_DISABLE);
+    jtag_command_u08(GOWIN_COMMAND_NOOP);
+    jtag_clk_us(300000);
+    st = gowin_readStatusReg();
+    snprintf(how, sizeof(how), " %s %04lx/%04lx", (st & GOWIN_STATUS_DONE_FINAL) ? "R2" : "R-",
+             (unsigned long)(st1 & 0xffff), (unsigned long)(st & 0xffff));
+  }
+  gowin_debugf("FLASH: reload%s", how);
+  size_t used = strlen(out);
+  if(used < size) snprintf(out + used, size - used, "%s", how);
   jtag_close();
   return ok;
 }
