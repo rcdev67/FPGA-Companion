@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 // https://cdn.gowinsemi.com.cn/TN711E.pdf
 /* known GOWIN JTAG commands */
@@ -86,5 +87,6 @@
 
 bool gowin_upload_core(const char *name);
 void gowin_fpgaReset(void);
+bool gowin_flash_probe(char *out, size_t size);   // read only: flash id and a known place
 
 #endif // GOWIN_H

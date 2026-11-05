@@ -538,4 +538,87 @@ bool gowin_upload_core(const char *name) {
   return false;
 }
 
+#include <stdio.h>
+
+/* ---- the FPGA's SPI flash through JTAG, GW2A only ----
+   The feasibility test for writing a core from the USB stick into the
+   flash, so that it stays. On the GW2A(R) the JTAG instruction 0x16
+   passes what is shifted through the data register straight to the SPI
+   flash: TDI is MOSI, TDO MISO, and the flash is selected while in
+   SHIFT-DR. JTAG sends LSB first, SPI MSB first, so every byte is
+   reversed, and what comes back is one bit late. This follows
+   openFPGALoader (src/gowin.cpp, spi_put() for is_gw2a, Apache-2.0,
+   Gwenhael Goavec-Merou and contributors). The SRAM has to be erased
+   first: the running core lets go of the flash only then. */
+
+// One SPI transaction: tx out, the same number of bytes in, rx may be NULL
+static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
+  uint16_t n = len + (rx ? 1 : 0);       // one byte more to catch the late bit
+  uint8_t jtx[n + 1], jrx[n + 1];
+  memset(jtx, 0, sizeof(jtx));
+  memset(jrx, 0, sizeof(jrx));
+  for(uint16_t i = 0; i < len; i++) jtx[i] = reverse_byte(tx[i]);
+
+  jtag_command_u08(GOWIN_COMMAND_TRANSFER_SPI);
+
+  // RUN-TEST/IDLE -> SELECT-DR -> CAPTURE-DR -> EXIT1-DR -> PAUSE-DR -> EXIT2-DR,
+  // as openFPGALoader's set_state(EXIT2_DR), then EXIT2-DR -> SHIFT-DR
+  mcu_hw_jtag_tms(0, 0b10101, 5);
+  mcu_hw_jtag_tms(0, 0b0, 1);
+
+  // all but the last bit, the last one with the step out of SHIFT-DR
+  mcu_hw_jtag_data(jtx, jrx, 8 * n - 1);
+  uint8_t lrx = mcu_hw_jtag_tms((jtx[n - 1] & 0x80) ? 1 : 0, 0b1, 1);
+  jrx[n - 1] = (jrx[n - 1] & 0x7f) | (lrx & 0x80);
+  mcu_hw_jtag_tms(1, 0b01, 2);           // EXIT1-DR -> UPDATE-DR -> RUN-TEST/IDLE
+
+  if(rx)
+    for(uint16_t i = 0; i < len; i++)
+      rx[i] = reverse_byte(jrx[i] >> 1) | (jrx[i + 1] & 0x01);
+}
+
+// Read the flash's JEDEC id and 16 bytes at 0x20C000, where the 1541's CBM
+// DOS starts with 97 AA AA AA. Nothing is written. The core is gone
+// afterwards and the FPGA is configured from the flash again: the caller
+// waits for it to come back. out gets one line for the user.
+bool gowin_flash_probe(char *out, size_t size) {
+  if(!gowin_open()) {
+    snprintf(out, size, "No FPGA on JTAG (%08lx)", (unsigned long)idcode);
+    jtag_close();
+    return false;
+  }
+  if(idcode != IDCODE_GW2AR18) {
+    snprintf(out, size, "Not a GW2AR-18 (%08lx)", (unsigned long)idcode);
+    jtag_close();
+    return false;
+  }
+  if(!gowin_eraseSRAM()) {
+    snprintf(out, size, "Erasing the SRAM failed");
+    gowin_fpgaReset();
+    jtag_close();
+    return false;
+  }
+
+  uint8_t idtx[4] = { 0x9f, 0, 0, 0 }, idrx[4];
+  gowin_spi_xfer(idtx, idrx, sizeof(idtx));
+
+  uint8_t rdtx[4 + 16] = { 0x03, 0x20, 0xc0, 0x00 }, rdrx[4 + 16];
+  gowin_spi_xfer(rdtx, rdrx, sizeof(rdtx));
+  uint8_t *d = rdrx + 4;
+
+  gowin_debugf("FLASH: JEDEC %02x %02x %02x", idrx[1], idrx[2], idrx[3]);
+  gowin_debugf("FLASH: 0x20C000 %02x %02x %02x %02x %02x %02x %02x %02x",
+               d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+
+  bool ok = (d[0] == 0x97) && (d[1] == 0xaa) && (d[2] == 0xaa) && (d[3] == 0xaa);
+  snprintf(out, size, "ID %02x%02x%02x, 20C000: %02x %02x %02x %02x %s",
+           idrx[1], idrx[2], idrx[3], d[0], d[1], d[2], d[3], ok ? "OK" : "??");
+
+  // out of SPI mode, and the core back from the flash
+  mcu_hw_jtag_tms(1, 0b11111, 5);
+  gowin_fpgaReset();
+  jtag_close();
+  return ok;
+}
+
 #endif // ENABLE_JTAG

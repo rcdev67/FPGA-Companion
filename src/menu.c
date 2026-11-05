@@ -1672,15 +1672,65 @@ static const config_fsel_t usb_core_fsel = {
   .ext = (char**)core_exts
 };
 
-// second entry in main system menu
-static const config_menu_entry_t system_menu_usb_core_fsel = {
-  .type = CONFIG_MENU_ENTRY_FILESELECTOR,
-  .fsel = (config_fsel_t*)&usb_core_fsel,
+#ifdef ENABLE_JTAG
+/* ---- "Flash test": can the companion reach the FPGA's flash? ----
+   A feasibility test, read only, for writing a core from the USB stick
+   into the flash. The core stops, the FPGA comes back from the flash, and
+   the result is shown; power cycle afterwards. See gowin_flash_probe(). */
+#include "gowin.h"
+
+static void flashtest_func(void) {
+  static char result[64];
+  menu_draw_dialog_for("Flash test", "Reading the flash ...", pdMS_TO_TICKS(2000));
+  vTaskDelay(pdMS_TO_TICKS(300));
+  bool ok = gowin_flash_probe(result, sizeof(result));
+  menu_debugf("flash test: %s (%s)", result, ok ? "ok" : "failed");
+  vTaskDelay(pdMS_TO_TICKS(3000));       // the core starts again from the flash
+  osd_enable(OSD_VISIBLE);
+  menu_draw_dialog_for("Flash test", result, pdMS_TO_TICKS(30000));
+}
+
+static const config_action_command_t flashtest_exec = {
+  .code = CONFIG_ACTION_COMMAND_EXEC,
+  .exec = flashtest_func
+};
+
+static const config_action_t flashtest_action = {
+  .name = "flashtest",
+  .commands = (config_action_command_t*)&flashtest_exec
+};
+
+static const config_button_t flashtest_btn = {
+  .label = "Flash test",
+  .action = (config_action_t*)&flashtest_action
+};
+
+static const config_menu_entry_t system_menu_flashtest = {
+  .type = CONFIG_MENU_ENTRY_BUTTON,
+  .button = (config_button_t*)&flashtest_btn,
 #ifdef DIRECT_SDC_SUPPORTED
   .next = (config_menu_entry_t*)&system_menu_sdc_core_fsel
 #else
 #ifdef ENABLE_BLUETOOTH
   .next = (config_menu_entry_t*)&system_menu_bluetooth
+#endif
+#endif
+};
+#endif
+
+// second entry in main system menu
+static const config_menu_entry_t system_menu_usb_core_fsel = {
+  .type = CONFIG_MENU_ENTRY_FILESELECTOR,
+  .fsel = (config_fsel_t*)&usb_core_fsel,
+#ifdef ENABLE_JTAG
+  .next = (config_menu_entry_t*)&system_menu_flashtest
+#else
+#ifdef DIRECT_SDC_SUPPORTED
+  .next = (config_menu_entry_t*)&system_menu_sdc_core_fsel
+#else
+#ifdef ENABLE_BLUETOOTH
+  .next = (config_menu_entry_t*)&system_menu_bluetooth
+#endif
 #endif
 #endif
 };
