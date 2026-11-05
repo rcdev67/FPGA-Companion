@@ -577,10 +577,21 @@ static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
       rx[i] = reverse_byte(jrx[i] >> 1) | (jrx[i + 1] & 0x01);
 }
 
-// Read the flash's JEDEC id and 16 bytes at 0x20C000, where the 1541's CBM
-// DOS starts with 97 AA AA AA. Nothing is written. The core is gone
-// afterwards and the FPGA is configured from the flash again: the caller
-// waits for it to come back. out gets one line for the user.
+// Read the flash's JEDEC id and the first bytes of two places that hold
+// something known: 0x100000, the ST's first TOS slot (a TOS starts with a
+// BRA.S, 0x60), and 0x20C000, the 1541's CBM DOS (97 AA AA AA). A board
+// has at least one of them if a machine ever ran on it. Nothing is
+// written. The core is gone afterwards and the FPGA is configured from the
+// flash again: the caller waits for it to come back. out gets one line.
+static void gowin_flash_read(uint32_t addr, uint8_t *d, uint16_t len) {
+  uint8_t tx[4 + len], rx[4 + len];
+  memset(tx, 0, sizeof(tx));
+  tx[0] = 0x03;
+  tx[1] = addr >> 16; tx[2] = addr >> 8; tx[3] = addr;
+  gowin_spi_xfer(tx, rx, sizeof(tx));
+  memcpy(d, rx + 4, len);
+}
+
 bool gowin_flash_probe(char *out, size_t size) {
   if(!gowin_open()) {
     snprintf(out, size, "No FPGA on JTAG (%08lx)", (unsigned long)idcode);
@@ -601,18 +612,22 @@ bool gowin_flash_probe(char *out, size_t size) {
 
   uint8_t idtx[4] = { 0x9f, 0, 0, 0 }, idrx[4];
   gowin_spi_xfer(idtx, idrx, sizeof(idtx));
-
-  uint8_t rdtx[4 + 16] = { 0x03, 0x20, 0xc0, 0x00 }, rdrx[4 + 16];
-  gowin_spi_xfer(rdtx, rdrx, sizeof(rdtx));
-  uint8_t *d = rdrx + 4;
+  uint8_t tos[8], cbm[8];
+  gowin_flash_read(0x100000, tos, sizeof(tos));
+  gowin_flash_read(0x20C000, cbm, sizeof(cbm));
 
   gowin_debugf("FLASH: JEDEC %02x %02x %02x", idrx[1], idrx[2], idrx[3]);
+  gowin_debugf("FLASH: 0x100000 %02x %02x %02x %02x %02x %02x %02x %02x",
+               tos[0], tos[1], tos[2], tos[3], tos[4], tos[5], tos[6], tos[7]);
   gowin_debugf("FLASH: 0x20C000 %02x %02x %02x %02x %02x %02x %02x %02x",
-               d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+               cbm[0], cbm[1], cbm[2], cbm[3], cbm[4], cbm[5], cbm[6], cbm[7]);
 
-  bool ok = (d[0] == 0x97) && (d[1] == 0xaa) && (d[2] == 0xaa) && (d[3] == 0xaa);
-  snprintf(out, size, "ID %02x%02x%02x, 20C000: %02x %02x %02x %02x %s",
-           idrx[1], idrx[2], idrx[3], d[0], d[1], d[2], d[3], ok ? "OK" : "??");
+  bool id_ok = !((idrx[1] == 0x00 && idrx[2] == 0x00) || (idrx[1] == 0xff && idrx[2] == 0xff));
+  bool tos_ok = (tos[0] == 0x60);
+  bool cbm_ok = (cbm[0] == 0x97) && (cbm[1] == 0xaa) && (cbm[2] == 0xaa) && (cbm[3] == 0xaa);
+  bool ok = id_ok && (tos_ok || cbm_ok);
+  snprintf(out, size, "%02x%02x%02x T:%02x%02x C:%02x%02x %s",
+           idrx[1], idrx[2], idrx[3], tos[0], tos[1], cbm[0], cbm[1], ok ? "OK" : "??");
 
   // out of SPI mode, and the core back from the flash
   mcu_hw_jtag_tms(1, 0b11111, 5);
