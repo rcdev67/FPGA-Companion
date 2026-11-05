@@ -1348,6 +1348,14 @@ void mcu_hw_spi_end(void) {
   xSemaphoreGive(spi_sem);
 }
 
+void mcu_hw_spi_lock(void) {
+  xSemaphoreTake(spi_sem, 0xffffffffUL);
+}
+
+void mcu_hw_spi_unlock(void) {
+  xSemaphoreGive(spi_sem);
+}
+
 void mcu_hw_irq_ack(void) {
   // re-enable the interrupt since it was now serviced outside the irq handeler
   bflb_irq_enable(gpio->irq_num);   // resume interrupt processing

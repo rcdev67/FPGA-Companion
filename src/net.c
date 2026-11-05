@@ -1210,6 +1210,39 @@ static void download(int index) {
 }
 
 #define REQ_LIST      (-1)
+#define REQ_MSG       (-2)
+
+// A message for the modem's status display, AT+MSG:<title>|<text>, for
+// when the machine's own screen is dark. Spaces go as '_', so the line
+// gets through Zimodem's command parser in one piece.
+static char disp_msg[120];
+static volatile bool disp_msg_done = true;
+
+static void display_message(void) {
+  char line[NET_LINE_LEN];
+  if(modem_ati() && modem == MODEM_ZIMODEM) {
+    net_flush();
+    net_puts("AT+MSG:");
+    net_puts(disp_msg);
+    net_puts("\r");
+    while(net_read_line(line, sizeof(line), 1500))
+      if(!strcmp(line, "OK") || !strcmp(line, "ERROR")) break;
+  }
+  disp_msg_done = true;
+}
+
+bool netdl_display_message(const char *msg, int wait_ms) {
+  if(!req_queue) return false;    // no port in this core
+  size_t n = 0;
+  for(; msg && *msg && n < sizeof(disp_msg) - 1; msg++)
+    disp_msg[n++] = (*msg == ' ') ? '_' : *msg;
+  disp_msg[n] = 0;
+  disp_msg_done = false;
+  int req = REQ_MSG;
+  if(xQueueSendToBack(req_queue, &req, 0) != pdTRUE) { disp_msg_done = true; return false; }
+  for(int i = 0; i < wait_ms / 50 && !disp_msg_done; i++) vTaskDelay(pdMS_TO_TICKS(50));
+  return disp_msg_done;
+}
 
 
 static void net_task(__attribute__((unused)) void *parms) {
@@ -1332,6 +1365,7 @@ static void net_task(__attribute__((unused)) void *parms) {
       vTaskDelay(pdMS_TO_TICKS(50));
 
       if(req == REQ_LIST)          fetch_list();
+      else if(req == REQ_MSG)      display_message();
       else                         download(req);
 
       // the ST expects its modem at 19200 again

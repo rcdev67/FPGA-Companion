@@ -3,6 +3,8 @@
 
 */
 
+#include <stdio.h>
+#include <string.h>
 #include "../mcu_hw.h"
 
 #include "../config.h"
@@ -33,65 +35,18 @@ static void core_ready(void) {
 }
 
 #ifdef ENABLE_JTAG
-#include <stdio.h>
-#include <string.h>
-#include "gowin.h"
-
-// The flash test, asked for from the system menu with FLASHTST.REQ on the
-// card. It stops the core, so it runs here, before anything else talks to
-// the FPGA; the core comes back from the flash and start-up goes on. The
-// result goes to FLASHTST.TXT on the card and into the OSD.
+// The result of a flash test run before the last restart (menu.c), shown
+// once in the OSD and on the modem's display.
 static char flash_test_result[96];
 
-static void flash_test_at_boot(void) {
-  FILINFO fno;
-  if(f_stat(CARD_MOUNTPOINT "/FLASHTST.REQ", &fno) != FR_OK) return;
-  f_unlink(CARD_MOUNTPOINT "/FLASHTST.REQ");   // once, whatever happens
-
-  // While the card can still be reached: the test has begun. If the core
-  // does not come back, this line is all there is.
+static void flash_test_result_read(void) {
   FIL f;
-  if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-    f_puts("started, the core did not come back afterwards\r\n", &f);
-    f_close(&f);
-  }
-
-  debugf("Flash test requested");
-  bool ok = gowin_flash_probe(flash_test_result, sizeof(flash_test_result));
-  debugf("Flash test: %s (%s)", flash_test_result, ok ? "ok" : "failed");
-
-  // The FPGA is empty now, and the SD card out of reach. The USB stick hangs
-  // on the companion itself: the result goes there first, then the core
-  // comes from it into the SRAM -- a reload from the flash through JTAG does
-  // not work on this board.
-  for(int i = 0; i < 50 && !mcu_hw_usb_msc_present(); i++) vTaskDelay(pdMS_TO_TICKS(100));
-  if(mcu_hw_usb_msc_present() &&
-     f_open(&f, "/usb/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-    f_puts(flash_test_result, &f);
-    f_puts("\r\n", &f);
-    f_close(&f);
-  }
-  static const char *cores[] = { "/usb/atarist.fs", "/usb/c64nano.fs", "/usb/core.fs" };
-  const char *core = NULL;
-  for(unsigned i = 0; i < sizeof(cores)/sizeof(cores[0]) && !core; i++)
-    if(mcu_hw_usb_msc_present() && f_stat(cores[i], &fno) == FR_OK) core = cores[i];
-  size_t used = strlen(flash_test_result);
-  if(!core) {
-    snprintf(flash_test_result + used, sizeof(flash_test_result) - used, ", no core on the stick");
-    debugf("Flash test: no core on the stick, power cycle");
-    return;
-  }
-  mcu_hw_upload_core((char*)core);
-  bool back = sys_wait4fpga();
-  snprintf(flash_test_result + used, sizeof(flash_test_result) - used, ", %s %s",
-           core + 5, back ? "loaded" : "NOT loaded");
-  debugf("Flash test: %s", flash_test_result);
-
-  if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-    f_puts(flash_test_result, &f);
-    f_puts("\r\n", &f);
-    f_close(&f);
-  }
+  if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.NEW", FA_OPEN_EXISTING | FA_READ) != FR_OK) return;
+  if(!f_gets(flash_test_result, sizeof(flash_test_result), &f)) flash_test_result[0] = 0;
+  f_close(&f);
+  f_unlink(CARD_MOUNTPOINT "/FLASHTST.NEW");
+  char *e = strpbrk(flash_test_result, "\r\n");
+  if(e) *e = 0;
 }
 #endif
 
@@ -106,7 +61,7 @@ static void com_task(__attribute__((unused)) void *p ) {
     sdc_init();
 
 #ifdef ENABLE_JTAG
-    flash_test_at_boot();
+    flash_test_result_read();
 #endif
 
     // try to load the global config
@@ -194,6 +149,14 @@ static void com_task(__attribute__((unused)) void *p ) {
 
     // and for the companion's own modem on port 1
     netdl_init();
+
+#ifdef ENABLE_JTAG
+    if(flash_test_result[0]) {
+      char m[120];
+      snprintf(m, sizeof(m), "Flash test|%s", flash_test_result);
+      netdl_display_message(m, 0);
+    }
+#endif
 
     debugf("Entering main loop");
   

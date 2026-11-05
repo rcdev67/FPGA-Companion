@@ -1674,25 +1674,84 @@ static const config_fsel_t usb_core_fsel = {
 
 #ifdef ENABLE_JTAG
 /* ---- "Flash test": can the companion reach the FPGA's flash? ----
-   A feasibility test, read only, for writing a core from the USB stick
-   into the flash. Stopping the core while the companion runs leaves every
-   other part of it talking to an empty FPGA, so this entry only leaves a
-   request on the card and restarts the companion; the test runs at its
-   start, before anything else uses the FPGA. See flash_test_at_boot() in
-   main.c and gowin_flash_probe(). */
-static void flashtest_func(void) {
+   The feasibility test, read only, for writing a core from the USB stick
+   into the flash. In this order, so that nothing is touched unless all of
+   it can be done:
+   1. a core on the USB stick? Without one, nothing happens.
+   2. the modem's display says that the screen goes dark, and for how long
+   3. the bus to the FPGA is held, so no part of the companion talks to an
+      empty chip -- that hung the first try
+   4. through JTAG: the SRAM erased, the flash read (gowin_flash_probe())
+   5. the core from the stick into the SRAM. A reload from the flash does
+      not work on the Tang Nano 20K, not even with Gowin's own programmer
+   6. the result to the stick and the card, then a clean restart of the
+      companion with the core running; the OSD and the modem's display show
+      the result once it is up again (main.c). */
+#include "gowin.h"
+
+static const char *flashtest_cores[] = { "/usb/atarist.fs", "/usb/c64nano.fs", "/usb/core.fs" };
+
+static void flashtest_write(const char *name, const char *line) {
   FIL f;
   sdc_lock();
-  FRESULT r = f_open(&f, CARD_MOUNTPOINT "/FLASHTST.REQ", FA_CREATE_ALWAYS | FA_WRITE);
-  if(r == FR_OK) f_close(&f);
+  if(f_open(&f, name, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(line, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
   sdc_unlock();
-  if(r != FR_OK) {
-    menu_draw_dialog("Flash test", "Cannot write to the SD card");
+}
+
+static void flashtest_func(void) {
+  static char result[96];
+  FILINFO fno;
+
+  // 1. the core it will come back with
+  const char *core = NULL;
+  if(mcu_hw_usb_msc_present()) {
+    sdc_lock();
+    for(unsigned i = 0; i < sizeof(flashtest_cores)/sizeof(flashtest_cores[0]) && !core; i++)
+      if(f_stat(flashtest_cores[i], &fno) == FR_OK) core = flashtest_cores[i];
+    sdc_unlock();
+  }
+  if(!core) {
+    menu_draw_dialog_long("Flash test", "Needs atarist.fs or c64nano.fs on the USB stick first. Nothing was done.");
     return;
   }
-  menu_draw_dialog_for("Flash test", "Restarting the companion, the result follows ...",
+
+  // 2. what is about to happen, on the modem's display too
+  netdl_display_message("Flash test|Screen dark for about 40 s|Do not switch off", 4000);
+  menu_draw_dialog_for("Flash test", "The screen goes dark for about 40 seconds. Do not switch off.",
                        pdMS_TO_TICKS(3000));
-  vTaskDelay(pdMS_TO_TICKS(1500));
+  vTaskDelay(pdMS_TO_TICKS(2500));
+
+  // 3. to 5., with the bus held. No sdc_lock() in here: a task holding it
+  // may be waiting for the bus, which is ours now. The stick is a volume of
+  // its own, and its file is written before the core upload, which
+  // unmounts it.
+  mcu_hw_spi_lock();
+  bool ok = gowin_flash_probe(result, sizeof(result));
+  menu_debugf("flash test: %s (%s)", result, ok ? "ok" : "failed");
+  FIL f;
+  if(f_open(&f, "/usb/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(result, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+  mcu_hw_upload_core((char*)core);
+  mcu_hw_spi_unlock();
+
+  bool back = sys_wait4fpga();
+  size_t used = strlen(result);
+  snprintf(result + used, sizeof(result) - used, ", %s %s", core + 5, back ? "loaded" : "NOT loaded");
+  menu_debugf("flash test: %s", result);
+
+  // 6. kept for after the restart, which shows it
+  if(back) {
+    flashtest_write(CARD_MOUNTPOINT "/FLASHTST.TXT", result);
+    flashtest_write(CARD_MOUNTPOINT "/FLASHTST.NEW", result);
+  }
+  vTaskDelay(pdMS_TO_TICKS(500));
   mcu_hw_reset();
 }
 
