@@ -435,9 +435,23 @@ static bool modem_wait_wifi(int seconds) {
   return modem_ati() && !wifi_down;
 }
 
+// Tell a Zimodem which machine it serves, for its status display: AT+SYS:
+// and the core's name from its config xml. Once per power-up; a modem
+// without a display, or without the command, answers ERROR, and that is
+// all right.
+static void modem_tell_system(void) {
+  static bool told = false;
+  if(told || modem != MODEM_ZIMODEM || !cfg || !cfg->name) return;
+  told = true;
+  char line[NET_LINE_LEN];
+  snprintf(line, sizeof(line), "AT+SYS:%s", cfg->name);
+  modem_cmd(line, NULL, 2000);
+}
+
 // find out what is on the other end of the wire
 static bool modem_detect(void) {
   bool ok = modem_ati();
+  if(ok) modem_tell_system();
 
   if(ok && wifi_down && modem == MODEM_ZIMODEM && wifi_cfg[0] && !wifi_tried) {
     if(modem_join_from_ini())
