@@ -384,6 +384,8 @@ static bool modem_time_ask(void) {
   return modem_time_read(false, &mine);
 }
 
+static void modem_tell_system(void);
+
 static bool modem_ati(void) {
   char line[NET_LINE_LEN];
   wifi_none = false;
@@ -412,7 +414,7 @@ static bool modem_ati(void) {
       }
     }
     if(!strcmp(line, "INITIALIZED")) { wifi_down = true; wifi_none = true; }
-    if(!strcmp(line, "OK")) return true;
+    if(!strcmp(line, "OK")) { modem_tell_system(); return true; }
     if(!strcmp(line, "ERROR")) return false;
   }
   return false;
@@ -434,9 +436,10 @@ static bool modem_wait_wifi(int seconds) {
 }
 
 // Tell a Zimodem which machine it serves, for its status display: AT+SYS:
-// and the core's name from its config xml. Once per power-up; a modem
-// without a display, or without the command, answers ERROR, and that is
-// all right.
+// and the core's name from its config xml. Once per power-up, on the first
+// answer to ATI, whichever way that comes: the ST asks for the clock at
+// start-up, the C64 first at a download. A modem without a display, or
+// without the command, answers ERROR, and that is all right.
 static void modem_tell_system(void) {
   static bool told = false;
   if(told || modem != MODEM_ZIMODEM || !cfg || !cfg->name) return;
@@ -449,7 +452,6 @@ static void modem_tell_system(void) {
 // find out what is on the other end of the wire
 static bool modem_detect(void) {
   bool ok = modem_ati();
-  if(ok) modem_tell_system();
 
   if(ok && wifi_down && modem == MODEM_ZIMODEM && wifi_cfg[0] && !wifi_tried) {
     if(modem_join_from_ini())
