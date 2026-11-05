@@ -35,16 +35,16 @@ static void core_ready(void) {
 }
 
 #ifdef ENABLE_JTAG
-// The result of a flash test run before the last restart (menu.c), shown
-// once in the OSD and on the modem's display.
+// The result of a core change before the last restart (menu.c,
+// core_switch()), shown once in the OSD and on the modem's display.
 static char flash_test_result[96];
 
 static void flash_test_result_read(void) {
   FIL f;
-  if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.NEW", FA_OPEN_EXISTING | FA_READ) != FR_OK) return;
+  if(f_open(&f, CARD_MOUNTPOINT "/CORESW.NEW", FA_OPEN_EXISTING | FA_READ) != FR_OK) return;
   if(!f_gets(flash_test_result, sizeof(flash_test_result), &f)) flash_test_result[0] = 0;
   f_close(&f);
-  f_unlink(CARD_MOUNTPOINT "/FLASHTST.NEW");
+  f_unlink(CARD_MOUNTPOINT "/CORESW.NEW");
   char *e = strpbrk(flash_test_result, "\r\n");
   if(e) *e = 0;
 }
@@ -122,7 +122,7 @@ static void com_task(__attribute__((unused)) void *p ) {
     menu_init();
 
 #ifdef ENABLE_JTAG
-    if(flash_test_result[0]) menu_draw_dialog_long("Flash test", flash_test_result);
+    if(flash_test_result[0]) menu_draw_dialog_long("Change core", flash_test_result);
 #endif
 
     // open disk images, either defaults set in sdc_init or
@@ -153,7 +153,7 @@ static void com_task(__attribute__((unused)) void *p ) {
 #ifdef ENABLE_JTAG
     if(flash_test_result[0]) {
       char m[120];
-      snprintf(m, sizeof(m), "Flash test|%s", flash_test_result);
+      snprintf(m, sizeof(m), "30:Core changed|%s", flash_test_result);
       netdl_display_message(m, 0);
     }
 #endif

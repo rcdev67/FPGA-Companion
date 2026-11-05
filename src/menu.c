@@ -42,6 +42,12 @@
 // spaces removed
 #include "font_helvR08_te.c"
 
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+// "Change core", further down: a core from the USB stick into the flash
+#define CORE_SWITCH_SLOT (MAX_DRIVES+MAX_IMAGES+1)
+static void core_switch(const char *dir, const char *file);
+#endif
+
 // some constants for arrangement
 // The OSD (currently) is 64 pixel high. To allow for a proper
 // box around a text line, it needs to be 12 pixels high. A total
@@ -811,6 +817,9 @@ static void menu_file_selector_open(config_menu_entry_t *entry) {
     fsel_state.ext = entry->fsel->ext;
     fsel_state.index = entry->fsel->index;
     fsel_state.none_str = (entry->fsel->index == SDC_COPY_SLOT) ? "Back" : NULL;
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+    if(entry->fsel->index == CORE_SWITCH_SLOT) fsel_state.none_str = "Back";
+#endif
     fsel_state.none_icn = NULL;
     fsel_state.action = entry->fsel->action;
   }
@@ -905,7 +914,11 @@ static void menu_fileselector_select(sdc_dir_entry_t *entry) {
       // return to parent form
       menu_pop();
       // Eject; "From USB" has nothing to eject
-      if(drive != SDC_COPY_SLOT) sdc_image_open(drive, NULL);
+      if(drive != SDC_COPY_SLOT
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+         && drive != CORE_SWITCH_SLOT
+#endif
+        ) sdc_image_open(drive, NULL);
     } else {	
       // check if we are going up one dir and try to select the
       // directory we are coming from
@@ -942,6 +955,12 @@ static void menu_fileselector_select(sdc_dir_entry_t *entry) {
     // "From USB": onto the card, then back to the menu
     menu_pop();
     usb_copy(sdc_get_cwd(drive), entry->name);
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+  } else if(drive == CORE_SWITCH_SLOT) {
+    // "Change core": into the flash for good, see core_switch()
+    menu_pop();
+    core_switch(sdc_get_cwd(drive), entry->name);
+#endif
   } else {
     // request insertion of this image
     sdc_image_open(drive, entry->name);
@@ -1672,26 +1691,48 @@ static const config_fsel_t usb_core_fsel = {
   .ext = (char**)core_exts
 };
 
-#ifdef ENABLE_JTAG
-/* ---- "Flash test": can the companion reach the FPGA's flash? ----
-   The feasibility test, read only, for writing a core from the USB stick
-   into the flash. In this order, so that nothing is touched unless all of
-   it can be done:
-   1. a core on the USB stick? Without one, nothing happens.
-   2. the modem's display says that the screen goes dark, and for how long
-   3. the bus to the FPGA is held, so no part of the companion talks to an
-      empty chip -- that hung the first try
-   4. through JTAG: the SRAM erased, the flash read (gowin_flash_probe())
-   5. the core from the stick into the SRAM. A reload from the flash does
-      not work on the Tang Nano 20K, not even with Gowin's own programmer
-   6. the result to the stick and the card, then a clean restart of the
-      companion with the core running; the OSD and the modem's display show
-      the result once it is up again (main.c). */
+// a message that stays a while, for what start-up found
+void menu_draw_dialog_long(const char *title, const char *msg) {
+  menu_draw_dialog_for(title, msg, pdMS_TO_TICKS(30000));
+}
+
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+/* ---- "Change core": another machine from the USB stick, for good ----
+   A core file on the stick goes into the flash, so it is the machine from
+   now on, also after switching off, until another one is chosen. In this
+   order, so that nothing is touched unless all of it can be done:
+   1. the file is there; the modem's display and the OSD say what is about
+      to happen and that the screen goes dark
+   2. the bus to the FPGA is held: no part of the companion talks to an
+      empty chip (that hung the first feasibility test)
+   3. through JTAG: the SRAM erased, the core written into the flash below
+      0x100000, every page read back (gowin_flash_core()); the ROMs above
+      are not touched, only looked at
+   4. the core from the same file into the SRAM: it runs at once. A reload
+      from the flash through JTAG does not work on the Tang Nano 20K, not
+      even with Gowin's own programmer
+   5. the result on the card, then a clean restart of the companion for the
+      new core's menu; the OSD and the display show the result (main.c)
+   The slot is the one of "Load Core from SD", which this board has not. */
 #include "gowin.h"
 
-static const char *flashtest_cores[] = { "/usb/atarist.fs", "/usb/c64nano.fs", "/usb/core.fs" };
+// the machine's name from its core file: "/usb/c64nano.fs" -> "C64"
+static void core_machine(const char *path, char *out, size_t size) {
+  static const char *known[][2] = {
+    { "c64nano", "C64" }, { "atarist", "Atari ST" }, { "nanomig", "Amiga" } };
+  const char *b = strrchr(path, '/');
+  b = b ? b + 1 : path;
+  const char *dot = strrchr(b, '.');
+  size_t n = dot ? (size_t)(dot - b) : strlen(b);
+  for(unsigned i = 0; i < sizeof(known)/sizeof(known[0]); i++)
+    if(strlen(known[i][0]) == n && !strncasecmp(b, known[i][0], n)) {
+      snprintf(out, size, "%s", known[i][1]);
+      return;
+    }
+  snprintf(out, size, "%.*s", (int)n, b);
+}
 
-static void flashtest_write(const char *name, const char *line) {
+static void core_switch_write(const char *name, const char *line) {
   FIL f;
   sdc_lock();
   if(f_open(&f, name, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
@@ -1702,88 +1743,75 @@ static void flashtest_write(const char *name, const char *line) {
   sdc_unlock();
 }
 
-static void flashtest_func(void) {
-  static char result[96];
+static void core_switch(const char *dir, const char *file) {
+  static char result[120];
+  char path[128], machine[24], msg[120];
   FILINFO fno;
 
-  // 1. the core it will come back with
-  const char *core = NULL;
-  if(mcu_hw_usb_msc_present()) {
-    sdc_lock();
-    for(unsigned i = 0; i < sizeof(flashtest_cores)/sizeof(flashtest_cores[0]) && !core; i++)
-      if(f_stat(flashtest_cores[i], &fno) == FR_OK) core = flashtest_cores[i];
-    sdc_unlock();
-  }
-  if(!core) {
-    menu_draw_dialog_long("Flash test", "Needs atarist.fs or c64nano.fs on the USB stick first. Nothing was done.");
+  snprintf(path, sizeof(path), "%s/%s", dir, file);
+  core_machine(path, machine, sizeof(machine));
+  menu_debugf("change core to %s (%s)", path, machine);
+
+  // 1. the file, and what is about to happen
+  sdc_lock();
+  FRESULT r = f_stat(path, &fno);
+  sdc_unlock();
+  if(r != FR_OK) {
+    menu_draw_dialog_long("Change core", "The file is not on the stick. Nothing was done.");
     return;
   }
+  snprintf(msg, sizeof(msg), "Switching|to %s|Screen dark for|about a minute.|Do not switch off.", machine);
+  netdl_display_message(msg, 4000);
+  snprintf(msg, sizeof(msg), "%s is written for good. The screen goes dark for about a minute. Do not switch off.", machine);
+  menu_draw_dialog_for("Change core", msg, pdMS_TO_TICKS(4000));
+  vTaskDelay(pdMS_TO_TICKS(3500));
 
-  // 2. what is about to happen, on the modem's display too
-  netdl_display_message("Flash test|Screen dark for about 40 s|Do not switch off", 4000);
-  menu_draw_dialog_for("Flash test", "The screen goes dark for about 40 seconds. Do not switch off.",
-                       pdMS_TO_TICKS(3000));
-  vTaskDelay(pdMS_TO_TICKS(2500));
-
-  // 3. to 5., with the bus held. No sdc_lock() in here: a task holding it
-  // may be waiting for the bus, which is ours now. The stick is a volume of
-  // its own, and its file is written before the core upload, which
-  // unmounts it.
+  // 2. to 4., with the bus held; no sdc_lock() in here, a task holding it
+  // may be waiting for the bus
   mcu_hw_spi_lock();
-  bool ok = gowin_flash_probe(result, sizeof(result));
-  menu_debugf("flash test: %s (%s)", result, ok ? "ok" : "failed");
-  FIL f;
-  if(f_open(&f, "/usb/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-    f_puts(result, &f);
-    f_puts("\r\n", &f);
-    f_close(&f);
-  }
-  mcu_hw_upload_core((char*)core);
+  uint32_t written;
+  bool tos, cbm;
+  const char *err = gowin_flash_core(path, &written, &tos, &cbm);
+  mcu_hw_upload_core(path);
   mcu_hw_spi_unlock();
+  bool running = sys_wait4fpga();
 
-  bool back = sys_wait4fpga();
-  size_t used = strlen(result);
-  snprintf(result + used, sizeof(result) - used, ", %s %s", core + 5, back ? "loaded" : "NOT loaded");
-  menu_debugf("flash test: %s", result);
+  // what the new machine still lacks, if anything
+  const char *lacks = "";
+  if(!strcmp(machine, "Atari ST") && !tos) lacks = " No TOS in the flash yet, see the ST guide.";
+  if(!strcmp(machine, "C64") && !cbm)      lacks = " No 1541 ROMs in the flash yet, see the C64 guide.";
 
-  // 6. kept for after the restart, which shows it
-  if(back) {
-    flashtest_write(CARD_MOUNTPOINT "/FLASHTST.TXT", result);
-    flashtest_write(CARD_MOUNTPOINT "/FLASHTST.NEW", result);
+  if(!err)
+    snprintf(result, sizeof(result), "%s written (%lu KB)%s.%s", machine,
+             (unsigned long)(written / 1024), running ? " and running" : ", NOT running", lacks);
+  else
+    snprintf(result, sizeof(result), "%s NOT written: %s.%s", machine, err,
+             running ? " It runs until power off." : " Flash from the PC.");
+  menu_debugf("change core: %s", result);
+
+  // 5. kept for after the restart, which shows it
+  if(running) {
+    core_switch_write(CARD_MOUNTPOINT "/CORESW.TXT", result);
+    core_switch_write(CARD_MOUNTPOINT "/CORESW.NEW", result);
   }
   vTaskDelay(pdMS_TO_TICKS(500));
   mcu_hw_reset();
 }
 
-// a message that stays a while, for what start-up found
-void menu_draw_dialog_long(const char *title, const char *msg) {
-  menu_draw_dialog_for(title, msg, pdMS_TO_TICKS(30000));
-}
+static char *core_switch_exts[] = { "fs", "bin", NULL };
 
-static const config_action_command_t flashtest_exec = {
-  .code = CONFIG_ACTION_COMMAND_EXEC,
-  .exec = flashtest_func
+static const config_fsel_t core_switch_fsel = {
+  .index = CORE_SWITCH_SLOT,
+  .label = "Change core",
+  .def = "/usb",
+  .ext = (char**)core_switch_exts
 };
 
-static const config_action_t flashtest_action = {
-  .name = "flashtest",
-  .commands = (config_action_command_t*)&flashtest_exec
-};
-
-static const config_button_t flashtest_btn = {
-  .label = "Flash test",
-  .action = (config_action_t*)&flashtest_action
-};
-
-static const config_menu_entry_t system_menu_flashtest = {
-  .type = CONFIG_MENU_ENTRY_BUTTON,
-  .button = (config_button_t*)&flashtest_btn,
-#ifdef DIRECT_SDC_SUPPORTED
-  .next = (config_menu_entry_t*)&system_menu_sdc_core_fsel
-#else
+static const config_menu_entry_t system_menu_core_switch = {
+  .type = CONFIG_MENU_ENTRY_FILESELECTOR,
+  .fsel = (config_fsel_t*)&core_switch_fsel,
 #ifdef ENABLE_BLUETOOTH
   .next = (config_menu_entry_t*)&system_menu_bluetooth
-#endif
 #endif
 };
 #endif
@@ -1792,8 +1820,8 @@ static const config_menu_entry_t system_menu_flashtest = {
 static const config_menu_entry_t system_menu_usb_core_fsel = {
   .type = CONFIG_MENU_ENTRY_FILESELECTOR,
   .fsel = (config_fsel_t*)&usb_core_fsel,
-#ifdef ENABLE_JTAG
-  .next = (config_menu_entry_t*)&system_menu_flashtest
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+  .next = (config_menu_entry_t*)&system_menu_core_switch
 #else
 #ifdef DIRECT_SDC_SUPPORTED
   .next = (config_menu_entry_t*)&system_menu_sdc_core_fsel

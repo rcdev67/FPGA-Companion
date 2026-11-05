@@ -88,5 +88,7 @@
 bool gowin_upload_core(const char *name);
 void gowin_fpgaReset(void);
 bool gowin_flash_probe(char *out, size_t size);   // read only: flash id and a known place
+// a core into the flash for good, NULL or why not; see gowin.c
+const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, bool *cbm);
 
 #endif // GOWIN_H
