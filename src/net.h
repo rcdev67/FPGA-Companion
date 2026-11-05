@@ -43,11 +43,6 @@ int netdl_get_clock_wait(void);
 bool netdl_hold_start(void (*release)(void));
 const char *netdl_get_ip(void);
 
-// the Bluetooth controller on the modem (Zimodem built with Bluepad32)
-void netdl_request_joy(bool pair);  // ask for the status, or start pairing first
-const char *netdl_joy_status(void); // "XBox One", "none", "asking..." and the like
-bool netdl_joy_busy(void);     // the modem's address as it last reported it, "" if unknown
-
 // requests from the menu, handled in the net task
 void netdl_request_list(void);
 void netdl_request_download(int index);
