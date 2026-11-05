@@ -32,6 +32,37 @@ static void core_ready(void) {
   else     sys_run_action_by_name("ready");
 }
 
+#ifdef ENABLE_JTAG
+#include "gowin.h"
+
+// The flash test, asked for from the system menu with FLASHTST.REQ on the
+// card. It stops the core, so it runs here, before anything else talks to
+// the FPGA; the core comes back from the flash and start-up goes on. The
+// result goes to FLASHTST.TXT on the card and into the OSD.
+static char flash_test_result[64];
+
+static void flash_test_at_boot(void) {
+  FILINFO fno;
+  if(f_stat(CARD_MOUNTPOINT "/FLASHTST.REQ", &fno) != FR_OK) return;
+  f_unlink(CARD_MOUNTPOINT "/FLASHTST.REQ");   // once, whatever happens
+
+  debugf("Flash test requested");
+  bool ok = gowin_flash_probe(flash_test_result, sizeof(flash_test_result));
+  debugf("Flash test: %s (%s)", flash_test_result, ok ? "ok" : "failed");
+
+  // the core is configured from the flash again
+  if(!sys_wait4fpga())
+    debugf("Flash test: the core did not come back");
+
+  FIL f;
+  if(f_open(&f, CARD_MOUNTPOINT "/FLASHTST.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(flash_test_result, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+}
+#endif
+
 static void com_task(__attribute__((unused)) void *p ) {
   debugf("Starting main communication task");
   
@@ -41,6 +72,10 @@ static void com_task(__attribute__((unused)) void *p ) {
 
     // initialitze SD card
     sdc_init();
+
+#ifdef ENABLE_JTAG
+    flash_test_at_boot();
+#endif
 
     // try to load the global config
     inifile_config_read();
@@ -98,6 +133,10 @@ static void com_task(__attribute__((unused)) void *p ) {
     // initialize on-screen-display and menu system
     osd_init();    
     menu_init();
+
+#ifdef ENABLE_JTAG
+    if(flash_test_result[0]) menu_draw_dialog_long("Flash test", flash_test_result);
+#endif
 
     // open disk images, either defaults set in sdc_init or
     // user configure ones from the ini file. This will also

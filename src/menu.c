@@ -1675,19 +1675,30 @@ static const config_fsel_t usb_core_fsel = {
 #ifdef ENABLE_JTAG
 /* ---- "Flash test": can the companion reach the FPGA's flash? ----
    A feasibility test, read only, for writing a core from the USB stick
-   into the flash. The core stops, the FPGA comes back from the flash, and
-   the result is shown; power cycle afterwards. See gowin_flash_probe(). */
-#include "gowin.h"
-
+   into the flash. Stopping the core while the companion runs leaves every
+   other part of it talking to an empty FPGA, so this entry only leaves a
+   request on the card and restarts the companion; the test runs at its
+   start, before anything else uses the FPGA. See flash_test_at_boot() in
+   main.c and gowin_flash_probe(). */
 static void flashtest_func(void) {
-  static char result[64];
-  menu_draw_dialog_for("Flash test", "Reading the flash ...", pdMS_TO_TICKS(2000));
-  vTaskDelay(pdMS_TO_TICKS(300));
-  bool ok = gowin_flash_probe(result, sizeof(result));
-  menu_debugf("flash test: %s (%s)", result, ok ? "ok" : "failed");
-  vTaskDelay(pdMS_TO_TICKS(3000));       // the core starts again from the flash
-  osd_enable(OSD_VISIBLE);
-  menu_draw_dialog_for("Flash test", result, pdMS_TO_TICKS(30000));
+  FIL f;
+  sdc_lock();
+  FRESULT r = f_open(&f, CARD_MOUNTPOINT "/FLASHTST.REQ", FA_CREATE_ALWAYS | FA_WRITE);
+  if(r == FR_OK) f_close(&f);
+  sdc_unlock();
+  if(r != FR_OK) {
+    menu_draw_dialog("Flash test", "Cannot write to the SD card");
+    return;
+  }
+  menu_draw_dialog_for("Flash test", "Restarting the companion, the result follows ...",
+                       pdMS_TO_TICKS(3000));
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  mcu_hw_reset();
+}
+
+// a message that stays a while, for what start-up found
+void menu_draw_dialog_long(const char *title, const char *msg) {
+  menu_draw_dialog_for(title, msg, pdMS_TO_TICKS(30000));
 }
 
 static const config_action_command_t flashtest_exec = {
