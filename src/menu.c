@@ -1761,7 +1761,10 @@ static bool core_switch_result(void) {
   if(f_open(&f, CORE_SWITCH_RESULT, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
   if(!f_gets(line, sizeof(line), &f)) line[0] = 0;
   f_close(&f);
-  f_unlink(CORE_SWITCH_RESULT);
+  // kept on the stick as CORESW.TXT, to be read on a PC: at this moment
+  // the SD card may not be ready yet after the restart
+  f_unlink("/usb/CORESW.TXT");
+  if(f_rename(CORE_SWITCH_RESULT, "/usb/CORESW.TXT") != FR_OK) f_unlink(CORE_SWITCH_RESULT);
   char *e = strpbrk(line, "\r\n");
   if(e) *e = 0;
   if(!line[0]) return false;
