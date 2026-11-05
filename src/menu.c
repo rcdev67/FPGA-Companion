@@ -1737,30 +1737,19 @@ static void net_dialog_draw(void) {
     else
       u8g2_DrawStr(&u8g2, 2, MENU_LINE_Y + 2*MENU_ENTRY_H, netdl_message());
 
-    // the last characters exchanged with the modem, two rows, and the
-    // number of bytes the core delivered from port 1 so far
+    // Two small lines in words: where the fetch goes, and how the last one
+    // ended -- the modem's own reason and its WiFi signal, "stalled -78dBm"
+    // or "fetched 142 KB -63dBm". The raw characters on the line used to be
+    // here; they are in NETLOG.TXT and the console now.
     {
-      const char *t = netdl_tail();
-      int len = strlen(t);
-      char row[25];
-      const char *a = (len > 48) ? t + len - 48 : t;
-      int alen = strlen(a);
-      // 18 characters of 5 pixels, so the counts to the right stay readable
-      if(alen > 18) {
-        snprintf(row, sizeof(row), "%.18s", a);
-        u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
-        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
-        snprintf(row, sizeof(row), "%.18s", a + 18);
-        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, row);
-      } else {
-        u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
-        u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, a);
-      }
-      // bytes over the port, and sectors the core's floppy has asked for
-      snprintf(row, sizeof(row), "b%lu", sys_stats.net_bytes);
-      u8g2_DrawStr(&u8g2, 100, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
-      snprintf(row, sizeof(row), "s%lu", (unsigned long)sdc_sector_requests);
-      u8g2_DrawStr(&u8g2, 100, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, row);
+      char row[26];   // 25 characters of 5 pixels fill the 128
+      u8g2_SetFont(&u8g2, u8g2_font_5x7_tr);
+      if(netdl_fetch_to()[0]) snprintf(row, sizeof(row), "%s", netdl_fetch_to());
+      else if(netdl_get_server()[0]) snprintf(row, sizeof(row), "to %s", netdl_get_server());
+      else row[0] = 0;
+      u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H - 4, row);
+      snprintf(row, sizeof(row), "%s", netdl_fetch_result());
+      u8g2_DrawStr(&u8g2, 0, MENU_LINE_Y + 3*MENU_ENTRY_H + 5, row);
       u8g2_SetFont(&u8g2, font_helvR08_te);
     }
     return;

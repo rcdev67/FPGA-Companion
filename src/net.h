@@ -61,5 +61,7 @@ bool netdl_entry_marked(int index);   // sent from the catalogue, shown with "> 
 uint32_t netdl_bytes_done(void);
 uint32_t netdl_bytes_total(void);
 const char *netdl_tail(void);   // the last characters exchanged with the modem
+const char *netdl_fetch_to(void);      // "to <host>:<port>" of the last fetch, "" before
+const char *netdl_fetch_result(void);  // its outcome: "stalled -78dBm", "fetched 142 KB -63dBm"
 
 #endif // NET_H

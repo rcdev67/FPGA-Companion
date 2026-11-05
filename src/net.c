@@ -680,9 +680,57 @@ static bool xm_read(unsigned char *buf, int n, int timeout_ms) {
   return true;
 }
 
+// The outcome of the last fetch in words, for the two small lines of the
+// download dialog: where it went, and what the modem said about it. Zimodem
+// sends one line before XMODEM or ERROR, "FETCH <got> of <len> bytes in <ms>
+// ms, <why>, <n> connections, rssi <dBm>"; its why and rssi are what the
+// user needs to tell a weak WiFi from a server that is not there.
+static char fetch_to[40];
+static char fetch_result[32];
+static int fetch_rssi = 0;
+static bool fetch_have_rssi = false;
+
+const char *netdl_fetch_to(void) { return fetch_to; }
+const char *netdl_fetch_result(void) { return fetch_result; }
+
+static void fetch_note(const char *what) {
+  if(fetch_have_rssi) snprintf(fetch_result, sizeof(fetch_result), "%s %ddBm", what, fetch_rssi);
+  else                snprintf(fetch_result, sizeof(fetch_result), "%s", what);
+}
+
+// "FETCH 0 of 1234 bytes in 812 ms, stalled, 3 connections, rssi -78"
+static void fetch_line(const char *line) {
+  static const char *shorter[][2] = {
+    { "the server answered something else", "server answer odd" },
+    { "read returned nothing", "read nothing" },
+    { "closed by the server", "closed by server" },
+    { "no room in psram", "no room in psram" } };
+  char why[40] = "";
+  const char *a = strstr(line, " ms, ");
+  if(a) {
+    a += 5;
+    const char *b = strstr(a, ", ");
+    size_t len = b ? (size_t)(b - a) : strlen(a);
+    if(len >= sizeof(why)) len = sizeof(why) - 1;
+    memcpy(why, a, len);
+    why[len] = 0;
+    for(unsigned i = 0; i < sizeof(shorter)/sizeof(shorter[0]); i++)
+      if(!strcmp(why, shorter[i][0])) strcpy(why, shorter[i][1]);
+  }
+  const char *r = strstr(line, "rssi ");
+  fetch_have_rssi = (r != NULL);
+  if(r) fetch_rssi = atoi(r + 5);
+  fetch_note(why[0] ? why : "modem fetch");
+  net_log(line);
+}
+
 static bool xmodem_get(const char *host, int port, const char *path, bool (*sink)(const unsigned char*, int)) {
   char line[NET_LINE_LEN];
   static unsigned char blk[1024 + 4];
+
+  snprintf(fetch_to, sizeof(fetch_to), "to %s:%d", host, port);
+  fetch_have_rssi = false;
+  fetch_note("fetching...");
 
   // the modem fetches the whole resource first, that takes a while
   net_set_message("Modem fetching...");
@@ -697,16 +745,24 @@ static bool xmodem_get(const char *host, int port, const char *path, bool (*sink
   net_puts("\r");
 
   bytes_total = 0;
-  bool announced = false;
+  bool announced = false, answered = false, told = false;
   // The modem takes the whole file in before it answers, and over a weak
   // WiFi link it may ask the server again a few times for the rest; it
   // gives up after 100 s (Zimodem, xFetchToMemory()). Wait for that.
   while(net_read_line(line, sizeof(line), 120000)) {
     debugf("NET: xmodem '%s'", line);
+    answered = true;
+    if(!strncmp(line, "FETCH ", 6)) { fetch_line(line); told = true; continue; }
     if(!strncmp(line, "XMODEM ", 7)) { bytes_total = strtoul(line + 7, NULL, 10); announced = true; break; }
     if(!strcmp(line, "ERROR") || !strncmp(line, "NO CARRIER", 10)) break;
   }
-  if(!announced) { net_set_message("Modem could not fetch"); return false; }
+  if(!announced) {
+    // FETCH has said why; without it, at least what the modem did
+    if(!told) fetch_note(!answered ? "modem did not answer" :
+                         !strcmp(line, "ERROR") ? "modem: ERROR, no reason" : "modem: no carrier");
+    net_set_message("Modem could not fetch");
+    return false;
+  }
 
   snprintf(line, sizeof(line), "Receiving %lu bytes", (unsigned long)bytes_total);
   net_set_message(line);
@@ -780,6 +836,11 @@ static bool xmodem_get(const char *host, int port, const char *path, bool (*sink
   net_flush();
 
   if(ok && bytes_done != bytes_total) { net_set_message("Short transfer"); ok = false; }
+  if(ok) {
+    snprintf(line, sizeof(line), "fetched %lu KB", (unsigned long)((bytes_total + 1023) / 1024));
+    fetch_note(line);
+  } else
+    fetch_note(message);     // what broke off the transfer
   return ok;
 }
 
@@ -791,6 +852,7 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
   char line[NET_LINE_LEN];
   char base[NET_PATH_LEN], full[NET_PATH_LEN + NET_HREF_LEN];
 
+  fetch_result[0] = 0;       // nothing old in the dialog
   if(!net_server_parse(host, sizeof(host), &port, base, sizeof(base))) return false;
   snprintf(full, sizeof(full), "%s%s", base, path);
   path = full;
