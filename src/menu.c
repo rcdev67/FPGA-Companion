@@ -1757,7 +1757,7 @@ static void core_switch_note(const char *line) {
 // shown in the OSD and on the modem's display, and copied to the card.
 static bool core_switch_result(void) {
   FIL f;
-  char line[170];
+  char line[230];
   if(f_open(&f, CORE_SWITCH_RESULT, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
   if(!f_gets(line, sizeof(line), &f)) line[0] = 0;
   f_close(&f);
@@ -1775,7 +1775,7 @@ static bool core_switch_result(void) {
   }
   sdc_unlock();
 
-  char m[190];
+  char m[250];
   snprintf(m, sizeof(m), "30:Core changed|%s", line);
   if(!netdl_display_message(m, 0)) netdl_boot_message(m);
   menu_draw_dialog_long("Change core", line);
@@ -1783,7 +1783,7 @@ static bool core_switch_result(void) {
 }
 
 static void core_switch(const char *dir, const char *file) {
-  static char result[160];
+  static char result[220];
   char path[128], machine[24], msg[120];
   FILINFO fno;
 

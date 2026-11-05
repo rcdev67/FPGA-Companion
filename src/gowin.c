@@ -741,10 +741,16 @@ static void gowin_flash_wren(void) {
   gowin_spi_xfer(tx, NULL, sizeof(tx));
 }
 
+// whether the flash ever said busy after an erase command: an erase takes
+// a tenth of a second and more, a flash that never says so either did not
+// take the command or is not read right
+static bool erase_busy_seen;
+
 static bool gowin_flash_erase64(uint32_t addr) {
   uint8_t tx[4] = { 0xd8, addr >> 16, addr >> 8, addr };
   gowin_flash_wren();
   gowin_spi_xfer(tx, NULL, sizeof(tx));
+  if(gowin_flash_status() & 0x01) erase_busy_seen = true;
   return gowin_flash_wait(3000);
 }
 
@@ -773,9 +779,10 @@ static char flash_diag[64];
 const char *gowin_flash_diag(void) { return flash_diag; }
 
 const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, bool *cbm) {
-  static char why[80];
+  static char why[150];
   flash_diag[0] = 0;
   gowin_flash_unlocked_all = false;
+  erase_busy_seen = false;
   *written = 0; *tos = *cbm = false;
   size_t nl = strlen(name);
   bool fs = (nl > 3) && !strcasecmp(name + nl - 3, ".fs");
@@ -864,15 +871,28 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
     if(n < 0) { err = "the file is damaged"; break; }
     if(n == 0) break;
     if(addr + n > CORE_FLASH_LIMIT) { err = "the core is too big"; break; }
-    if(!(addr & 0xffff) && !gowin_flash_erase64(addr)) {
-      snprintf(why, sizeof(why), "erasing at %06lx failed", (unsigned long)addr); err = why; break;
+    if(!(addr & 0xffff)) {
+      if(!gowin_flash_erase64(addr)) {
+        snprintf(why, sizeof(why), "erasing at %06lx failed [%s]", (unsigned long)addr, flash_diag); err = why; break;
+      }
+      // erased means FF
+      uint8_t e[4];
+      gowin_flash_read(addr, e, sizeof(e));
+      if((e[0] & e[1] & e[2] & e[3]) != 0xff) {
+        snprintf(why, sizeof(why), "erase at %06lx did not take: %02x%02x%02x%02x, busy %s [%s]",
+                 (unsigned long)addr, e[0], e[1], e[2], e[3], erase_busy_seen ? "seen" : "never", flash_diag);
+        err = why; break;
+      }
     }
     if(!gowin_flash_page(addr, page, n)) {
       snprintf(why, sizeof(why), "writing at %06lx failed", (unsigned long)addr); err = why; break;
     }
     gowin_flash_read(addr, back, n);
     if(memcmp(page, back, n)) {
-      snprintf(why, sizeof(why), "wrong data at %06lx", (unsigned long)addr); err = why; break;
+      snprintf(why, sizeof(why), "wrong data at %06lx: %02x%02x%02x%02x not %02x%02x%02x%02x, busy %s [%s]",
+               (unsigned long)addr, back[0], back[1], back[2], back[3], page[0], page[1], page[2], page[3],
+               erase_busy_seen ? "seen" : "never", flash_diag);
+      err = why; break;
     }
     addr += n;
   }
