@@ -577,7 +577,12 @@ static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
   uint32_t last = bits - 1;
   mcu_hw_jtag_data(jtx, jrx, last);
   uint8_t lrx = mcu_hw_jtag_tms((jtx[last / 8] >> (last % 8)) & 1, 0b1, 1);
-  if(rx) jrx[n - 1] = (jrx[n - 1] & 0x7f) | (lrx & 0x80);
+  // mcu_hw_jtag_data() leaves a last byte of 7 bits shifted up by one, as a
+  // shift register would hold it, its lowest bit 0; the eighth bit, from
+  // the step out of SHIFT-DR, comes in on top. Taking bit 7 without that
+  // shift lost the lowest bit of the last byte read: a status of fe, and
+  // ff ff ff fe after an erase that had worked.
+  if(rx) jrx[n - 1] = (jrx[n - 1] >> 1) | (lrx & 0x80);
   mcu_hw_jtag_tms(1, 0b01, 2);           // EXIT1-DR -> UPDATE-DR -> RUN-TEST/IDLE
 
   if(rx)
