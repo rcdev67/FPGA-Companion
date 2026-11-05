@@ -34,22 +34,6 @@ static void core_ready(void) {
   else     sys_run_action_by_name("ready");
 }
 
-#ifdef ENABLE_JTAG
-// The result of a core change before the last restart (menu.c,
-// core_switch()), shown once in the OSD and on the modem's display.
-static char flash_test_result[96];
-
-static void flash_test_result_read(void) {
-  FIL f;
-  if(f_open(&f, CARD_MOUNTPOINT "/CORESW.NEW", FA_OPEN_EXISTING | FA_READ) != FR_OK) return;
-  if(!f_gets(flash_test_result, sizeof(flash_test_result), &f)) flash_test_result[0] = 0;
-  f_close(&f);
-  f_unlink(CARD_MOUNTPOINT "/CORESW.NEW");
-  char *e = strpbrk(flash_test_result, "\r\n");
-  if(e) *e = 0;
-}
-#endif
-
 static void com_task(__attribute__((unused)) void *p ) {
   debugf("Starting main communication task");
   
@@ -59,10 +43,6 @@ static void com_task(__attribute__((unused)) void *p ) {
 
     // initialitze SD card
     sdc_init();
-
-#ifdef ENABLE_JTAG
-    flash_test_result_read();
-#endif
 
     // try to load the global config
     inifile_config_read();
@@ -121,10 +101,6 @@ static void com_task(__attribute__((unused)) void *p ) {
     osd_init();    
     menu_init();
 
-#ifdef ENABLE_JTAG
-    if(flash_test_result[0]) menu_draw_dialog_long("Change core", flash_test_result);
-#endif
-
     // open disk images, either defaults set in sdc_init or
     // user configure ones from the ini file. This will also
     // start rom image transfers if specified in the ini file
@@ -150,13 +126,6 @@ static void com_task(__attribute__((unused)) void *p ) {
     // and for the companion's own modem on port 1
     netdl_init();
 
-#ifdef ENABLE_JTAG
-    if(flash_test_result[0]) {
-      char m[120];
-      snprintf(m, sizeof(m), "30:Core changed|%s", flash_test_result);
-      netdl_display_message(m, 0);
-    }
-#endif
 
     debugf("Entering main loop");
   

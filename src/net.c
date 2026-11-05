@@ -440,6 +440,10 @@ static bool modem_wait_wifi(int seconds) {
 // answer to ATI, whichever way that comes: the ST asks for the clock at
 // start-up, the C64 first at a download. A modem without a display, or
 // without the command, answers ERROR, and that is all right.
+// a message for the display that waits for the first contact, see
+// netdl_boot_message()
+static char boot_msg[120];
+
 static void modem_tell_system(void) {
   static bool told = false;
   if(told || modem != MODEM_ZIMODEM || !cfg || !cfg->name) return;
@@ -447,6 +451,18 @@ static void modem_tell_system(void) {
   char line[NET_LINE_LEN];
   snprintf(line, sizeof(line), "AT+SYS:%s", cfg->name);
   modem_cmd(line, NULL, 2000);
+  // A message left from before the restart -- "Switching to C64" -- goes,
+  // or the one that waited for this moment takes its place.
+  snprintf(line, sizeof(line), "AT+MSG:%s", boot_msg);
+  modem_cmd(line, NULL, 2000);
+  boot_msg[0] = 0;
+}
+
+void netdl_boot_message(const char *msg) {
+  size_t n = 0;
+  for(; msg && *msg && n < sizeof(boot_msg) - 1; msg++)
+    boot_msg[n++] = (*msg == ' ') ? '_' : *msg;
+  boot_msg[n] = 0;
 }
 
 // find out what is on the other end of the wire

@@ -765,7 +765,18 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
   if(!gowin_eraseSRAM()) { err = "erasing the SRAM failed"; goto out; }
 
   gowin_flash_roms(tos, cbm);
-  if(gowin_flash_status() & 0x1c) { err = "the flash is write protected"; goto out; }
+
+  // Block protection bits set? Gowin's programmer clears them before it
+  // writes, and so do we; the region written is limited anyway.
+  uint8_t sr = gowin_flash_status();
+  if(sr & 0x1c) {
+    uint8_t tx[2] = { 0x01, sr & ~0x9c };   // BP0-2 and SRP0 off
+    gowin_debugf("FLASH: status %02x, lifting the write protection", sr);
+    gowin_flash_wren();
+    gowin_spi_xfer(tx, NULL, sizeof(tx));
+    gowin_flash_wait(100);
+    if(gowin_flash_status() & 0x1c) { err = "the flash stays write protected"; goto out; }
+  }
 
   uint8_t page[256], back[256];
   uint32_t addr = 0;

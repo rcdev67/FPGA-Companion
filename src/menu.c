@@ -46,6 +46,7 @@
 // "Change core", further down: a core from the USB stick into the flash
 #define CORE_SWITCH_SLOT (MAX_DRIVES+MAX_IMAGES+1)
 static void core_switch(const char *dir, const char *file);
+static bool core_switch_result(void);
 #endif
 
 // some constants for arrangement
@@ -1385,6 +1386,10 @@ static void menu_task(__attribute__((unused)) void *parms) {
       if ( (fres = f_mount(&usb_fs, "/usb", 1)) != FR_OK ) menu_debugf("/usb mount failed: %d", fres);
       else {
 	menu_debugf("/usb mounted");
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+	// the result of a core change before the restart, if any
+	if(!core_switch_result())
+#endif
 	menu_draw_dialog_for("USB", "The USB stick is ready: Shift+F12, From USB", pdMS_TO_TICKS(3000));
       }
     } else if(cmd == MENU_EVENT_USB_UMOUNTED) {
@@ -1732,15 +1737,49 @@ static void core_machine(const char *path, char *out, size_t size) {
   snprintf(out, size, "%.*s", (int)n, b);
 }
 
-static void core_switch_write(const char *name, const char *line) {
+// The result goes to the USB stick, before the new core is loaded: the
+// stick hangs on the companion itself, the SD card only through a core,
+// and a freshly loaded core has not set the card up -- writing there
+// right after the change went nowhere. After the restart the companion
+// finds it on the stick, see core_switch_result().
+#define CORE_SWITCH_RESULT "/usb/CORESW.NEW"
+
+static void core_switch_note(const char *line) {
   FIL f;
+  if(f_open(&f, CORE_SWITCH_RESULT, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(line, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+}
+
+// Once the stick is mounted after a restart: a result waiting on it is
+// shown in the OSD and on the modem's display, and copied to the card.
+static bool core_switch_result(void) {
+  FIL f;
+  char line[120];
+  if(f_open(&f, CORE_SWITCH_RESULT, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
+  if(!f_gets(line, sizeof(line), &f)) line[0] = 0;
+  f_close(&f);
+  f_unlink(CORE_SWITCH_RESULT);
+  char *e = strpbrk(line, "\r\n");
+  if(e) *e = 0;
+  if(!line[0]) return false;
+  menu_debugf("change core, the result: %s", line);
+
   sdc_lock();
-  if(f_open(&f, name, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+  if(f_open(&f, CARD_MOUNTPOINT "/CORESW.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
     f_puts(line, &f);
     f_puts("\r\n", &f);
     f_close(&f);
   }
   sdc_unlock();
+
+  char m[140];
+  snprintf(m, sizeof(m), "30:Core changed|%s", line);
+  if(!netdl_display_message(m, 0)) netdl_boot_message(m);
+  menu_draw_dialog_long("Change core", line);
+  return true;
 }
 
 static void core_switch(const char *dir, const char *file) {
@@ -1772,28 +1811,25 @@ static void core_switch(const char *dir, const char *file) {
   uint32_t written;
   bool tos, cbm;
   const char *err = gowin_flash_core(path, &written, &tos, &cbm);
-  mcu_hw_upload_core(path);
-  mcu_hw_spi_unlock();
-  bool running = sys_wait4fpga();
 
   // what the new machine still lacks, if anything
   const char *lacks = "";
   if(!strcmp(machine, "Atari ST") && !tos) lacks = " No TOS in the flash yet, see the ST guide.";
   if(!strcmp(machine, "C64") && !cbm)      lacks = " No 1541 ROMs in the flash yet, see the C64 guide.";
-
   if(!err)
-    snprintf(result, sizeof(result), "%s written (%lu KB)%s.%s", machine,
-             (unsigned long)(written / 1024), running ? " and running" : ", NOT running", lacks);
+    snprintf(result, sizeof(result), "%s written (%lu KB), from now on at every start.%s",
+             machine, (unsigned long)(written / 1024), lacks);
   else
-    snprintf(result, sizeof(result), "%s NOT written: %s.%s", machine, err,
-             running ? " It runs until power off." : " Flash from the PC.");
+    snprintf(result, sizeof(result), "%s NOT written: %s. It runs until power off.", machine, err);
   menu_debugf("change core: %s", result);
+  core_switch_note(result);          // before the upload, which unmounts the stick
 
-  // 5. kept for after the restart, which shows it
-  if(running) {
-    core_switch_write(CARD_MOUNTPOINT "/CORESW.TXT", result);
-    core_switch_write(CARD_MOUNTPOINT "/CORESW.NEW", result);
-  }
+  mcu_hw_upload_core(path);
+  mcu_hw_spi_unlock();
+  bool running = sys_wait4fpga();
+  menu_debugf("change core: %s", running ? "running" : "NOT running");
+
+  // 5. a clean restart for the new core's menu; the result waits on the stick
   vTaskDelay(pdMS_TO_TICKS(500));
   mcu_hw_reset();
 }
