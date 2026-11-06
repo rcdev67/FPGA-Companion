@@ -1387,6 +1387,9 @@ static bool play_name_ok(const char *name) {
   return name[0] && name[0] != '.' && !strpbrk(name, "/\\:*?\"<>|");
 }
 
+static bool card_job_parse(char *line);
+static void card_jobs_run(void);
+
 // Ask the server, quietly. True when a game is waiting; its disks are in
 // play_names[] then. *answered tells a server that said "NONE" from one
 // that could not be asked.
@@ -1409,11 +1412,13 @@ static bool play_poll(bool *answered) {
 
   *answered = ok;
   play_count = 0;
+  card_job_count = 0;
   if(!ok) return false;
   job_text[job_len] = 0;
 
   for(char *line = strtok(job_text, "\r\n"); line && play_count < PLAY_MAX; line = strtok(NULL, "\r\n")) {
     const char *href = NULL;
+    if(card_job_parse(line)) continue;
     if(!strncmp(line, "PLAY ", 5) && play_count == 0) href = line + 5;
     if(!strncmp(line, "DISK ", 5) && play_count > 0)  href = line + 5;
     if(!href || strlen(href) >= NET_HREF_LEN) continue;
@@ -1423,6 +1428,220 @@ static bool play_poll(bool *answered) {
     play_count++;
   }
   return play_count > 0;
+}
+
+/* ---- the SD card from the browser: stserve's "SD card" page ----
+   The answer to /_/job may carry jobs for the card besides a game to play,
+   one per line, names URL encoded, all in the card's root:
+     LIST                 the list of files goes to the server
+     READ <name>          a file goes to the server, the last 16 KB of a
+                          longer one -- an ini to edit, NETLOG.TXT to read
+     DEL <name>           delete it
+     REN <name> <new>     rename it
+     FILE <href> <name>   fetch href from the server onto the card as name:
+                          a file uploaded in the browser, an edited ini
+   Every job ends with a fresh list, with how each went. The way back to
+   the server is a POST over a plain connection through the modem: Zimodem
+   fetches, but sends nothing but a request line. An image a drive has open
+   is not touched. */
+#define CARD_JOBS 8
+#define CARD_POST_MAX (16 * 1024)
+typedef struct {
+  char op;                        // 'L', 'R', 'D', 'N' (rename), 'F'
+  char a[NET_NAME_LEN], b[NET_NAME_LEN];
+  char href[NET_HREF_LEN];
+} card_job_t;
+static card_job_t card_jobs[CARD_JOBS];
+static int card_job_count = 0;
+static char card_results[400];    // how the jobs went, sent with the list
+
+static void card_result(const char *fmt, const char *a, const char *b) {
+  size_t n = strlen(card_results);
+  if(n < sizeof(card_results) - 2)
+    snprintf(card_results + n, sizeof(card_results) - n, fmt, a, b ? b : "");
+}
+
+// one job line of the answer to /_/job; false if it is none
+static bool card_job_parse(char *line) {
+  if(card_job_count >= CARD_JOBS) return false;
+  card_job_t *j = &card_jobs[card_job_count];
+  memset(j, 0, sizeof(*j));
+  char *arg = strchr(line, ' ');
+  if(arg) *arg++ = 0;
+  char *arg2 = arg ? strchr(arg, ' ') : NULL;
+  if(arg2) *arg2++ = 0;
+  if(!strcmp(line, "LIST")) j->op = 'L';
+  else if(!strcmp(line, "READ") && arg) j->op = 'R';
+  else if(!strcmp(line, "DEL") && arg) j->op = 'D';
+  else if(!strcmp(line, "REN") && arg && arg2) j->op = 'N';
+  else if(!strcmp(line, "FILE") && arg && arg2) j->op = 'F';
+  else return false;
+  if(j->op == 'F') {
+    if(strlen(arg) >= NET_HREF_LEN) return false;
+    strcpy(j->href, arg);
+    url_decode(arg2, j->a, NET_NAME_LEN);
+  } else if(arg) {
+    url_decode(arg, j->a, NET_NAME_LEN);
+    if(arg2) url_decode(arg2, j->b, NET_NAME_LEN);
+  }
+  if(j->op != 'L' && !play_name_ok(j->a)) return false;
+  if(j->op == 'N' && !play_name_ok(j->b)) return false;
+  card_job_count++;
+  return true;
+}
+
+// an image one of the drives has open
+static bool card_in_use(const char *name) {
+  for(int d = 0; d < MAX_DRIVES; d++) {
+    const char *n = sdc_get_image_name(d);
+    if(!n) continue;
+    const char *b = strrchr(n, '/');
+    if(!strcasecmp(b ? b + 1 : n, name)) return true;
+  }
+  return false;
+}
+
+// POST body to path on the server, over a plain connection: the request,
+// then only the status line of the answer. True on 200.
+static bool http_post(const char *path, const char *body, int len) {
+  char host[NET_SERVER_LEN];
+  int port;
+  char base[NET_PATH_LEN], line[NET_LINE_LEN];
+  if(!net_server_parse(host, sizeof(host), &port, base, sizeof(base))) return false;
+  if(!modem_detect()) return false;
+  net_baud_slow();                     // the stream at 19200, flow is the core's
+  if(!modem_connect(host, port)) { net_flush(); return false; }
+  // Zimodem rearranges its serial side when it enters the stream, see
+  // http_get()
+  vTaskDelay(pdMS_TO_TICKS(400));
+  net_flush();
+  char head[NET_PATH_LEN + 200];
+  int hn = snprintf(head, sizeof(head),
+                    "POST /%s%s HTTP/1.0\r\nHost: %s\r\nContent-Type: application/octet-stream\r\n"
+                    "Content-Length: %d\r\nConnection: close\r\n\r\n", base, path, host, len);
+  if(hn < 0 || hn >= (int)sizeof(head)) { modem_hangup(); return false; }
+  net_puts(head);
+  in_body = true;
+  for(int o = 0; o < len; o += 256)
+    net_write(body + o, (len - o > 256) ? 256 : len - o);
+  in_body = false;
+  int status = 0;
+  TickType_t t0 = xTaskGetTickCount();
+  while(!status && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(15000) &&
+        net_read_line(line, sizeof(line), 15000))
+    if(!strncmp(line, "HTTP/1.", 7)) status = atoi(line + 9);
+  modem_hangup();
+  return status == 200;
+}
+
+// the root of the card, one line a file: name, size, D for a folder,
+// date and time; the results of the jobs first, "! ..." lines
+static void card_send_list(void) {
+  char *buf = pvPortMalloc(CARD_POST_MAX);
+  if(!buf) return;
+  int n = 0;
+  for(char *r = strtok(card_results, "\n"); r; r = strtok(NULL, "\n"))
+    n += snprintf(buf + n, CARD_POST_MAX - n, "! %s\n", r);
+  card_results[0] = 0;
+  DIR dir;
+  FILINFO fno;
+  int files = 0;
+  bool full = false;
+  sdc_lock();
+  if(f_opendir(&dir, CARD_MOUNTPOINT) == FR_OK) {
+    while(f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+      if(n > CARD_POST_MAX - 300) { full = true; break; }
+      n += snprintf(buf + n, CARD_POST_MAX - n, "%s\t%lu\t%s\t%04u-%02u-%02u %02u:%02u\n",
+                    fno.fname, (unsigned long)fno.fsize, (fno.fattrib & AM_DIR) ? "D" : "F",
+                    ((fno.fdate >> 9) & 0x7f) + 1980, (fno.fdate >> 5) & 0x0f, fno.fdate & 0x1f,
+                    (fno.ftime >> 11) & 0x1f, (fno.ftime >> 5) & 0x3f);
+      files++;
+    }
+    f_closedir(&dir);
+  }
+  sdc_unlock();
+  if(full) n += snprintf(buf + n, CARD_POST_MAX - n, "! the list ends here, the card has more\n");
+  char path[96];
+  snprintf(path, sizeof(path), "_/card/list?i=%s&n=%d", modem_ip, files);
+  bool ok = http_post(path, buf, n);
+  vPortFree(buf);
+  char l[64];
+  snprintf(l, sizeof(l), "card: list of %d sent%s", files, ok ? "" : ", FAILED");
+  net_log(l);
+}
+
+// a file to the server, the last CARD_POST_MAX bytes of a longer one
+static void card_send_file(const char *name) {
+  char full[NET_NAME_LEN + 8];
+  snprintf(full, sizeof(full), "%s/%s", CARD_MOUNTPOINT, name);
+  char *buf = pvPortMalloc(CARD_POST_MAX);
+  if(!buf) { card_result("READ %s: out of memory%s\n", name, NULL); return; }
+  FIL f;
+  UINT got = 0;
+  FSIZE_t size = 0, from = 0;
+  sdc_lock();
+  FRESULT r = f_open(&f, full, FA_OPEN_EXISTING | FA_READ);
+  if(r == FR_OK) {
+    size = f_size(&f);
+    from = (size > CARD_POST_MAX) ? size - CARD_POST_MAX : 0;
+    if(from) f_lseek(&f, from);
+    r = f_read(&f, buf, CARD_POST_MAX, &got);
+    f_close(&f);
+  }
+  sdc_unlock();
+  if(r != FR_OK) {
+    char e[8]; snprintf(e, sizeof(e), "f%d", r);
+    card_result("READ %s: %s\n", name, e);
+    vPortFree(buf);
+    return;
+  }
+  char path[200], q[100];
+  q[0] = 0;
+  query_add(q, sizeof(q), "name", name, 60);
+  snprintf(path, sizeof(path), "_/card/text?i=%s&size=%lu&from=%lu&%s", modem_ip,
+           (unsigned long)size, (unsigned long)from, q);
+  bool ok = http_post(path, buf, (int)got);
+  vPortFree(buf);
+  card_result(ok ? "READ %s: sent%s\n" : "READ %s: sending failed%s\n", name, NULL);
+}
+
+// The jobs of the last answer, in order, then the list.
+static void card_jobs_run(void) {
+  if(!card_job_count) return;
+  char full[NET_NAME_LEN + 8], to[NET_NAME_LEN + 8], e[8];
+  for(int i = 0; i < card_job_count; i++) {
+    card_job_t *j = &card_jobs[i];
+    snprintf(full, sizeof(full), "%s/%s", CARD_MOUNTPOINT, j->a);
+    FRESULT r = FR_OK;
+    switch(j->op) {
+    case 'R':
+      card_send_file(j->a);
+      break;
+    case 'D':
+      if(card_in_use(j->a)) { card_result("DEL %s: in a drive, not deleted%s\n", j->a, NULL); break; }
+      sdc_lock(); r = f_unlink(full); sdc_unlock();
+      snprintf(e, sizeof(e), "f%d", r);
+      card_result("DEL %s: %s\n", j->a, r == FR_OK ? "deleted" : e);
+      break;
+    case 'N':
+      if(card_in_use(j->a)) { card_result("REN %s: in a drive, not renamed%s\n", j->a, NULL); break; }
+      snprintf(to, sizeof(to), "%s/%s", CARD_MOUNTPOINT, j->b);
+      sdc_lock(); r = f_rename(full, to); sdc_unlock();
+      snprintf(e, sizeof(e), "f%d", r);
+      card_result("REN %s: %s\n", j->a, r == FR_OK ? j->b : r == FR_EXIST ? "the new name is taken" : e);
+      break;
+    case 'F':
+      if(card_in_use(j->a)) { card_result("FILE %s: in a drive, not replaced%s\n", j->a, NULL); break; }
+      card_result(download_file(j->a, j->href, NET_MARK_CARD) ? "FILE %s: on the card%s\n"
+                                                               : "FILE %s: failed%s\n", j->a, NULL);
+      break;
+    }
+    char l[NET_NAME_LEN + 16];
+    snprintf(l, sizeof(l), "card: %c %s", j->op, j->a);
+    net_log(l);
+  }
+  card_job_count = 0;
+  card_send_list();
 }
 
 // the drive the core's menu offers for this kind of file, -1 if none
@@ -1537,6 +1756,7 @@ static bool play_round(void) {
   vTaskDelay(pdMS_TO_TICKS(50));
   bool got = play_poll(&answered);
   bool ok = false;
+  card_jobs_run();
   if(got) {
     char line[96];
     snprintf(line, sizeof(line), "play: %s, %d disk%s", play_names[0], play_count, play_count == 1 ? "" : "s");
