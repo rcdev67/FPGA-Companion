@@ -1448,11 +1448,11 @@ static bool play_poll(bool *answered) {
      FILE <href> <name>   fetch href from the server onto the card as name:
                           a file uploaded in the browser, an edited ini
    Every job ends with a fresh list, with how each went. The way back to
-   the server is a POST over a plain connection through the modem: Zimodem
-   fetches, but sends nothing but a request line. An image a drive has open
-   is not touched. */
+   the server is the modem's fetch as well, see card_put(). An image a
+   drive has open is not touched. */
 #define CARD_JOBS 8
-#define CARD_POST_MAX (16 * 1024)
+#define CARD_POST_MAX (16 * 1024)     // the list
+#define CARD_TEXT_MAX 4096            // a file, the end of a longer one
 typedef struct {
   char op;                        // 'L', 'R', 'D', 'N' (rename), 'F'
   char a[NET_NAME_LEN], b[NET_NAME_LEN];
@@ -1508,66 +1508,98 @@ static bool card_in_use(const char *name) {
   return false;
 }
 
-// POST body to path on the server, over a plain connection: the request,
-// then only the status line of the answer. True on 200; else post_why
-// says what went wrong, for NETLOG.
-//
-// Paced: in a stream Zimodem hands every byte from the serial side to the
-// socket on its own, slower than 19200 bit/s bring them, and a request of
-// a kilobyte and more overflowed its receive buffer on the board -- the
-// server waited for the rest of the body and never answered. 32 bytes
-// every 40 ms is 800 bytes a second.
+// Data to the server, in pieces: _/card/put?<query>&s=<piece>&d=<data>,
+// &e=1 on the last. Zimodem fetches, it sends nothing but a request line,
+// and a POST over a plain connection through it (ATD, the bytes, +++)
+// left it answering nothing at all on the board, for minutes, until it
+// was switched off. A fetch is what works, so the data goes in the
+// address: as much of it as Zimodem's 256 characters a command leave,
+// about a hundred bytes a fetch. stserve puts the pieces together and
+// takes a piece it already has once more without harm, so a failed
+// fetch is simply repeated. True when every piece came through; else
+// post_why says what went wrong, for NETLOG.
 static char post_why[64];
+static char put_reply[24];
+static int put_len;
 
-static void post_paced(const char *data, int len) {
-  for(int o = 0; o < len; o += 32) {
-    net_write(data + o, (len - o > 32) ? 32 : len - o);
-    vTaskDelay(pdMS_TO_TICKS(40));
-  }
+static bool put_sink(const unsigned char *data, int len) {
+  int room = (int)sizeof(put_reply) - 1 - put_len;
+  if(len > room) len = room;
+  memcpy(put_reply + put_len, data, len);
+  put_len += len;
+  put_reply[put_len] = 0;
+  return true;
 }
 
-static bool http_post(const char *path, const char *body, int len) {
+// left as it is in the address; a space goes as '+'
+static bool put_plain(unsigned char c) {
+  return isalnum(c) || (c && strchr("-_.~!*'(),:;/@$", c));
+}
+
+static bool card_put(const char *query, const char *data, int len) {
   char host[NET_SERVER_LEN];
   int port;
-  char base[NET_PATH_LEN], line[NET_LINE_LEN];
+  char base[NET_PATH_LEN];
   strcpy(post_why, "no server in the ini");
   if(!net_server_parse(host, sizeof(host), &port, base, sizeof(base))) return false;
+
+  // quietly, as the questions for a game: no FETCH lines in NETLOG, the
+  // dialog's lines as they were
+  char msg[sizeof(message)], to[sizeof(fetch_to)], res[sizeof(fetch_result)];
+  int rssi = fetch_rssi;
+  bool have = fetch_have_rssi;
+  strcpy(msg, message); strcpy(to, fetch_to); strcpy(res, fetch_result);
+  net_quiet = true;
+
+  bool ok = false;
   strcpy(post_why, "no modem");
-  if(!modem_detect()) return false;
-  net_baud_slow();                     // the stream at 19200, flow is the core's
-  if(!modem_connect(host, port)) {
-    snprintf(post_why, sizeof(post_why), "no connection, modem: %s", modem_last);
-    net_flush();
-    return false;
+  if(modem_detect()) {
+    net_baud_fast();
+    // what the command takes besides the path: AT&G"xmodem:http://host:port/"
+    int fixed = snprintf(NULL, 0, "AT&G\"xmodem:http://%s:%d/\"", host, port);
+    static char path[256];
+    int o = 0, piece = 0;
+    ok = true;
+    do {
+      int n = snprintf(path, sizeof(path), "%s_/card/put?%s&s=%d&d=", base, query, piece);
+      int room = 255 - fixed - n - 4;                   // and "&e=1"
+      if(n >= (int)sizeof(path) || room < 16) { strcpy(post_why, "the address is too long"); ok = false; break; }
+      int take = 0;
+      while(o + take < len) {
+        unsigned char c = (unsigned char)data[o + take];
+        int need = (c == ' ' || put_plain(c)) ? 1 : 3;
+        if(need > room) break;
+        if(c == ' ')     path[n++] = '+';
+        else if(need == 1) path[n++] = (char)c;
+        else             n += sprintf(path + n, "%%%02X", c);
+        room -= need;
+        take++;
+      }
+      if(o + take == len) n += sprintf(path + n, "&e=1");
+      path[n] = 0;
+      bool got = false;
+      for(int tries = 0; tries < 3 && !got; tries++) {
+        put_len = 0;
+        put_reply[0] = 0;
+        got = xmodem_get(host, port, path, put_sink) && !strncmp(put_reply, "OK", 2);
+      }
+      if(!got) {
+        snprintf(post_why, sizeof(post_why), "piece %d of %d: %.30s", piece + 1,
+                 len / 100 + 1, put_reply[0] ? put_reply : message);
+        char *nl = strpbrk(post_why, "\r\n");
+        if(nl) *nl = 0;
+        ok = false;
+        break;
+      }
+      o += take;
+      piece++;
+    } while(o < len);
   }
-  // Zimodem rearranges its serial side when it enters the stream, see
-  // http_get()
-  vTaskDelay(pdMS_TO_TICKS(400));
-  net_flush();
-  char head[NET_PATH_LEN + 200];
-  int hn = snprintf(head, sizeof(head),
-                    "POST /%s%s HTTP/1.0\r\nHost: %s\r\nContent-Type: application/octet-stream\r\n"
-                    "Content-Length: %d\r\nConnection: close\r\n\r\n", base, path, host, len);
-  if(hn < 0 || hn >= (int)sizeof(head)) { modem_hangup(); return false; }
-  post_paced(head, hn);
-  in_body = true;
-  post_paced(body, len);
-  in_body = false;
-  // stserve gives up on a body that stops short after 12 s and says how
-  // much came, in its status line
-  int status = 0;
-  char first[24] = "nothing";
-  bool any = false;
-  TickType_t t0 = xTaskGetTickCount();
-  while(!status && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(20000) &&
-        net_read_line(line, sizeof(line), 20000)) {
-    if(!any) { snprintf(first, sizeof(first), "%s", line); any = true; }
-    if(!strncmp(line, "HTTP/1.", 7)) status = atoi(line + 9);
-  }
-  modem_hangup();
-  if(!status) snprintf(post_why, sizeof(post_why), "no answer from the server, got: %s", first);
-  else        snprintf(post_why, sizeof(post_why), "the server says %.48s", line + 9);
-  return status == 200;
+
+  net_quiet = false;
+  strcpy(message, msg); strcpy(fetch_to, to); strcpy(fetch_result, res);
+  fetch_rssi = rssi; fetch_have_rssi = have;
+  return ok;
 }
 
 // the root of the card, one line a file: name, size, D for a folder,
@@ -1597,20 +1629,20 @@ static void card_send_list(void) {
   }
   sdc_unlock();
   if(full) n += snprintf(buf + n, CARD_POST_MAX - n, "! the list ends here, the card has more\n");
-  char path[96];
-  snprintf(path, sizeof(path), "_/card/list?i=%s&n=%d", modem_ip, files);
-  bool ok = http_post(path, buf, n);
+  char q[64];
+  snprintf(q, sizeof(q), "i=%s&k=list&n=%d", modem_ip, files);
+  bool ok = card_put(q, buf, n);
   vPortFree(buf);
   char l[128];
   snprintf(l, sizeof(l), "card: list of %d sent%s%s", files, ok ? "" : ", FAILED: ", ok ? "" : post_why);
   net_log(l);
 }
 
-// a file to the server, the last CARD_POST_MAX bytes of a longer one
+// a file to the server, the last CARD_TEXT_MAX bytes of a longer one
 static void card_send_file(const char *name) {
   char full[NET_NAME_LEN + 8];
   snprintf(full, sizeof(full), "%s/%s", CARD_MOUNTPOINT, name);
-  char *buf = pvPortMalloc(CARD_POST_MAX);
+  char *buf = pvPortMalloc(CARD_TEXT_MAX);
   if(!buf) { card_result("READ %s: out of memory%s\n", name, NULL); return; }
   FIL f;
   UINT got = 0;
@@ -1619,9 +1651,9 @@ static void card_send_file(const char *name) {
   FRESULT r = f_open(&f, full, FA_OPEN_EXISTING | FA_READ);
   if(r == FR_OK) {
     size = f_size(&f);
-    from = (size > CARD_POST_MAX) ? size - CARD_POST_MAX : 0;
+    from = (size > CARD_TEXT_MAX) ? size - CARD_TEXT_MAX : 0;
     if(from) f_lseek(&f, from);
-    r = f_read(&f, buf, CARD_POST_MAX, &got);
+    r = f_read(&f, buf, CARD_TEXT_MAX, &got);
     f_close(&f);
   }
   sdc_unlock();
@@ -1634,9 +1666,9 @@ static void card_send_file(const char *name) {
   char path[200], q[100];
   q[0] = 0;
   query_add(q, sizeof(q), "name", name, 60);
-  snprintf(path, sizeof(path), "_/card/text?i=%s&size=%lu&from=%lu&%s", modem_ip,
+  snprintf(path, sizeof(path), "i=%s&k=text&size=%lu&from=%lu&%s", modem_ip,
            (unsigned long)size, (unsigned long)from, q);
-  bool ok = http_post(path, buf, (int)got);
+  bool ok = card_put(path, buf, (int)got);
   vPortFree(buf);
   card_result(ok ? "READ %s: sent%s\n" : "READ %s: sending failed, %s\n", name, ok ? NULL : post_why);
 }
