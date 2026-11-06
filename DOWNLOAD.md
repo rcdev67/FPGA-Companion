@@ -114,6 +114,14 @@ the C3's.
 3. Pick a file. A bar shows the progress, the end says how many bytes
    arrived. The file lands in the root of the card.
 
+   The list's second line, `Save to: SD card`, says where a file goes;
+   picking it changes it to `Save to: USB stick`, when a stick is on the
+   hub. The stick is for keeping games -- for another computer, or to
+   bring a collection home -- the cores' floppies read the SD card only;
+   *From USB* in the system menu copies a file from the stick onto the
+   card. A game sent from stserve's catalogue is marked `> ` for the card
+   or `USB> ` for the stick, and goes there whatever the second line says.
+
    Names that end in a slash are folders: picking one shows what is in
    it, `..` goes back up. A folder in the `server=` line works as well,
    `server=192.168.1.10:8888/atari/games` starts the list there.
