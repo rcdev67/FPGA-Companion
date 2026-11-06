@@ -804,6 +804,25 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
   if(!gowin_open() || idcode != IDCODE_GW2AR18) { err = "no GW2AR-18 on JTAG"; goto out; }
   if(!gowin_eraseSRAM()) { err = "erasing the SRAM failed"; goto out; }
 
+  // The core that ran read its ROMs in the flash's continuous read mode,
+  // and the flash is still in it: the first command counts as an address,
+  // and the first answers are nothing -- the first board run read all
+  // three status registers as ff and missed the 1541's ROMs. So first out
+  // of that mode (ff ff), then a reset (66, 99), and the ID has to be a
+  // flash's before anything else happens.
+  { uint8_t m[2] = { 0xff, 0xff }, e[1] = { 0x66 }, r[1] = { 0x99 };
+    gowin_spi_xfer(m, NULL, sizeof(m));
+    gowin_spi_xfer(e, NULL, sizeof(e));
+    gowin_spi_xfer(r, NULL, sizeof(r));
+    vTaskDelay(pdMS_TO_TICKS(2)); }
+  { uint8_t tx[4] = { 0x9f, 0, 0, 0 }, id[4];
+    gowin_spi_xfer(tx, id, sizeof(tx));
+    if(id[1] == 0x00 || id[1] == 0xff || id[3] < 0x14 || id[3] > 0x19) {
+      snprintf(why, sizeof(why), "the flash does not answer (id %02x %02x %02x)", id[1], id[2], id[3]);
+      err = why;
+      goto out;
+    } }
+
   gowin_flash_roms(tos, cbm);
 
   // Does a command that only sends get into the flash? Its write enable
@@ -832,22 +851,22 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
   // writes this flash, so one way works: the usual ones are tried, each
   // checked, and the result says which did it.
   uint8_t r1 = gowin_flash_reg(0x05), r2 = gowin_flash_reg(0x35), r3 = gowin_flash_reg(0x15);
+  // all ones is no state a flash reports: then nothing is written to its
+  // registers, whatever they seem to say
+  if(r1 == 0xff || r2 == 0xff || r3 == 0xff) {
+    snprintf(why, sizeof(why), "the flash's status reads wrong (%02x %02x %02x)", r1, r2, r3);
+    err = why;
+    goto out;
+  }
   const char *way = "none needed";
   if(gowin_flash_protected()) {
     way = NULL;
-    // 1. status register 1 written, non-volatile
+    // 1. status register 1 written, non-volatile: BP0-2 and SRP0 off, the
+    // rest as it is. Register 2 -- QE, the one-time lock bits, CMP -- is
+    // never written.
     { uint8_t tx[2] = { 0x01, r1 & ~0x9c };
       gowin_flash_wren(); gowin_spi_xfer(tx, NULL, sizeof(tx)); gowin_flash_wait(100);
       if(!gowin_flash_protected()) way = "sr1"; }
-    // 2. registers 1 and 2 at once: CMP, SRP1 and the lock off as well
-    if(!way) { uint8_t tx[3] = { 0x01, r1 & ~0x9c, r2 & ~0x41 };
-      gowin_flash_wren(); gowin_spi_xfer(tx, NULL, sizeof(tx)); gowin_flash_wait(100);
-      if(!gowin_flash_protected()) way = "sr1+2"; }
-    // 3. register 2 on its own, then 1 again
-    if(!way) { uint8_t tx2[2] = { 0x31, r2 & ~0x41 }, tx1[2] = { 0x01, r1 & ~0x9c };
-      gowin_flash_wren(); gowin_spi_xfer(tx2, NULL, sizeof(tx2)); gowin_flash_wait(100);
-      gowin_flash_wren(); gowin_spi_xfer(tx1, NULL, sizeof(tx1)); gowin_flash_wait(100);
-      if(!gowin_flash_protected()) way = "sr2,sr1"; }
     // 4. volatile, until power off
     if(!way) { uint8_t tv[1] = { 0x50 }, tx[2] = { 0x01, 0x00 };
       gowin_spi_xfer(tv, NULL, sizeof(tv)); gowin_spi_xfer(tx, NULL, sizeof(tx));
