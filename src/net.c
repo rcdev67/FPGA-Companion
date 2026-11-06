@@ -1338,9 +1338,13 @@ static void query_add(char *out, size_t size, const char *key, const char *s, si
   if(!s || !*s || o + strlen(key) + 3 >= size) return;
   o += snprintf(out + o, size - o, "%s%s=", o ? "&" : "", key);
   size_t start = o;
-  for(; *s && o + 4 < size && o - start + 3 <= max; s++) {
+  // max counts what goes into the address: a character, or three for one
+  // that is escaped -- an address of 15 characters fits into 16
+  for(; *s && o + 4 < size; s++) {
     unsigned char ch = (unsigned char)*s;
-    if(isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') out[o++] = ch;
+    bool plain = isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~';
+    if(o - start + (plain ? 1 : 3) > max) break;
+    if(plain) out[o++] = ch;
     else o += snprintf(out + o, size - o, "%%%02X", ch);
   }
   out[o] = 0;
@@ -1468,9 +1472,14 @@ static void card_result(const char *fmt, const char *a, const char *b) {
     snprintf(card_results + n, sizeof(card_results) - n, fmt, a, b ? b : "");
 }
 
-// one job line of the answer to /_/job; false if it is none
-static bool card_job_parse(char *line) {
-  if(card_job_count >= CARD_JOBS) return false;
+// one job line of the answer to /_/job; false if it is none. Taken apart
+// in a copy: a line that is no job for the card -- "PLAY <href>" -- has to
+// reach play_poll() as it came.
+static bool card_job_parse(char *in) {
+  char copy[2 * NET_HREF_LEN + 16];
+  if(card_job_count >= CARD_JOBS || strlen(in) >= sizeof(copy)) return false;
+  strcpy(copy, in);
+  char *line = copy;
   card_job_t *j = &card_jobs[card_job_count];
   memset(j, 0, sizeof(*j));
   char *arg = strchr(line, ' ');
