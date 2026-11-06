@@ -152,6 +152,14 @@ that runs one. The questions are quiet: they leave nothing in
 lines there as any download does. A server that is not stserve, or not
 reachable, is asked every five minutes only.
 
+Every question also tells stserve what the computer is, for the
+catalogue's list of computers: the core, the companion's commit and board,
+Zimodem's version and address, the WiFi signal at the last fetch, the
+image in the first drive and the last file that arrived. With `play=` off
+the companion says the same once after start-up and after every download,
+at `/_/hello`; a server that is not stserve answers 404, and nothing
+happens.
+
 The `Serial:` setting in the OSD does not matter for downloads: the
 companion switches the port to itself for the request and puts your
 setting back afterwards. During a download the ST has no modem, that is
