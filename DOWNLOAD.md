@@ -129,6 +129,29 @@ the C3's.
    set `Video: Color` if needed and use the reset entry, TOS reads the
    monitor type only at boot.
 
+## One click to play: `play=`
+
+With stserve as the server, its catalogue in the browser has a **Play**
+button. For it the companion has to ask the server now and then whether a
+game is waiting; one line in the ini switches that on:
+
+    play=on
+
+`on` asks every 10 seconds, `play=30` every 30, `play=off` never -- the
+default. A game waiting is fetched onto the card with the other disks of
+its set, put into the drive the core's menu offers for its kind of file,
+and the machine starts afresh: the ST boots from drive A, the C64 gets
+`LOAD"*",8,1` typed and `RUN` once its drive has gone quiet; a `.prg` is
+loaded into the freshly started C64 and run by the core.
+
+Each question takes the modem from the machine's serial port for a second
+or two, which nobody notices in a game -- but a terminal program online
+over the modem loses its connection to it. Leave `play=` off on a machine
+that runs one. The questions are quiet: they leave nothing in
+`NETLOG.TXT`, the menu or the status display; a game fetched leaves its
+lines there as any download does. A server that is not stserve, or not
+reachable, is asked every five minutes only.
+
 The `Serial:` setting in the OSD does not matter for downloads: the
 companion switches the port to itself for the request and puts your
 setting back afterwards. During a download the ST has no modem, that is
