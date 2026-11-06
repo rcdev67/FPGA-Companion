@@ -42,6 +42,8 @@
 #include "config.h"   // for config_find_role() and the core's name
 #include "debug.h"
 #include "mcu_hw.h"   // for mcu_hw_usb_msc_present()
+#include "sysctrl.h"  // for sys_run_action_by_name()
+#include "ps2helper.h" // keys typed into the C64, see play_start()
 
 #define NET_PORT          1
 #define NET_RX_BUF        2048    // bytes the interrupt handler may queue
@@ -167,7 +169,16 @@ static bool net_read_line(char *line, int max, int timeout_ms) {
 
 // keep a record on the card: the OSD message is gone once the dialog is
 // closed, this stays until it is read on a PC
+// While the companion asks stserve for a game to play, every few seconds,
+// nothing of it goes to NETLOG.TXT, the menu or the dialog's lines.
+static bool net_quiet = false;
+
+static void net_notify(void) {
+  if(!net_quiet) net_notify();
+}
+
 static void net_log(const char *line) {
+  if(net_quiet) return;
   FIL f;
   sdc_lock();
   if(f_open(&f, CARD_MOUNTPOINT "/NETLOG.TXT", FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
@@ -182,7 +193,7 @@ static void net_set_message(const char *msg) {
   strncpy(message, msg, sizeof(message)-1);
   message[sizeof(message)-1] = '\0';
   debugf("NET: %s", message);
-  menu_notify(MENU_EVENT_NET_UPDATE);
+  net_notify();
 }
 
 // send a command and wait for a final reply line: true on "OK" or the
@@ -845,7 +856,7 @@ static bool xmodem_get(const char *host, int port, const char *path, bool (*sink
 
     if((xTaskGetTickCount() - last_report) > pdMS_TO_TICKS(250)) {
       last_report = xTaskGetTickCount();
-      menu_notify(MENU_EVENT_NET_UPDATE);
+      net_notify();
     }
   }
   in_body = false;
@@ -985,7 +996,7 @@ static bool http_get(const char *path, bool (*sink)(const unsigned char*, int)) 
 
     if((xTaskGetTickCount() - last_report) > pdMS_TO_TICKS(250)) {
       last_report = xTaskGetTickCount();
-      menu_notify(MENU_EVENT_NET_UPDATE);
+      net_notify();
     }
   }
   if(ok && complete && fill && !sink(chunk, fill)) ok = false;
@@ -1060,7 +1071,7 @@ static void fetch_list(void) {
     char line[80];
     snprintf(line, sizeof(line), "FAIL list: %s", message);
     net_log(line);
-    menu_notify(MENU_EVENT_NET_UPDATE);
+    net_notify();
     return;
   }
   index_text[index_len] = '\0';
@@ -1104,7 +1115,7 @@ static void fetch_list(void) {
     state = NET_STATE_LIST;
   }
   net_log(message);
-  menu_notify(MENU_EVENT_NET_UPDATE);
+  net_notify();
 }
 
 static FIL dl_file;
@@ -1156,42 +1167,25 @@ static void cwd_up(void) {
   cwd[n] = '\0';
 }
 
-static void download(int index) {
-  if(index < 0 || index >= name_count) return;
-  const char *name = names[index];
-
-  // a folder: show what is in it, and go back to where we were if that
-  // folder cannot be read
-  int nl = strlen(name);
-  if(!strcmp(name, "..") || (nl && name[nl-1] == '/')) {
-    char was[NET_PATH_LEN];
-    strcpy(was, cwd);
-    if(!strcmp(name, ".."))
-      cwd_up();
-    else if(strlen(cwd) + strlen(hrefs[index]) < sizeof(cwd))
-      strcat(cwd, hrefs[index]);
-    else
-      { net_set_message("Folder path too long"); return; }
-    fetch_list();
-    if(state == NET_STATE_ERROR) strcpy(cwd, was);
-    return;
-  }
-
+// One file from the server, url as the server wants it, onto the card or
+// the stick under name. mark is the catalogue's mark, if any. True when it
+// arrived whole.
+static bool download_file(const char *name, const char *url, uint8_t mark) {
   // the card or the stick: a game sent to one of them from the catalogue
   // goes there, any other file where the dialog says
-  dl_usb = (marked[index] == NET_MARK_STICK) || (marked[index] == NET_MARK_NONE && to_stick);
+  dl_usb = (mark == NET_MARK_STICK) || (mark == NET_MARK_NONE && to_stick);
   if(dl_usb && !mcu_hw_usb_msc_present()) {
     net_set_message("No USB stick on the hub");
     state = NET_STATE_ERROR;
-    menu_notify(MENU_EVENT_NET_UPDATE);
-    return;
+    net_notify();
+    return false;
   }
   const char *base = dl_usb ? "/usb" : CARD_MOUNTPOINT;
 
   state = NET_STATE_BUSY;
   bytes_done = bytes_total = 0;
   snprintf(message, sizeof(message), "Loading %s%s", name, dl_usb ? " to USB" : "");
-  menu_notify(MENU_EVENT_NET_UPDATE);
+  net_notify();
 
   char path[NET_NAME_LEN + 8];
   snprintf(path, sizeof(path), "%s/%s", base, name);
@@ -1210,13 +1204,11 @@ static void download(int index) {
     else       snprintf(msg, sizeof(msg), "Cannot create f%d e%d", r, sdc_get_last_error());
     net_set_message(msg);
     state = NET_STATE_ERROR;
-    menu_notify(MENU_EVENT_NET_UPDATE);
-    return;
+    net_notify();
+    return false;
   }
   dl_open = true;
 
-  char url[NET_PATH_LEN + NET_HREF_LEN];
-  snprintf(url, sizeof(url), "%s%s", cwd, hrefs[index]);
   bool ok = http_get(url, file_sink);            // the URL form, spaces and all encoded
 
   dl_lock();
@@ -1250,8 +1242,234 @@ static void download(int index) {
              (unsigned long)bytes_done, (unsigned long)bytes_total, message);
     net_log(line);
   }
-  menu_notify(MENU_EVENT_NET_UPDATE);
+  net_notify();
+  return ok;
 }
+
+static void download(int index) {
+  if(index < 0 || index >= name_count) return;
+  const char *name = names[index];
+
+  // a folder: show what is in it, and go back to where we were if that
+  // folder cannot be read
+  int nl = strlen(name);
+  if(!strcmp(name, "..") || (nl && name[nl-1] == '/')) {
+    char was[NET_PATH_LEN];
+    strcpy(was, cwd);
+    if(!strcmp(name, ".."))
+      cwd_up();
+    else if(strlen(cwd) + strlen(hrefs[index]) < sizeof(cwd))
+      strcat(cwd, hrefs[index]);
+    else
+      { net_set_message("Folder path too long"); return; }
+    fetch_list();
+    if(state == NET_STATE_ERROR) strcpy(cwd, was);
+    return;
+  }
+
+  char url[NET_PATH_LEN + NET_HREF_LEN];
+  snprintf(url, sizeof(url), "%s%s", cwd, hrefs[index]);
+  download_file(name, url, marked[index]);
+}
+
+/* ---- "Play" in stserve's catalogue: one click, and the game runs ----
+   With play= in the ini the companion asks the server every so many
+   seconds whether a game is waiting, at /_/job. stserve answers "NONE", or
+   "PLAY <name>" and a "DISK <name>" line for each further disk of a set.
+   The companion fetches them onto the card, as a game sent from the
+   catalogue, puts the first one into the drive that takes its kind of
+   file -- the core's own menu says which -- and starts the machine afresh.
+   A C64 disk gets LOAD"*",8,1 typed, and RUN once the drive is quiet.
+
+   Off unless the ini asks for it: every question takes the modem from the
+   core for a second or two, and a terminal program on the C64 or the ST
+   would lose its connection to that. */
+#define PLAY_MAX 4
+static int play_secs = 0;               // ini play=, 0 = off
+static char play_names[PLAY_MAX][NET_NAME_LEN];
+static char play_hrefs[PLAY_MAX][NET_HREF_LEN];
+static int play_count = 0;
+static char job_text[512];
+static int job_len;
+
+static bool job_sink(const unsigned char *data, int len) {
+  int room = sizeof(job_text) - 1 - job_len;
+  if(len > room) len = room;
+  memcpy(job_text + job_len, data, len);
+  job_len += len;
+  return true;
+}
+
+// a name that can only be a file in the card's root
+static bool play_name_ok(const char *name) {
+  return name[0] && name[0] != '.' && !strpbrk(name, "/\\:*?\"<>|");
+}
+
+// Ask the server, quietly. True when a game is waiting; its disks are in
+// play_names[] then. *answered tells a server that said "NONE" from one
+// that could not be asked.
+static bool play_poll(bool *answered) {
+  char msg[sizeof(message)], to[sizeof(fetch_to)], res[sizeof(fetch_result)];
+  int rssi = fetch_rssi;
+  bool have = fetch_have_rssi;
+  strcpy(msg, message); strcpy(to, fetch_to); strcpy(res, fetch_result);
+
+  job_len = 0;
+  net_quiet = true;
+  bool ok = http_get("_/job", job_sink);
+  net_quiet = false;
+
+  strcpy(message, msg); strcpy(fetch_to, to); strcpy(fetch_result, res);
+  fetch_rssi = rssi; fetch_have_rssi = have;
+
+  *answered = ok;
+  play_count = 0;
+  if(!ok) return false;
+  job_text[job_len] = 0;
+
+  for(char *line = strtok(job_text, "\r\n"); line && play_count < PLAY_MAX; line = strtok(NULL, "\r\n")) {
+    const char *href = NULL;
+    if(!strncmp(line, "PLAY ", 5) && play_count == 0) href = line + 5;
+    if(!strncmp(line, "DISK ", 5) && play_count > 0)  href = line + 5;
+    if(!href || strlen(href) >= NET_HREF_LEN) continue;
+    url_decode(href, play_names[play_count], NET_NAME_LEN);
+    if(!play_name_ok(play_names[play_count])) continue;
+    strcpy(play_hrefs[play_count], href);
+    play_count++;
+  }
+  return play_count > 0;
+}
+
+// the drive the core's menu offers for this kind of file, -1 if none
+static int play_drive(config_menu_t *menu, const char *ext) {
+  if(!menu) return -1;
+  for(config_menu_entry_t *me = menu->entries; me; me = me->next) {
+    if(me->type == CONFIG_MENU_ENTRY_MENU) {
+      int d = play_drive(me->menu, ext);
+      if(d >= 0) return d;
+    }
+    if(me->type == CONFIG_MENU_ENTRY_FILESELECTOR && me->fsel && me->fsel->ext &&
+       me->fsel->index >= 0 && me->fsel->index < MAX_DRIVES)
+      for(char **x = me->fsel->ext; *x; x++)
+        if(!strcasecmp(*x, ext)) return me->fsel->index;
+  }
+  return -1;
+}
+
+// One key into the core, as the US keyboard the C64 core expects: shift
+// held for the C64's ", its * on a key of its own.
+static void play_key(uint8_t usage, bool shift) {
+  if(shift) { kbd_tx_hid_ps2_make(1, 1); vTaskDelay(pdMS_TO_TICKS(30)); }
+  kbd_tx_hid_ps2_make(usage, 0);
+  vTaskDelay(pdMS_TO_TICKS(80));
+  kbd_tx_hid_ps2_break(usage, 0);
+  if(shift) { vTaskDelay(pdMS_TO_TICKS(30)); kbd_tx_hid_ps2_break(1, 1); }
+  vTaskDelay(pdMS_TO_TICKS(80));
+}
+
+static void play_type(const char *s) {
+  for(; *s; s++) {
+    char ch = *s;
+    if(ch >= 'A' && ch <= 'Z')      play_key(0x04 + (ch - 'A'), false);
+    else if(ch >= '1' && ch <= '9') play_key(0x1e + (ch - '1'), false);
+    else if(ch == '0')              play_key(0x27, false);
+    else if(ch == '"')              play_key(0x1f, true);    // shift 2
+    else if(ch == '*')              play_key(0x30, false);
+    else if(ch == ',')              play_key(0x36, false);
+    else if(ch == '\r')             play_key(0x28, false);
+  }
+}
+
+static void play_reset(void) {
+  if(config_get_action("cold_reset")) sys_run_action_by_name("cold_reset");
+  else                                sys_run_action_by_name("reset");
+}
+
+// The first disk into its drive, the machine started afresh.
+static void play_start(const char *name) {
+  char line[96];
+  const char *dot = strrchr(name, '.');
+  const char *ext = dot ? dot + 1 : "";
+  int drive = play_drive(cfg ? cfg->menu : NULL, ext);
+  if(drive < 0) {
+    snprintf(line, sizeof(line), "play: no drive for .%s in this core", ext);
+    net_log(line);
+    snprintf(message, sizeof(message), "No drive for .%s here", ext);
+    net_notify();
+    return;
+  }
+  bool c64 = cfg && cfg->name && !strcasecmp(cfg->name, "C64Nano");
+  bool c64disk = c64 && (!strcasecmp(ext, "d64") || !strcasecmp(ext, "g64"));
+  bool c64prg = c64 && !strcasecmp(ext, "prg");
+  snprintf(line, sizeof(line), "play: %s into drive %d%s", name, drive,
+           c64disk ? ", LOAD and RUN typed" : "");
+  net_log(line);
+
+  char img[NET_NAME_LEN];
+  strcpy(img, name);
+  sdc_set_cwd(drive, CARD_MOUNTPOINT);
+  if(c64prg) {
+    // the core puts a program into memory and runs it: into a machine
+    // that has just started
+    play_reset();
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    sdc_image_open(drive, img);
+    return;
+  }
+  if(sdc_image_open(drive, img) != 0) {
+    snprintf(message, sizeof(message), "Cannot open %s", name);
+    net_notify();
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(200));
+  play_reset();
+  if(!c64disk) return;
+
+  // READY. after about two seconds; then LOAD, and RUN once the drive has
+  // been busy and gone quiet for three seconds -- it asks the card for
+  // sectors while it loads. A game that starts itself gets the RUN in its
+  // keyboard buffer, which games ignore.
+  vTaskDelay(pdMS_TO_TICKS(4000));
+  play_type("LOAD\"*\",8,1\r");
+  uint32_t seen = sdc_sector_requests;
+  TickType_t t0 = xTaskGetTickCount(), last = t0;
+  bool busy = false;
+  while((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(240000)) {
+    vTaskDelay(pdMS_TO_TICKS(250));
+    if(sdc_sector_requests != seen) { seen = sdc_sector_requests; last = xTaskGetTickCount(); busy = true; }
+    if(busy && (xTaskGetTickCount() - last) > pdMS_TO_TICKS(3000)) break;
+    if(!busy && (xTaskGetTickCount() - t0) > pdMS_TO_TICKS(30000)) break;   // nothing asked: loaded at once
+  }
+  play_type("RUN\r");
+  net_log("play: RUN typed");
+}
+
+// One round: ask, and if a game waits, fetch its disks and start it.
+// Returns whether the server could be asked.
+static bool play_round(void) {
+  bool answered = false;
+  netport_select();
+  vTaskDelay(pdMS_TO_TICKS(50));
+  bool got = play_poll(&answered);
+  bool ok = false;
+  if(got) {
+    char line[96];
+    snprintf(line, sizeof(line), "play: %s, %d disk%s", play_names[0], play_count, play_count == 1 ? "" : "s");
+    net_log(line);
+    for(int i = 0; i < play_count; i++) {
+      bool one = download_file(play_names[i], play_hrefs[i], NET_MARK_CARD);
+      if(i == 0) ok = one;
+      if(!one) break;
+    }
+  }
+  net_baud_slow();
+  netport_restore();
+  if(ok) play_start(play_names[0]);
+  return answered;
+}
+
+void netdl_set_play(int s) { play_secs = (s <= 0) ? 0 : (s < 5) ? 5 : (s > 600) ? 600 : s; }
+int netdl_get_play(void) { return play_secs; }
 
 #define REQ_LIST      (-1)
 #define REQ_MSG       (-2)
@@ -1319,6 +1537,8 @@ static void net_task(__attribute__((unused)) void *parms) {
   TickType_t last_nudge = 0;
   TickType_t t0 = xTaskGetTickCount();
   TickType_t next_probe = t0 + pdMS_TO_TICKS(hold_release ? 1500 : 12000);
+  TickType_t next_play = t0 + pdMS_TO_TICKS(30000);
+  int play_fails = 0;
 
   while(1) {
     if(hold_release && (time_set || link_state == LINK_NONE ||
@@ -1397,10 +1617,27 @@ static void net_task(__attribute__((unused)) void *parms) {
       continue;
     }
 
+    // a game waiting at the server? Not while a request runs or the ST
+    // still waits for its clock; after failures less often, a server that
+    // does not know /_/job (not stserve, or an older one) every 5 minutes
+    if(play_secs && server[0] && modem_ip[0] && link_state == LINK_UP && !hold_release &&
+       state != NET_STATE_BUSY && (int32_t)(xTaskGetTickCount() - next_play) >= 0) {
+      if(play_round()) play_fails = 0;
+      else             play_fails++;
+      next_play = xTaskGetTickCount() +
+        pdMS_TO_TICKS(play_fails >= 3 ? 300000 : play_fails ? 60000 : play_secs * 1000);
+      continue;
+    }
+
     int req;
     // wake up now and then while the address is still unknown
     TickType_t wait = hold_release ? pdMS_TO_TICKS(200) :
       ((!modem_ip[0] || !time_set) && link_state != LINK_NONE) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
+    if(play_secs && server[0] && modem_ip[0] && link_state == LINK_UP) {
+      int32_t left = (int32_t)(next_play - xTaskGetTickCount());
+      TickType_t w = (left > 0) ? (TickType_t)left : 1;
+      if(w < wait) wait = w;
+    }
     if(xQueueReceive(req_queue, &req, wait)) {
       // Port 1 only exists while the core routes its serial pins to it.
       // Switch it on for the request regardless of the menu, and put the

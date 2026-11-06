@@ -157,6 +157,14 @@ int inifile_read(char *name) {
       if(strncasecmp(buffer, "clockwait=", 10) == 0)
 	netdl_set_clock_wait(atoi(buffer+10));
 
+      // every so many seconds ask stserve for a game to play, "on" = 10,
+      // see net.c, play_round()
+      if(strncasecmp(buffer, "play=", 5) == 0) {
+	char *p = buffer+5;
+	while(*p && iswhite(*p)) p++;
+	netdl_set_play(!strncasecmp(p, "on", 2) ? 10 : !strncasecmp(p, "off", 3) ? 0 : atoi(p));
+      }
+
       // the WiFi the modem should join, "Net,Password" (a password may hold
       // spaces, so only the line end is trimmed), see net.c
       if(strncasecmp(buffer, "wifi=", 5) == 0) {
@@ -272,6 +280,14 @@ int inifile_write(char *name) {
       char str[48];
       f_puts("\n; seconds the ST's start waits for the clock from the modem (0 = not at all)\n", &file);
       sprintf(str, "clockwait=%d\n", netdl_get_clock_wait());
+      f_puts(str, &file);
+    }
+
+    // asking stserve for a game to play, kept if it is on
+    if(netdl_get_play()) {
+      char str[48];
+      f_puts("\n; seconds between two questions to stserve for a game to play (off = never)\n", &file);
+      sprintf(str, "play=%d\n", netdl_get_play());
       f_puts(str, &file);
     }
 

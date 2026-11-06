@@ -39,6 +39,9 @@ void netdl_set_timezone(const char *tz);   // a Zimodem time zone code from the 
 const char *netdl_get_timezone(void);
 const char *netdl_link_text(void);
 void netdl_set_clock_wait(int s);
+// play=: every so many seconds ask stserve for a game to play, 0 = never
+void netdl_set_play(int s);
+int netdl_get_play(void);
 int netdl_get_clock_wait(void);
 bool netdl_hold_start(void (*release)(void));
 const char *netdl_get_ip(void);
