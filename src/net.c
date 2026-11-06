@@ -280,6 +280,7 @@ static void net_port_reset(void) {
 
 static bool wifi_none = false;      // the modem has no network configured
 static char modem_ip[20];           // from the modem's "CONNECTED TO <ssid> (<ip>)"
+static char modem_version[16];      // from "Zimodem ESP32 Firmware v4.0.3", for the status
 static char tz_cfg[12];             // time zone code for the modem's clock, from the ini
 static bool time_set = false;       // the ST's clock has been set from the modem
 // What the OSD tells about the line to the modem. Joining a network takes
@@ -415,7 +416,14 @@ static bool modem_ati(void) {
   wifi_down = false;
   while(net_read_line(line, sizeof(line), 3000)) {
     debugf("NET: ATI '%s'", line);
-    if(strstr(line, "Zimodem") || strstr(line, "zimodem")) modem = MODEM_ZIMODEM;
+    if(strstr(line, "Zimodem") || strstr(line, "zimodem")) {
+      modem = MODEM_ZIMODEM;
+      const char *v = strstr(line, "Firmware v");
+      if(v) {
+        snprintf(modem_version, sizeof(modem_version), "%s", v + 10);
+        modem_version[strcspn(modem_version, " \r\n")] = 0;
+      }
+    }
     if(strstr(line, "AT version") || strstr(line, "SDK version")) modem = MODEM_ESPAT;
     // Zimodem reports its WiFi as "CONNECTED TO <ssid> (<ip>)" or "ERROR ON <ssid>",
     // and "INITIALIZED" when it has no network at all
@@ -1120,6 +1128,7 @@ static void fetch_list(void) {
 
 static FIL dl_file;
 static bool dl_open;
+static char last_file[NET_NAME_LEN];   // the last file that arrived whole, for the status
 // The download goes to the USB stick. The stick hangs on the companion
 // itself: no core reads it, so it needs no sdc_lock(), which would only
 // hold the core's floppy up.
@@ -1231,6 +1240,7 @@ static bool download_file(const char *name, const char *url, uint8_t mark) {
   dl_open = false;
 
   if(ok) {
+    snprintf(last_file, sizeof(last_file), "%s", name);
     snprintf(message, sizeof(message), "%s: %lu bytes%s", name, (unsigned long)bytes_done, dl_usb ? " on USB" : "");
     state = NET_STATE_DONE;
   } else
@@ -1300,6 +1310,78 @@ static bool job_sink(const unsigned char *data, int len) {
   return true;
 }
 
+/* ---- the device status, for stserve's catalogue in the browser ----
+   With every question for a game to play, once after start-up and after
+   every download the companion tells the server what it is: the core, its
+   own commit and board, the modem's firmware and address, the WiFi signal
+   at the last fetch, the image in the first drive and the last file that
+   arrived. As a query on the request, kept short: Zimodem takes 256
+   characters per command, the address and the quotes included. */
+#ifndef COMPANION_VERSION
+#define COMPANION_VERSION "unknown"
+#endif
+#if defined(TANG_NANO20K_V3923)
+#define COMPANION_BOARD "3923"
+#elif defined(TANG_NANO20K)
+#define COMPANION_BOARD "3921"
+#else
+#define COMPANION_BOARD "other"
+#endif
+
+// s into out as a query value, at most max characters of out
+static void query_add(char *out, size_t size, const char *key, const char *s, size_t max) {
+  size_t o = strlen(out);
+  if(!s || !*s || o + strlen(key) + 3 >= size) return;
+  o += snprintf(out + o, size - o, "%s%s=", o ? "&" : "", key);
+  size_t start = o;
+  for(; *s && o + 4 < size && o - start + 3 <= max; s++) {
+    unsigned char ch = (unsigned char)*s;
+    if(isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') out[o++] = ch;
+    else o += snprintf(out + o, size - o, "%%%02X", ch);
+  }
+  out[o] = 0;
+}
+
+static void status_query(char *q, size_t size) {
+  char num[16];
+  q[0] = 0;
+  query_add(q, size, "c", cfg ? cfg->name : NULL, 16);
+  query_add(q, size, "v", COMPANION_VERSION, 12);
+  query_add(q, size, "b", COMPANION_BOARD, 6);
+  query_add(q, size, "m", modem_version, 12);
+  query_add(q, size, "i", modem_ip, 16);
+  if(fetch_have_rssi) { snprintf(num, sizeof(num), "%d", fetch_rssi); query_add(q, size, "r", num, 5); }
+  snprintf(num, sizeof(num), "%lu", (unsigned long)(xTaskGetTickCount() / pdMS_TO_TICKS(60000)));
+  query_add(q, size, "u", num, 6);
+  snprintf(num, sizeof(num), "%d", play_secs);
+  query_add(q, size, "p", num, 4);
+  const char *img = sdc_get_image_name(0);
+  if(img) {
+    const char *b = strrchr(img, '/');
+    query_add(q, size, "d", b ? b + 1 : img, 36);
+  }
+  query_add(q, size, "l", last_file, 36);
+}
+
+// The status alone, for when no question for a game goes out: quiet,
+// and whatever the server answers is of no interest. A server that is not
+// stserve answers 404, which is fine too.
+static void status_report(void) {
+  char path[200];
+  char msg[sizeof(message)], to[sizeof(fetch_to)], res[sizeof(fetch_result)];
+  int rssi = fetch_rssi;
+  bool have = fetch_have_rssi;
+  strcpy(msg, message); strcpy(to, fetch_to); strcpy(res, fetch_result);
+  strcpy(path, "_/hello?");
+  status_query(path + 8, sizeof(path) - 8);
+  job_len = 0;
+  net_quiet = true;
+  http_get(path, job_sink);
+  net_quiet = false;
+  strcpy(message, msg); strcpy(fetch_to, to); strcpy(fetch_result, res);
+  fetch_rssi = rssi; fetch_have_rssi = have;
+}
+
 // a name that can only be a file in the card's root
 static bool play_name_ok(const char *name) {
   return name[0] && name[0] != '.' && !strpbrk(name, "/\\:*?\"<>|");
@@ -1314,9 +1396,12 @@ static bool play_poll(bool *answered) {
   bool have = fetch_have_rssi;
   strcpy(msg, message); strcpy(to, fetch_to); strcpy(res, fetch_result);
 
+  char path[200];
+  strcpy(path, "_/job?");
+  status_query(path + 6, sizeof(path) - 6);
   job_len = 0;
   net_quiet = true;
-  bool ok = http_get("_/job", job_sink);
+  bool ok = http_get(path, job_sink);
   net_quiet = false;
 
   strcpy(message, msg); strcpy(fetch_to, to); strcpy(fetch_result, res);
@@ -1539,6 +1624,7 @@ static void net_task(__attribute__((unused)) void *parms) {
   TickType_t next_probe = t0 + pdMS_TO_TICKS(hold_release ? 1500 : 12000);
   TickType_t next_play = t0 + pdMS_TO_TICKS(30000);
   int play_fails = 0;
+  bool reported = false;          // the status went to the server once
 
   while(1) {
     if(hold_release && (time_set || link_state == LINK_NONE ||
@@ -1617,6 +1703,19 @@ static void net_task(__attribute__((unused)) void *parms) {
       continue;
     }
 
+    // the status once after start-up, see status_report(); with play= the
+    // questions for a game carry it anyway
+    if(!reported && !play_secs && server[0] && modem_ip[0] && link_state == LINK_UP &&
+       !hold_release && state != NET_STATE_BUSY) {
+      reported = true;
+      netport_select();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      status_report();
+      net_baud_slow();
+      netport_restore();
+      continue;
+    }
+
     // a game waiting at the server? Not while a request runs or the ST
     // still waits for its clock; after failures less often, a server that
     // does not know /_/job (not stserve, or an older one) every 5 minutes
@@ -1647,7 +1746,11 @@ static void net_task(__attribute__((unused)) void *parms) {
 
       if(req == REQ_LIST)          fetch_list();
       else if(req == REQ_MSG)      display_message();
-      else                         download(req);
+      else {
+        download(req);
+        // the server learns what arrived, see status_report()
+        if(state == NET_STATE_DONE && last_file[0]) status_report();
+      }
 
       // the ST expects its modem at 19200 again
       net_baud_slow();

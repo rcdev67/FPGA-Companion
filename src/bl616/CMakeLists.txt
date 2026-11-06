@@ -30,6 +30,17 @@ else()
    message(FATAL_ERROR "TANG_BOARD must be mega60k, mega138kpro, console60k, primer25k, nano20k, nano20k_v3923 or m0sdock")
 endif()
 
+# The commit the companion is built from, for the device status it sends
+# stserve (net.c, status_query()). "unknown" without git.
+execute_process(COMMAND git rev-parse --short=7 HEAD
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE COMPANION_GIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT COMPANION_GIT)
+    set(COMPANION_GIT "unknown")
+endif()
+add_definitions(-DCOMPANION_VERSION=\"${COMPANION_GIT}\")
+
 find_package(bouffalo_sdk REQUIRED HINTS $ENV{BL_SDK_BASE})
 sdk_add_include_directories($ENV{BL_SDK_BASE}/components/net/lwip/lwip/src/include)
 sdk_add_include_directories(. ../u8g2/csrc)
