@@ -149,8 +149,10 @@ or two, which nobody notices in a game -- but a terminal program online
 over the modem loses its connection to it. Leave `play=` off on a machine
 that runs one. The questions are quiet: they leave nothing in
 `NETLOG.TXT`, the menu or the status display; a game fetched leaves its
-lines there as any download does. A server that is not stserve, or not
-reachable, is asked every five minutes only.
+lines there as any download does. After a failed question the next one
+comes 15 s later, after three a minute later, after ten every five
+minutes; `NETLOG.TXT` notes the third failure with its reason and the
+recovery.
 
 The answer can carry jobs for the SD card as well, from stserve's page
 *SD card*: send the list of the card's root, send a file (the last 16 KB
