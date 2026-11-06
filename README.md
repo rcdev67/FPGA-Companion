@@ -12,11 +12,29 @@ DEV25K, and Console 60k/138k. A built-in FTP server allows files to be copied
 to the SD card. A Telnet server is also built in, allowing clients to monitor
 debug messages.
 
-This fork adds a way to load files from a PC onto the SD card over WiFi
-on the Tang Nano 20K, using an ESP32-C3 or ESP32-S3 running Zimodem as
-the network: see [DOWNLOAD.md](DOWNLOAD.md). It needs the matching core
-from the [MiSTeryNano fork](https://github.com/rcdev67/MiSTeryNano),
-branch `nano20k-running`.
+This fork (branch `net-download`) is the companion of
+[MISTrcdev](https://github.com/rcdev67/MISTrcdev): a C64 and an Atari ST on
+the Tang Nano 20K with its onboard BL616, built and tested for that board
+only. What it adds:
+
+- **Files from a server over WiFi**, through an ESP32-S3 running our
+  [Zimodem fork](https://github.com/rcdev67/Zimodem) on the core's network
+  port: folders, the SD card or a USB stick as the target, and with
+  stserve one click to play, the SD card from the browser and save games
+  back to the server -- see [DOWNLOAD.md](DOWNLOAD.md).
+- **Bluetooth** keyboards, mice and controllers through a USB adapter
+  (RTL8761B) on the hub, classic and Low Energy, up to four at once.
+- **Change core**: a core from the USB stick into the FPGA's flash, for
+  good.
+- The ST's clock from the network, a German keyboard layout, USB hubs with
+  up to 16 ports, *From USB* to copy a file onto the card.
+
+It needs the matching cores from the
+[MiSTeryNano fork](https://github.com/rcdev67/MiSTeryNano) and the
+[C64Nano fork](https://github.com/rcdev67/C64Nano), branch
+`nano20k-running`. What the whole setup does better and worse than
+upstream is in
+[MISTrcdev/DIFFERENCES.md](https://github.com/rcdev67/MISTrcdev/blob/main/DIFFERENCES.md).
 
 The Tang Nano 20K comes in two board versions, 3921 and 3923, that need
 different companion images: see [TANG_NANO_20K.md](TANG_NANO_20K.md) for
