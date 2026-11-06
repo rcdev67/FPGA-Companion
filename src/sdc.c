@@ -496,6 +496,87 @@ static inline char *StrDup(const char *s) {
   return res;
 }
 
+/* ---- images the core has written, for a backup on the server ----
+   One record a drive while its image is in it, and a few for images taken
+   out after being written, which are still to go. net.c asks for the next
+   one that has been quiet for a while (sdc_save_next()) and says how it
+   went (sdc_save_done()). The file system lock guards them. */
+#define SDC_SAVES (MAX_DRIVES + 4)
+static struct {
+  char *path;               // the image's full path on the card
+  uint32_t writes;          // sectors written since the last backup
+  TickType_t last;          // when the last one was written
+  bool skip;                // never backed up: too big, say
+} saves[SDC_SAVES];
+
+static void sdc_note_write(int drive) {          // the lock is held
+  if(!saves[drive].path && image_name[drive] && cwd[drive]) {
+    char *p = pvPortMalloc(strlen(cwd[drive]) + strlen(image_name[drive]) + 2);
+    if(!p) return;
+    strcpy(p, cwd[drive]);
+    strcat(p, "/");
+    strcat(p, image_name[drive]);
+    saves[drive].path = p;
+    saves[drive].skip = false;
+  }
+  if(saves[drive].skip) return;
+  saves[drive].writes++;
+  saves[drive].last = xTaskGetTickCount();
+}
+
+// the drive gets another image: a written one still to go keeps a record
+// of its own, otherwise the record is gone
+static void sdc_save_eject(int drive) {          // the lock is held
+  if(drive >= MAX_DRIVES || !saves[drive].path) return;
+  if(saves[drive].writes && !saves[drive].skip) {
+    int slot = MAX_DRIVES;
+    for(int i = MAX_DRIVES; i < SDC_SAVES; i++) {
+      if(!saves[i].path) { slot = i; break; }
+      if(saves[i].last < saves[slot].last) slot = i;   // all taken: the oldest goes
+    }
+    if(saves[slot].path) vPortFree(saves[slot].path);
+    saves[slot] = saves[drive];
+  } else
+    vPortFree(saves[drive].path);
+  memset(&saves[drive], 0, sizeof(saves[drive]));
+}
+
+int sdc_save_next(char *path, size_t size, uint32_t quiet_ms, uint32_t *stamp) {
+  int slot = -1;
+  sdc_lock();
+  TickType_t now = xTaskGetTickCount();
+  for(int i = 0; i < SDC_SAVES; i++)
+    if(saves[i].path && saves[i].writes && !saves[i].skip &&
+       (now - saves[i].last) >= pdMS_TO_TICKS(quiet_ms) &&
+       (slot < 0 || saves[i].last < saves[slot].last))
+      slot = i;
+  if(slot >= 0) {
+    snprintf(path, size, "%s", saves[slot].path);
+    *stamp = saves[slot].writes;
+  }
+  sdc_unlock();
+  return slot;
+}
+
+void sdc_save_done(int slot, uint32_t stamp, int how) {
+  if(slot < 0 || slot >= SDC_SAVES) return;
+  sdc_lock();
+  if(saves[slot].path) {
+    if(how < 0) {                      // never: written or not
+      saves[slot].skip = true;
+      saves[slot].writes = 0;
+    } else if(how > 0 && saves[slot].writes == stamp) {
+      saves[slot].writes = 0;          // nothing written since it was read
+      if(slot >= MAX_DRIVES) {
+        vPortFree(saves[slot].path);
+        memset(&saves[slot], 0, sizeof(saves[slot]));
+      }
+    }
+    // how == 0: failed, it stays to go
+  }
+  sdc_unlock();
+}
+
 void sdc_set_default(int drive, const char *name) {
   sdc_debugf("set default %d: %s", drive, name);
   if(drive >= MAX_DRIVES+MAX_IMAGES) return;
@@ -665,7 +746,15 @@ int sdc_handle_event(void) {
   unsigned char request = mcu_hw_spi_tx_u08(0);
   unsigned long rsector = 0;
   for(int i=0;i<4;i++) rsector = (rsector << 8) | mcu_hw_spi_tx_u08(0); 
+  // Two more bytes: the fifth marks that the sixth is there (its top bit
+  // the inverted top bit of the sector), the sixth has the core's pending
+  // write in bit 0 -- see sd_card.v in both cores. A request with it is
+  // the core writing to the image, which then is to be backed up.
+  unsigned char more = mcu_hw_spi_tx_u08(0);
+  unsigned char flags = mcu_hw_spi_tx_u08(0);
   mcu_hw_spi_end();
+  bool core_writes = request && !(more & 0x7f) &&
+                     ((more >> 7) == (((rsector >> 7) & 1) ^ 1)) && (flags & 1);
 
   if(request) {
     int drive = 0;
@@ -692,6 +781,7 @@ int sdc_handle_event(void) {
       sdc_unlock();
       return -1;
     }
+    if(core_writes && drive < MAX_DRIVES) sdc_note_write(drive);
 
     // ---- figure out which physical sector to use ----
 
@@ -903,6 +993,7 @@ int sdc_image_open(int drive, char *name) {
     vPortFree(lktbl[drive]);
     lktbl[drive] = NULL;
   }
+  sdc_save_eject(drive);
   sdc_unlock();
 
   if(drive < MAX_DRIVES+MAX_IMAGES) {

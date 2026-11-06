@@ -42,6 +42,8 @@ void netdl_set_clock_wait(int s);
 // play=: every so many seconds ask stserve for a game to play, 0 = never
 void netdl_set_play(int s);
 int netdl_get_play(void);
+void netdl_set_save(bool on);       // ini save=: written disk images go back to stserve
+bool netdl_get_save(void);
 int netdl_get_clock_wait(void);
 bool netdl_hold_start(void (*release)(void));
 const char *netdl_get_ip(void);

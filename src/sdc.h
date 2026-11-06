@@ -34,6 +34,11 @@ void sdc_set_default(int drive, const char *name);
 void sdc_mount_defaults(void);
 bool sdc_image_upload_in_progress(void);
 extern uint32_t sdc_sector_requests;   // sectors the core has asked for
+// images the core has written, for a backup on the server, see sdc.c:
+// the next one quiet for quiet_ms (its path, a stamp; -1 if none), and how
+// it went: 1 backed up, 0 failed (it stays to go), -1 never
+int sdc_save_next(char *path, size_t size, uint32_t quiet_ms, uint32_t *stamp);
+void sdc_save_done(int slot, uint32_t stamp, int how);
 bool sdc_check_for_pending_image_uploads(void);
 
 #endif // SDC_H

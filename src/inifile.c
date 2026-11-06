@@ -165,6 +165,13 @@ int inifile_read(char *name) {
 	netdl_set_play(!strncasecmp(p, "on", 2) ? 10 : !strncasecmp(p, "off", 3) ? 0 : atoi(p));
       }
 
+      // disk images the machine has written go back to stserve, see net.c
+      if(strncasecmp(buffer, "save=", 5) == 0) {
+	char *p = buffer+5;
+	while(*p && iswhite(*p)) p++;
+	netdl_set_save(!strncasecmp(p, "on", 2) || *p == '1');
+      }
+
       // the WiFi the modem should join, "Net,Password" (a password may hold
       // spaces, so only the line end is trimmed), see net.c
       if(strncasecmp(buffer, "wifi=", 5) == 0) {
@@ -289,6 +296,12 @@ int inifile_write(char *name) {
       f_puts("\n; seconds between two questions to stserve for a game to play (off = never)\n", &file);
       sprintf(str, "play=%d\n", netdl_get_play());
       f_puts(str, &file);
+    }
+
+    // written disk images back to stserve, kept if it is on
+    if(netdl_get_save()) {
+      f_puts("\n; disk images the machine has written go back to stserve (on/off)\n", &file);
+      f_puts("save=on\n", &file);
     }
 
     // the modem's network, kept if one was set

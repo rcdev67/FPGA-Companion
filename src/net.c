@@ -1350,6 +1350,8 @@ static void query_add(char *out, size_t size, const char *key, const char *s, si
   out[o] = 0;
 }
 
+static char last_saved[40];      // the last image that went back, see save_round()
+
 static void status_query(char *q, size_t size) {
   char num[16];
   q[0] = 0;
@@ -1363,12 +1365,14 @@ static void status_query(char *q, size_t size) {
   query_add(q, size, "u", num, 6);
   snprintf(num, sizeof(num), "%d", play_secs);
   query_add(q, size, "p", num, 4);
+  query_add(q, size, "s", save_on ? (save_no_put ? "x" : "1") : "0", 1);
   const char *img = sdc_get_image_name(0);
   if(img) {
     const char *b = strrchr(img, '/');
     query_add(q, size, "d", b ? b + 1 : img, 36);
   }
   query_add(q, size, "l", last_file, 36);
+  query_add(q, size, "w", last_saved, 36);
 }
 
 // The status alone, for when no question for a game goes out: quiet,
@@ -1854,6 +1858,169 @@ static bool play_round(void) {
 void netdl_set_play(int s) { play_secs = (s <= 0) ? 0 : (s < 5) ? 5 : (s > 600) ? 600 : s; }
 int netdl_get_play(void) { return play_secs; }
 
+/* ---- save games: written disk images back to stserve, save=on ----
+   A game that saves writes into its disk image on the card. Once the
+   drive has been quiet for SAVE_QUIET_MS -- or the image has been taken
+   out -- the whole image goes to stserve, which keeps the last few of
+   every one (see sdc_save_next()). The way up is Zimodem's AT+PUT: the
+   image over XMODEM into the modem's memory, from there in one POST. A
+   Zimodem without it answers ERROR, and then saving stays off until the
+   next start, with a line in NETLOG. Images over SAVE_MAX (a hard disk)
+   are never sent. */
+#define SAVE_QUIET_MS 30000
+#define SAVE_MAX      (4UL * 1024 * 1024)   // Zimodem's XPUT_MAX
+static bool save_on = false;
+static bool save_no_put = false;            // the modem knows no AT+PUT
+
+void netdl_set_save(bool on) { save_on = on; }
+bool netdl_get_save(void) { return save_on; }
+
+// 1 sent, 0 failed (again later), -1 never; why says what happened
+static int save_image(const char *path, char *why, size_t wsize) {
+  const char *name = strrchr(path, '/');
+  name = name ? name + 1 : path;
+  FIL f;
+  sdc_lock();
+  FRESULT r = f_open(&f, path, FA_OPEN_EXISTING | FA_READ);
+  FSIZE_t size = (r == FR_OK) ? f_size(&f) : 0;
+  sdc_unlock();
+  if(r != FR_OK) { snprintf(why, wsize, "cannot open it, f%d", r); return -1; }
+  int res = 0;
+  char host[NET_SERVER_LEN], base[NET_PATH_LEN], line[NET_LINE_LEN];
+  int port;
+  if(size == 0 || size > SAVE_MAX) {
+    snprintf(why, wsize, "%lu bytes, too big to go", (unsigned long)size);
+    res = -1;
+    goto out;
+  }
+  snprintf(why, wsize, "no server in the ini");
+  if(!net_server_parse(host, sizeof(host), &port, base, sizeof(base))) goto out;
+
+  {
+    char q[160], cmd[256];
+    q[0] = 0;
+    query_add(q, sizeof(q), "i", modem_ip, 16);
+    query_add(q, sizeof(q), "c", cfg ? cfg->name : NULL, 16);
+    query_add(q, sizeof(q), "name", name, 90);
+    int n = snprintf(cmd, sizeof(cmd), "AT+PUT:%lu:http://%s:%d/%s_/save?%s",
+                     (unsigned long)size, host, port, base, q);
+    if(n < 0 || n >= 250) { snprintf(why, wsize, "the name is too long for the modem"); res = -1; goto out; }
+
+    snprintf(why, wsize, "no modem");
+    if(!modem_detect()) goto out;
+    net_baud_fast();
+    net_flush();
+    net_puts(cmd);
+    net_puts("\r");
+
+    // "XMODEM <size>", then the modem asks with 'C'
+    bool go = false;
+    while(net_read_line(line, sizeof(line), 5000)) {
+      if(!strncmp(line, "XMODEM ", 7)) { go = true; break; }
+      if(!strcmp(line, "ERROR")) {
+        save_no_put = true;
+        snprintf(why, wsize, "the modem knows no AT+PUT -- Zimodem fa26b16 or later is needed");
+        goto out;
+      }
+      if(!strncmp(line, "PUT ", 4)) { snprintf(why, wsize, "modem: %.40s", line + 4); goto out; }
+    }
+    if(!go) { snprintf(why, wsize, "the modem did not take AT+PUT"); goto out; }
+    unsigned char b = 0;
+    TickType_t t0 = xTaskGetTickCount();
+    while(b != XM_CRC && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(16000))
+      if(!net_getc(&b, 2000)) b = 0;
+    if(b != XM_CRC) { snprintf(why, wsize, "the modem did not start XMODEM"); goto out; }
+    net_flush();
+
+    // the blocks, 1 KB each with a CRC, the last one filled up with ^Z
+    static unsigned char blk[3 + 1024 + 2];
+    in_body = true;
+    bool sent = true;
+    uint8_t no = 1;
+    for(FSIZE_t off = 0; off < size && sent; off += 1024, no++) {
+      UINT got = 0;
+      sdc_lock();
+      r = f_lseek(&f, off);
+      if(r == FR_OK) r = f_read(&f, blk + 3, 1024, &got);
+      sdc_unlock();
+      if(r != FR_OK) { snprintf(why, wsize, "reading at %lu, f%d", (unsigned long)off, r); sent = false; break; }
+      if(got < 1024) memset(blk + 3 + got, 0x1a, 1024 - got);
+      blk[0] = XM_STX; blk[1] = no; blk[2] = (uint8_t)~no;
+      uint16_t crc = crc16_xmodem(blk + 3, 1024);
+      blk[1027] = crc >> 8; blk[1028] = crc & 0xff;
+      bool acked = false;
+      for(int tries = 0; tries < 10 && !acked && sent; tries++) {
+        net_write((const char *)blk, sizeof(blk));
+        TickType_t tw = xTaskGetTickCount();
+        while((xTaskGetTickCount() - tw) < pdMS_TO_TICKS(10000)) {
+          if(!net_getc(&b, 10000)) break;
+          if(b == XM_ACK) { acked = true; break; }
+          if(b == XM_NAK) break;
+          if(b == XM_CAN) { snprintf(why, wsize, "the modem cancelled at %lu", (unsigned long)off); sent = false; break; }
+          // anything else, a late 'C' say: not an answer
+        }
+      }
+      if(!acked && sent) { snprintf(why, wsize, "no answer to the block at %lu", (unsigned long)off); sent = false; }
+    }
+    if(sent) {
+      bool done = false;
+      for(int tries = 0; tries < 5 && !done; tries++) {
+        xm_put(XM_EOT);
+        if(net_getc(&b, 3000) && b == XM_ACK) done = true;
+      }
+      if(!done) { snprintf(why, wsize, "the modem did not take the end"); sent = false; }
+    } else {
+      xm_put(XM_CAN); xm_put(XM_CAN); xm_put(XM_CAN);
+    }
+    in_body = false;
+    if(!sent) goto out;
+
+    // the modem posts it and says how that went: "POST <code> ...", then
+    // OK or ERROR
+    snprintf(why, wsize, "no word from the modem after the transfer");
+    while(net_read_line(line, sizeof(line), 90000)) {
+      if(!strncmp(line, "POST ", 5) || !strncmp(line, "PUT ", 4)) snprintf(why, wsize, "%.60s", line);
+      if(!strcmp(line, "OK")) { res = 1; break; }
+      if(!strcmp(line, "ERROR")) break;
+    }
+  }
+
+out:
+  sdc_lock();
+  f_close(&f);
+  sdc_unlock();
+  return res;
+}
+
+// One round: the next image to go, if there is one.
+static int save_fails = 0;
+
+static void save_round(void) {
+  char path[160], why[80], l[200];
+  uint32_t stamp = 0;
+  int slot = sdc_save_next(path, sizeof(path), SAVE_QUIET_MS, &stamp);
+  if(slot < 0) return;
+  const char *name = strrchr(path, '/');
+  name = name ? name + 1 : path;
+  netport_select();
+  vTaskDelay(pdMS_TO_TICKS(50));
+  bool quiet = net_quiet;
+  net_quiet = true;
+  TickType_t t0 = xTaskGetTickCount();
+  int how = save_image(path, why, sizeof(why));
+  net_quiet = quiet;
+  sdc_save_done(slot, stamp, how);
+  // the catalogue learns what went, see status_report()
+  if(how > 0) { snprintf(last_saved, sizeof(last_saved), "%s", name); status_report(); }
+  net_baud_slow();
+  netport_restore();
+  snprintf(l, sizeof(l), "save: %s %s in %lu s, %s", name,
+           how > 0 ? "sent" : how < 0 ? "not sent" : "FAILED",
+           (unsigned long)((xTaskGetTickCount() - t0) / pdMS_TO_TICKS(1000)), why);
+  net_log(l);
+  save_fails = (how == 0) ? save_fails + 1 : 0;
+}
+
 #define REQ_LIST      (-1)
 #define REQ_MSG       (-2)
 
@@ -1922,6 +2089,7 @@ static void net_task(__attribute__((unused)) void *parms) {
   TickType_t next_probe = t0 + pdMS_TO_TICKS(hold_release ? 1500 : 12000);
   TickType_t next_play = t0 + pdMS_TO_TICKS(30000);
   int play_fails = 0;
+  TickType_t next_save = t0 + pdMS_TO_TICKS(60000);
   bool reported = false;          // the status went to the server once
 
   while(1) {
@@ -2041,12 +2209,26 @@ static void net_task(__attribute__((unused)) void *parms) {
       continue;
     }
 
+    // a written disk image to go back? Every few seconds a look, after
+    // failures less often
+    if(save_on && !save_no_put && server[0] && modem_ip[0] && link_state == LINK_UP &&
+       !hold_release && state != NET_STATE_BUSY && (int32_t)(xTaskGetTickCount() - next_save) >= 0) {
+      save_round();
+      next_save = xTaskGetTickCount() +
+        pdMS_TO_TICKS(save_fails >= 3 ? 600000 : save_fails ? 60000 : 5000);
+    }
+
     int req;
     // wake up now and then while the address is still unknown
     TickType_t wait = hold_release ? pdMS_TO_TICKS(200) :
       ((!modem_ip[0] || !time_set) && link_state != LINK_NONE) ? pdMS_TO_TICKS(1000) : 0xffffffffUL;
     if(play_secs && server[0] && modem_ip[0] && link_state == LINK_UP) {
       int32_t left = (int32_t)(next_play - xTaskGetTickCount());
+      TickType_t w = (left > 0) ? (TickType_t)left : 1;
+      if(w < wait) wait = w;
+    }
+    if(save_on && !save_no_put && server[0] && modem_ip[0] && link_state == LINK_UP) {
+      int32_t left = (int32_t)(next_save - xTaskGetTickCount());
       TickType_t w = (left > 0) ? (TickType_t)left : 1;
       if(w < wait) wait = w;
     }
