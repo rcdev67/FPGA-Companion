@@ -152,6 +152,14 @@ that runs one. The questions are quiet: they leave nothing in
 lines there as any download does. A server that is not stserve, or not
 reachable, is asked every five minutes only.
 
+The answer can carry jobs for the SD card as well, from stserve's page
+*SD card*: send the list of the card's root, send a file (the last 16 KB
+of a longer one), delete, rename, or fetch a file uploaded in the browser
+onto the card. The list and the files go to the server by POST over a
+plain connection through the modem, at 19200 baud -- Zimodem's own fetch
+only sends a request line. An image one of the drives has open is left
+alone. NETLOG.TXT notes every job, `card: D Xenon.ST`.
+
 Every question also tells stserve what the computer is, for the
 catalogue's list of computers: the core, the companion's commit and board,
 Zimodem's version and address, the WiFi signal at the last fetch, the
