@@ -174,7 +174,7 @@ static bool net_read_line(char *line, int max, int timeout_ms) {
 static bool net_quiet = false;
 
 static void net_notify(void) {
-  if(!net_quiet) net_notify();
+  if(!net_quiet) menu_notify(MENU_EVENT_NET_UPDATE);
 }
 
 static void net_log(const char *line) {
@@ -198,16 +198,20 @@ static void net_set_message(const char *msg) {
 
 // send a command and wait for a final reply line: true on "OK" or the
 // expected prefix, false on "ERROR", "NO CARRIER" or timeout
+static char modem_last[32];        // the modem's last reply line, for NETLOG
+
 static bool modem_cmd(const char *cmd, const char *expect, int timeout_ms) {
   char line[NET_LINE_LEN];
 
   net_flush();
   net_puts(cmd);
   net_puts("\r");
+  strcpy(modem_last, "nothing");
 
   while(net_read_line(line, sizeof(line), timeout_ms)) {
     debugf("NET: modem '%s'", line);
     if(!strcmp(line, cmd)) continue;        // the modem's echo of the command
+    snprintf(modem_last, sizeof(modem_last), "%s", line);
     if(expect && !strncmp(line, expect, strlen(expect))) return true;
     if(!strcmp(line, "OK")) return true;
     // a bare ERROR only: Zimodem's "ERROR ON <ssid>" is a status line
@@ -1503,15 +1507,24 @@ static bool card_in_use(const char *name) {
 }
 
 // POST body to path on the server, over a plain connection: the request,
-// then only the status line of the answer. True on 200.
+// then only the status line of the answer. True on 200; else post_why
+// says what went wrong, for NETLOG.
+static char post_why[64];
+
 static bool http_post(const char *path, const char *body, int len) {
   char host[NET_SERVER_LEN];
   int port;
   char base[NET_PATH_LEN], line[NET_LINE_LEN];
+  strcpy(post_why, "no server in the ini");
   if(!net_server_parse(host, sizeof(host), &port, base, sizeof(base))) return false;
+  strcpy(post_why, "no modem");
   if(!modem_detect()) return false;
   net_baud_slow();                     // the stream at 19200, flow is the core's
-  if(!modem_connect(host, port)) { net_flush(); return false; }
+  if(!modem_connect(host, port)) {
+    snprintf(post_why, sizeof(post_why), "no connection, modem: %s", modem_last);
+    net_flush();
+    return false;
+  }
   // Zimodem rearranges its serial side when it enters the stream, see
   // http_get()
   vTaskDelay(pdMS_TO_TICKS(400));
@@ -1527,11 +1540,17 @@ static bool http_post(const char *path, const char *body, int len) {
     net_write(body + o, (len - o > 256) ? 256 : len - o);
   in_body = false;
   int status = 0;
+  char first[24] = "nothing";
+  bool any = false;
   TickType_t t0 = xTaskGetTickCount();
   while(!status && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(15000) &&
-        net_read_line(line, sizeof(line), 15000))
+        net_read_line(line, sizeof(line), 15000)) {
+    if(!any) { snprintf(first, sizeof(first), "%s", line); any = true; }
     if(!strncmp(line, "HTTP/1.", 7)) status = atoi(line + 9);
+  }
   modem_hangup();
+  if(!status) snprintf(post_why, sizeof(post_why), "no answer from the server, got: %s", first);
+  else        snprintf(post_why, sizeof(post_why), "the server says %d", status);
   return status == 200;
 }
 
@@ -1566,8 +1585,8 @@ static void card_send_list(void) {
   snprintf(path, sizeof(path), "_/card/list?i=%s&n=%d", modem_ip, files);
   bool ok = http_post(path, buf, n);
   vPortFree(buf);
-  char l[64];
-  snprintf(l, sizeof(l), "card: list of %d sent%s", files, ok ? "" : ", FAILED");
+  char l[128];
+  snprintf(l, sizeof(l), "card: list of %d sent%s%s", files, ok ? "" : ", FAILED: ", ok ? "" : post_why);
   net_log(l);
 }
 
@@ -1603,7 +1622,7 @@ static void card_send_file(const char *name) {
            (unsigned long)size, (unsigned long)from, q);
   bool ok = http_post(path, buf, (int)got);
   vPortFree(buf);
-  card_result(ok ? "READ %s: sent%s\n" : "READ %s: sending failed%s\n", name, NULL);
+  card_result(ok ? "READ %s: sent%s\n" : "READ %s: sending failed, %s\n", name, ok ? NULL : post_why);
 }
 
 // The jobs of the last answer, in order, then the list.
@@ -1638,7 +1657,8 @@ static void card_jobs_run(void) {
       break;
     }
     char l[NET_NAME_LEN + 16];
-    snprintf(l, sizeof(l), "card: %c %s", j->op, j->a);
+    snprintf(l, sizeof(l), "card: %s%s%s", j->op == 'L' ? "list asked" : j->op == 'R' ? "READ" :
+             j->op == 'D' ? "DEL" : j->op == 'N' ? "REN" : "FILE", j->a[0] ? " " : "", j->a);
     net_log(l);
   }
   card_job_count = 0;

@@ -721,8 +721,10 @@ static uint8_t gowin_flash_reg(uint8_t cmd) {
 // bit 2) the individual block locks count, which only a Global Block
 // Unlock is known to have lifted; else BP0-2 in register 1.
 static bool gowin_flash_unlocked_all = false;
+static bool flash_has_sr3;           // the flash answers to 15h at all
+
 static bool gowin_flash_protected(void) {
-  if(gowin_flash_reg(0x15) & 0x04) return !gowin_flash_unlocked_all;
+  if(flash_has_sr3 && (gowin_flash_reg(0x15) & 0x04)) return !gowin_flash_unlocked_all;
   return (gowin_flash_reg(0x05) & 0x1c) != 0;
 }
 
@@ -815,7 +817,8 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
     gowin_spi_xfer(e, NULL, sizeof(e));
     gowin_spi_xfer(r, NULL, sizeof(r));
     vTaskDelay(pdMS_TO_TICKS(2)); }
-  { uint8_t tx[4] = { 0x9f, 0, 0, 0 }, id[4];
+  uint8_t id[4];
+  { uint8_t tx[4] = { 0x9f, 0, 0, 0 };
     gowin_spi_xfer(tx, id, sizeof(tx));
     if(id[1] == 0x00 || id[1] == 0xff || id[3] < 0x14 || id[3] > 0x19) {
       snprintf(why, sizeof(why), "the flash does not answer (id %02x %02x %02x)", id[1], id[2], id[3]);
@@ -851,9 +854,12 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
   // writes this flash, so one way works: the usual ones are tried, each
   // checked, and the result says which did it.
   uint8_t r1 = gowin_flash_reg(0x05), r2 = gowin_flash_reg(0x35), r3 = gowin_flash_reg(0x15);
-  // all ones is no state a flash reports: then nothing is written to its
-  // registers, whatever they seem to say
-  if(r1 == 0xff || r2 == 0xff || r3 == 0xff) {
+  // All ones is no state a flash reports: then nothing is written to its
+  // registers, whatever they seem to say. Register 3 is the exception: a
+  // flash without one (the Nano 20K's, 62 00 ff on the board) leaves the
+  // line high, and then there are no block locks either.
+  flash_has_sr3 = (r3 != 0xff);
+  if(r1 == 0xff || r2 == 0xff) {
     snprintf(why, sizeof(why), "the flash's status reads wrong (%02x %02x %02x)", r1, r2, r3);
     err = why;
     goto out;
@@ -883,8 +889,8 @@ const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, boo
       goto out;
     }
   }
-  snprintf(flash_diag, sizeof(flash_diag), "sr %02x %02x %02x, %s, %s", r1, r2, r3,
-           spi_tx_extra ? "+1 bit" : "exact", way);
+  snprintf(flash_diag, sizeof(flash_diag), "id %02x%02x%02x, sr %02x %02x %02x, %s, %s",
+           id[1], id[2], id[3], r1, r2, r3, spi_tx_extra ? "+1 bit" : "exact", way);
   gowin_debugf("FLASH: %s", flash_diag);
 
   uint8_t page[256], back[256];
