@@ -1389,6 +1389,7 @@ static bool play_name_ok(const char *name) {
 
 static bool card_job_parse(char *line);
 static void card_jobs_run(void);
+static int card_job_count;        // see the SD card from the browser, below
 
 // Ask the server, quietly. True when a game is waiting; its disks are in
 // play_names[] then. *answered tells a server that said "NONE" from one
