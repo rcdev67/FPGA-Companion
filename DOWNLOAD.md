@@ -173,6 +173,29 @@ the companion says the same once after start-up and after every download,
 at `/_/hello`; a server that is not stserve answers 404, and nothing
 happens.
 
+## Save games back to the server: `save=`
+
+A game that saves writes into its disk image on the card. With
+
+    save=on
+
+in the ini the companion sends such an image to stserve, whole, once the
+drive has been quiet for 30 seconds, or when the image is taken out of
+the drive. It knows which drive wrote: the cores report a pending write in
+the SD status. stserve keeps the last ten versions of every image, the
+same one twice only once; its page *Saves* offers each for download and to
+go back onto a card (see `server/README.md` in MISTrcdev).
+
+The way up is Zimodem's `AT+PUT:<length>:<url>`: the image goes over
+XMODEM into the modem's memory, 1 KB blocks with a CRC, and from there to
+`/_/save` in one POST. A ST disk of 720 KB takes about a minute, a C64
+disk well under half of that; meanwhile the machine has no modem, as
+during a download. A Zimodem without `AT+PUT` (before `fa26b16`) answers
+`ERROR`: saving then stays off until the next start. Images over 4 MB --
+a hard disk -- are never sent. Every image gets a line in `NETLOG.TXT`,
+`save: Summer_Games_II.D64 sent in 21 s, POST 200, ...`, and stserve's
+list of computers says *saves games* and the last one that went.
+
 The `Serial:` setting in the OSD does not matter for downloads: the
 companion switches the port to itself for the request and puts your
 setting back afterwards. During a download the ST has no modem, that is
