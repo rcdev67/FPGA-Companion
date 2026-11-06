@@ -155,12 +155,15 @@ minutes; `NETLOG.TXT` notes the third failure with its reason and the
 recovery.
 
 The answer can carry jobs for the SD card as well, from stserve's page
-*SD card*: send the list of the card's root, send a file (the last 16 KB
+*SD card*: send the list of the card's root, send a file (the last 4 KB
 of a longer one), delete, rename, or fetch a file uploaded in the browser
-onto the card. The list and the files go to the server by POST over a
-plain connection through the modem, at 19200 baud -- Zimodem's own fetch
-only sends a request line. An image one of the drives has open is left
-alone. NETLOG.TXT notes every job, `card: D Xenon.ST`.
+onto the card. The list and the files go to the server by the modem's
+fetch as well, in the address of `/_/card/put`, about a hundred bytes a
+fetch: Zimodem's fetch only sends a request line, and a POST over a plain
+connection through it (ATD) left the modem answering nothing at all. A
+list of twenty files takes some seven fetches, a file of 4 KB about forty.
+An image one of the drives has open is left alone. NETLOG.TXT notes every
+job, `card: DEL Xenon.ST`, and a failed sending with its reason.
 
 Every question also tells stserve what the computer is, for the
 catalogue's list of computers: the core, the companion's commit and board,
