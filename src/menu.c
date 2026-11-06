@@ -42,6 +42,13 @@
 // spaces removed
 #include "font_helvR08_te.c"
 
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+// "Change core", further down: a core from the USB stick into the flash
+#define CORE_SWITCH_SLOT (MAX_DRIVES+MAX_IMAGES+1)
+static void core_switch(const char *dir, const char *file);
+static bool core_switch_result(void);
+#endif
+
 // some constants for arrangement
 // The OSD (currently) is 64 pixel high. To allow for a proper
 // box around a text line, it needs to be 12 pixels high. A total
@@ -811,6 +818,9 @@ static void menu_file_selector_open(config_menu_entry_t *entry) {
     fsel_state.ext = entry->fsel->ext;
     fsel_state.index = entry->fsel->index;
     fsel_state.none_str = (entry->fsel->index == SDC_COPY_SLOT) ? "Back" : NULL;
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+    if(entry->fsel->index == CORE_SWITCH_SLOT) fsel_state.none_str = "Back";
+#endif
     fsel_state.none_icn = NULL;
     fsel_state.action = entry->fsel->action;
   }
@@ -905,7 +915,11 @@ static void menu_fileselector_select(sdc_dir_entry_t *entry) {
       // return to parent form
       menu_pop();
       // Eject; "From USB" has nothing to eject
-      if(drive != SDC_COPY_SLOT) sdc_image_open(drive, NULL);
+      if(drive != SDC_COPY_SLOT
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+         && drive != CORE_SWITCH_SLOT
+#endif
+        ) sdc_image_open(drive, NULL);
     } else {	
       // check if we are going up one dir and try to select the
       // directory we are coming from
@@ -942,6 +956,12 @@ static void menu_fileselector_select(sdc_dir_entry_t *entry) {
     // "From USB": onto the card, then back to the menu
     menu_pop();
     usb_copy(sdc_get_cwd(drive), entry->name);
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+  } else if(drive == CORE_SWITCH_SLOT) {
+    // "Change core": into the flash for good, see core_switch()
+    menu_pop();
+    core_switch(sdc_get_cwd(drive), entry->name);
+#endif
   } else {
     // request insertion of this image
     sdc_image_open(drive, entry->name);
@@ -1366,6 +1386,10 @@ static void menu_task(__attribute__((unused)) void *parms) {
       if ( (fres = f_mount(&usb_fs, "/usb", 1)) != FR_OK ) menu_debugf("/usb mount failed: %d", fres);
       else {
 	menu_debugf("/usb mounted");
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+	// the result of a core change before the restart, if any
+	if(!core_switch_result())
+#endif
 	menu_draw_dialog_for("USB", "The USB stick is ready: Shift+F12, From USB", pdMS_TO_TICKS(3000));
       }
     } else if(cmd == MENU_EVENT_USB_UMOUNTED) {
@@ -1672,15 +1696,178 @@ static const config_fsel_t usb_core_fsel = {
   .ext = (char**)core_exts
 };
 
+// a message that stays a while, for what start-up found
+void menu_draw_dialog_long(const char *title, const char *msg) {
+  menu_draw_dialog_for(title, msg, pdMS_TO_TICKS(30000));
+}
+
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+/* ---- "Change core": another machine from the USB stick, for good ----
+   A core file on the stick goes into the flash, so it is the machine from
+   now on, also after switching off, until another one is chosen. In this
+   order, so that nothing is touched unless all of it can be done:
+   1. the file is there; the modem's display and the OSD say what is about
+      to happen and that the screen goes dark
+   2. the bus to the FPGA is held: no part of the companion talks to an
+      empty chip (that hung the first feasibility test)
+   3. through JTAG: the SRAM erased, the core written into the flash below
+      0x100000, every page read back (gowin_flash_core()); the ROMs above
+      are not touched, only looked at
+   4. the core from the same file into the SRAM: it runs at once. A reload
+      from the flash through JTAG does not work on the Tang Nano 20K, not
+      even with Gowin's own programmer
+   5. the result on the card, then a clean restart of the companion for the
+      new core's menu; the OSD and the display show the result (main.c)
+   The slot is the one of "Load Core from SD", which this board has not. */
+#include "gowin.h"
+
+// the machine's name from its core file: "/usb/c64nano.fs" -> "C64"
+static void core_machine(const char *path, char *out, size_t size) {
+  static const char *known[][2] = {
+    { "c64nano", "C64" }, { "atarist", "Atari ST" }, { "nanomig", "Amiga" } };
+  const char *b = strrchr(path, '/');
+  b = b ? b + 1 : path;
+  const char *dot = strrchr(b, '.');
+  size_t n = dot ? (size_t)(dot - b) : strlen(b);
+  for(unsigned i = 0; i < sizeof(known)/sizeof(known[0]); i++)
+    if(strlen(known[i][0]) == n && !strncasecmp(b, known[i][0], n)) {
+      snprintf(out, size, "%s", known[i][1]);
+      return;
+    }
+  snprintf(out, size, "%.*s", (int)n, b);
+}
+
+// The result goes to the USB stick, before the new core is loaded: the
+// stick hangs on the companion itself, the SD card only through a core,
+// and a freshly loaded core has not set the card up -- writing there
+// right after the change went nowhere. After the restart the companion
+// finds it on the stick, see core_switch_result().
+#define CORE_SWITCH_RESULT "/usb/CORESW.NEW"
+
+static void core_switch_note(const char *line) {
+  FIL f;
+  if(f_open(&f, CORE_SWITCH_RESULT, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(line, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+}
+
+// Once the stick is mounted after a restart: a result waiting on it is
+// shown in the OSD and on the modem's display, and copied to the card.
+static bool core_switch_result(void) {
+  FIL f;
+  char line[230];
+  if(f_open(&f, CORE_SWITCH_RESULT, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
+  if(!f_gets(line, sizeof(line), &f)) line[0] = 0;
+  f_close(&f);
+  // kept on the stick as CORESW.TXT, to be read on a PC: at this moment
+  // the SD card may not be ready yet after the restart
+  f_unlink("/usb/CORESW.TXT");
+  if(f_rename(CORE_SWITCH_RESULT, "/usb/CORESW.TXT") != FR_OK) f_unlink(CORE_SWITCH_RESULT);
+  char *e = strpbrk(line, "\r\n");
+  if(e) *e = 0;
+  if(!line[0]) return false;
+  menu_debugf("change core, the result: %s", line);
+
+  sdc_lock();
+  if(f_open(&f, CARD_MOUNTPOINT "/CORESW.TXT", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+    f_puts(line, &f);
+    f_puts("\r\n", &f);
+    f_close(&f);
+  }
+  sdc_unlock();
+
+  char m[250];
+  snprintf(m, sizeof(m), "30:Core changed|%s", line);
+  if(!netdl_display_message(m, 0)) netdl_boot_message(m);
+  menu_draw_dialog_long("Change core", line);
+  return true;
+}
+
+static void core_switch(const char *dir, const char *file) {
+  static char result[220];
+  char path[128], machine[24], msg[120];
+  FILINFO fno;
+
+  snprintf(path, sizeof(path), "%s/%s", dir, file);
+  core_machine(path, machine, sizeof(machine));
+  menu_debugf("change core to %s (%s)", path, machine);
+
+  // 1. the file, and what is about to happen
+  sdc_lock();
+  FRESULT r = f_stat(path, &fno);
+  sdc_unlock();
+  if(r != FR_OK) {
+    menu_draw_dialog_long("Change core", "The file is not on the stick. Nothing was done.");
+    return;
+  }
+  snprintf(msg, sizeof(msg), "Switching|to %s|Screen dark for|about a minute.|Do not switch off.", machine);
+  netdl_display_message(msg, 4000);
+  snprintf(msg, sizeof(msg), "%s is written for good. The screen goes dark for about a minute. Do not switch off.", machine);
+  menu_draw_dialog_for("Change core", msg, pdMS_TO_TICKS(4000));
+  vTaskDelay(pdMS_TO_TICKS(3500));
+
+  // 2. to 4., with the bus held; no sdc_lock() in here, a task holding it
+  // may be waiting for the bus
+  mcu_hw_spi_lock();
+  uint32_t written;
+  bool tos, cbm;
+  const char *err = gowin_flash_core(path, &written, &tos, &cbm);
+
+  // what the new machine still lacks, if anything
+  const char *lacks = "";
+  if(!strcmp(machine, "Atari ST") && !tos) lacks = " No TOS in the flash yet, see the ST guide.";
+  if(!strcmp(machine, "C64") && !cbm)      lacks = " No 1541 ROMs in the flash yet, see the C64 guide.";
+  if(!err)
+    snprintf(result, sizeof(result), "%s written (%lu KB), from now on at every start.%s [%s]",
+             machine, (unsigned long)(written / 1024), lacks, gowin_flash_diag());
+  else
+    snprintf(result, sizeof(result), "%s NOT written: %s. It runs until power off.", machine, err);
+  menu_debugf("change core: %s", result);
+  core_switch_note(result);          // before the upload, which unmounts the stick
+
+  mcu_hw_upload_core(path);
+  mcu_hw_spi_unlock();
+  bool running = sys_wait4fpga();
+  menu_debugf("change core: %s", running ? "running" : "NOT running");
+
+  // 5. a clean restart for the new core's menu; the result waits on the stick
+  vTaskDelay(pdMS_TO_TICKS(500));
+  mcu_hw_reset();
+}
+
+static char *core_switch_exts[] = { "fs", "bin", NULL };
+
+static const config_fsel_t core_switch_fsel = {
+  .index = CORE_SWITCH_SLOT,
+  .label = "Change core",
+  .def = "/usb",
+  .ext = (char**)core_switch_exts
+};
+
+static const config_menu_entry_t system_menu_core_switch = {
+  .type = CONFIG_MENU_ENTRY_FILESELECTOR,
+  .fsel = (config_fsel_t*)&core_switch_fsel,
+#ifdef ENABLE_BLUETOOTH
+  .next = (config_menu_entry_t*)&system_menu_bluetooth
+#endif
+};
+#endif
+
 // second entry in main system menu
 static const config_menu_entry_t system_menu_usb_core_fsel = {
   .type = CONFIG_MENU_ENTRY_FILESELECTOR,
   .fsel = (config_fsel_t*)&usb_core_fsel,
+#if defined(ENABLE_JTAG) && !defined(DIRECT_SDC_SUPPORTED)
+  .next = (config_menu_entry_t*)&system_menu_core_switch
+#else
 #ifdef DIRECT_SDC_SUPPORTED
   .next = (config_menu_entry_t*)&system_menu_sdc_core_fsel
 #else
 #ifdef ENABLE_BLUETOOTH
   .next = (config_menu_entry_t*)&system_menu_bluetooth
+#endif
 #endif
 #endif
 };

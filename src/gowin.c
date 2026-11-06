@@ -538,4 +538,399 @@ bool gowin_upload_core(const char *name) {
   return false;
 }
 
+#include <stdio.h>
+
+/* ---- the FPGA's SPI flash through JTAG, GW2A only ----
+   The feasibility test for writing a core from the USB stick into the
+   flash, so that it stays. On the GW2A(R) the JTAG instruction 0x16
+   passes what is shifted through the data register straight to the SPI
+   flash: TDI is MOSI, TDO MISO, and the flash is selected while in
+   SHIFT-DR. JTAG sends LSB first, SPI MSB first, so every byte is
+   reversed, and what comes back is one bit late. This follows
+   openFPGALoader (src/gowin.cpp, spi_put() for is_gw2a, Apache-2.0,
+   Gwenhael Goavec-Merou and contributors). The SRAM has to be erased
+   first: the running core lets go of the flash only then. */
+
+// Bits shifted after a command that only sends (rx NULL). Reading needs a
+// byte more for the answer, which comes a bit late; whether sending loses
+// a bit the same way is found out at the flash itself, see
+// gowin_flash_core(): its write enable latch shows whether a command got in.
+static uint8_t spi_tx_extra = 0;
+
+// One SPI transaction: tx out, the same number of bytes in, rx may be NULL
+static void gowin_spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len) {
+  uint16_t n = len + (rx ? 1 : 0);       // one byte more to catch the late bit
+  uint8_t jtx[n + 1], jrx[n + 1];
+  memset(jtx, 0, sizeof(jtx));
+  memset(jrx, 0, sizeof(jrx));
+  for(uint16_t i = 0; i < len; i++) jtx[i] = reverse_byte(tx[i]);
+
+  jtag_command_u08(GOWIN_COMMAND_TRANSFER_SPI);
+
+  // RUN-TEST/IDLE -> SELECT-DR -> CAPTURE-DR -> EXIT1-DR -> PAUSE-DR -> EXIT2-DR,
+  // as openFPGALoader's set_state(EXIT2_DR), then EXIT2-DR -> SHIFT-DR
+  mcu_hw_jtag_tms(0, 0b10101, 5);
+  mcu_hw_jtag_tms(0, 0b0, 1);
+
+  // all but the last bit, the last one with the step out of SHIFT-DR
+  uint32_t bits = 8 * n + (rx ? 0 : spi_tx_extra);
+  uint32_t last = bits - 1;
+  mcu_hw_jtag_data(jtx, jrx, last);
+  uint8_t lrx = mcu_hw_jtag_tms((jtx[last / 8] >> (last % 8)) & 1, 0b1, 1);
+  // mcu_hw_jtag_data() leaves a last byte of 7 bits shifted up by one, as a
+  // shift register would hold it, its lowest bit 0; the eighth bit, from
+  // the step out of SHIFT-DR, comes in on top. Taking bit 7 without that
+  // shift lost the lowest bit of the last byte read: a status of fe, and
+  // ff ff ff fe after an erase that had worked.
+  if(rx) jrx[n - 1] = (jrx[n - 1] >> 1) | (lrx & 0x80);
+  mcu_hw_jtag_tms(1, 0b01, 2);           // EXIT1-DR -> UPDATE-DR -> RUN-TEST/IDLE
+
+  if(rx)
+    for(uint16_t i = 0; i < len; i++)
+      rx[i] = reverse_byte(jrx[i] >> 1) | (jrx[i + 1] & 0x01);
+}
+
+// Read the flash's JEDEC id and the first bytes of two places that hold
+// something known: 0x100000, the ST's first TOS slot (a TOS starts with a
+// BRA.S, 0x60), and 0x20C000, the 1541's CBM DOS (97 AA AA AA). A board
+// has at least one of them if a machine ever ran on it. Nothing is
+// written. The FPGA is empty afterwards; the caller loads a core into its
+// SRAM. out gets one line.
+static void gowin_flash_read(uint32_t addr, uint8_t *d, uint16_t len) {
+  uint8_t tx[4 + len], rx[4 + len];
+  memset(tx, 0, sizeof(tx));
+  tx[0] = 0x03;
+  tx[1] = addr >> 16; tx[2] = addr >> 8; tx[3] = addr;
+  gowin_spi_xfer(tx, rx, sizeof(tx));
+  memcpy(d, rx + 4, len);
+}
+
+bool gowin_flash_probe(char *out, size_t size) {
+  if(!gowin_open()) {
+    snprintf(out, size, "No FPGA on JTAG (%08lx)", (unsigned long)idcode);
+    jtag_close();
+    return false;
+  }
+  if(idcode != IDCODE_GW2AR18) {
+    snprintf(out, size, "Not a GW2AR-18 (%08lx)", (unsigned long)idcode);
+    jtag_close();
+    return false;
+  }
+  if(!gowin_eraseSRAM()) {
+    snprintf(out, size, "Erasing the SRAM failed");
+    gowin_fpgaReset();
+    jtag_close();
+    return false;
+  }
+
+  uint8_t idtx[4] = { 0x9f, 0, 0, 0 }, idrx[4];
+  gowin_spi_xfer(idtx, idrx, sizeof(idtx));
+  uint8_t tos[8], cbm[8];
+  gowin_flash_read(0x100000, tos, sizeof(tos));
+  gowin_flash_read(0x20C000, cbm, sizeof(cbm));
+
+  gowin_debugf("FLASH: JEDEC %02x %02x %02x", idrx[1], idrx[2], idrx[3]);
+  gowin_debugf("FLASH: 0x100000 %02x %02x %02x %02x %02x %02x %02x %02x",
+               tos[0], tos[1], tos[2], tos[3], tos[4], tos[5], tos[6], tos[7]);
+  gowin_debugf("FLASH: 0x20C000 %02x %02x %02x %02x %02x %02x %02x %02x",
+               cbm[0], cbm[1], cbm[2], cbm[3], cbm[4], cbm[5], cbm[6], cbm[7]);
+
+  bool id_ok = !((idrx[1] == 0x00 && idrx[2] == 0x00) || (idrx[1] == 0xff && idrx[2] == 0xff));
+  bool tos_ok = (tos[0] == 0x60);
+  bool cbm_ok = (cbm[0] == 0x97) && (cbm[1] == 0xaa) && (cbm[2] == 0xaa) && (cbm[3] == 0xaa);
+  bool ok = id_ok && (tos_ok || cbm_ok);
+  snprintf(out, size, "%02x%02x%02x T:%02x%02x C:%02x%02x %s",
+           idrx[1], idrx[2], idrx[3], tos[0], tos[1], cbm[0], cbm[1], ok ? "OK" : "??");
+
+  // Out of SPI mode. The FPGA stays empty: on the Tang Nano 20K a reload
+  // from the flash through JTAG does not bring the core back -- Gowin's own
+  // programmer cannot either (Reprogram leaves status 0x0020) -- so the
+  // caller loads a core into the SRAM, which works.
+  mcu_hw_jtag_tms(1, 0b11111, 5);
+  jtag_close();
+  return ok;
+}
+
+/* ---- a core into the flash, so that it stays: "Change core" ----
+   The bytes are the ones the SRAM gets: a .bin as it is, a .fs parsed
+   with the highest bit first, its "//" lines skipped -- as openFPGALoader
+   writes a flash. 64 KB blocks erased as the writing reaches them, 256
+   byte pages written and every page read back and compared. Nothing at
+   or above CORE_FLASH_LIMIT is touched: the ST's TOS and the 1541's ROMs
+   live there. The SRAM is erased first and stays empty; the caller loads
+   the core into it afterwards (a reload from the flash through JTAG does
+   not work on the Tang Nano 20K). */
+#define CORE_FLASH_LIMIT 0x100000
+
+typedef struct {
+  FIL fil;
+  bool fs;                 // ASCII .fs, else a binary .bin
+  bool line_start, comment;
+  uint8_t in[256];
+  UINT in_len, in_pos;
+  uint8_t byte, bit;
+} core_src_t;
+
+static int core_getc(core_src_t *s) {
+  if(s->in_pos >= s->in_len) {
+    if(f_read(&s->fil, s->in, sizeof(s->in), &s->in_len) != FR_OK || !s->in_len) return -1;
+    s->in_pos = 0;
+  }
+  return s->in[s->in_pos++];
+}
+
+// up to max bytes of the bitstream, 0 at its end, -1 on an error
+static int core_read(core_src_t *s, uint8_t *buf, int max) {
+  int n = 0;
+  while(n < max) {
+    int c = core_getc(s);
+    if(c < 0) break;
+    if(!s->fs) { buf[n++] = c; continue; }
+    if(c == '\n') { s->line_start = true; s->comment = false; continue; }
+    if(s->line_start && c == '/') s->comment = true;
+    s->line_start = false;
+    if(s->comment || (c != '0' && c != '1')) continue;
+    s->byte = (s->byte << 1) | (c == '1');
+    if(++s->bit == 8) { buf[n++] = s->byte; s->bit = 0; s->byte = 0; }
+  }
+  if(n == 0 && s->fs && s->bit) return -1;    // the digits did not end on a byte
+  return n;
+}
+
+// A .fs says in its header which FPGA it is for: it has to be ours
+static bool core_header_ok(const char *name) {
+  FIL f;
+  char line[96];
+  bool ok = false;
+  if(f_open(&f, name, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
+  for(int i = 0; i < 20 && f_gets(line, sizeof(line), &f); i++) {
+    if(line[0] != '/') break;
+    if(strstr(line, "GW2AR-18") || strstr(line, "GW2AR-LV18")) { ok = true; break; }
+  }
+  f_close(&f);
+  return ok;
+}
+
+static uint8_t gowin_flash_reg(uint8_t cmd) {
+  uint8_t tx[2] = { cmd, 0 }, rx[2];
+  gowin_spi_xfer(tx, rx, sizeof(tx));
+  return rx[1];
+}
+
+// Protected as far as the status registers tell: with WPS (register 3,
+// bit 2) the individual block locks count, which only a Global Block
+// Unlock is known to have lifted; else BP0-2 in register 1.
+static bool gowin_flash_unlocked_all = false;
+static bool gowin_flash_protected(void) {
+  if(gowin_flash_reg(0x15) & 0x04) return !gowin_flash_unlocked_all;
+  return (gowin_flash_reg(0x05) & 0x1c) != 0;
+}
+
+static uint8_t gowin_flash_status(void) {
+  uint8_t tx[2] = { 0x05, 0 }, rx[2];
+  gowin_spi_xfer(tx, rx, sizeof(tx));
+  return rx[1];
+}
+
+static bool gowin_flash_wait(uint32_t ms) {
+  TickType_t t0 = xTaskGetTickCount();
+  while(gowin_flash_status() & 0x01) {
+    if((xTaskGetTickCount() - t0) > pdMS_TO_TICKS(ms)) return false;
+    vTaskDelay(1);
+  }
+  return true;
+}
+
+static void gowin_flash_wren(void) {
+  uint8_t tx[1] = { 0x06 };
+  gowin_spi_xfer(tx, NULL, sizeof(tx));
+}
+
+// whether the flash ever said busy after an erase command: an erase takes
+// a tenth of a second and more, a flash that never says so either did not
+// take the command or is not read right
+static bool erase_busy_seen;
+
+static bool gowin_flash_erase64(uint32_t addr) {
+  uint8_t tx[4] = { 0xd8, addr >> 16, addr >> 8, addr };
+  gowin_flash_wren();
+  gowin_spi_xfer(tx, NULL, sizeof(tx));
+  if(gowin_flash_status() & 0x01) erase_busy_seen = true;
+  return gowin_flash_wait(3000);
+}
+
+static bool gowin_flash_page(uint32_t addr, const uint8_t *d, uint16_t len) {
+  uint8_t tx[4 + 256];
+  tx[0] = 0x02; tx[1] = addr >> 16; tx[2] = addr >> 8; tx[3] = addr;
+  memcpy(tx + 4, d, len);
+  gowin_flash_wren();
+  gowin_spi_xfer(tx, NULL, 4 + len);
+  return gowin_flash_wait(100);
+}
+
+// Whether the ROMs a machine needs are in the flash: 1 = yes, 0 = no
+static void gowin_flash_roms(bool *tos, bool *cbm) {
+  uint8_t d[4];
+  gowin_flash_read(0x100000, d, 2);
+  *tos = (d[0] == 0x60);
+  gowin_flash_read(0x20C000, d, 4);
+  *cbm = (d[0] == 0x97) && (d[1] == 0xaa) && (d[2] == 0xaa) && (d[3] == 0xaa);
+}
+
+// Write the core in name into the flash. NULL if it went through, else a
+// short reason. *written gets the bytes written, *tos and *cbm whether the
+// ST's TOS and the 1541's DOS are in the flash.
+static char flash_diag[64];
+const char *gowin_flash_diag(void) { return flash_diag; }
+
+const char *gowin_flash_core(const char *name, uint32_t *written, bool *tos, bool *cbm) {
+  static char why[150];
+  flash_diag[0] = 0;
+  gowin_flash_unlocked_all = false;
+  erase_busy_seen = false;
+  *written = 0; *tos = *cbm = false;
+  size_t nl = strlen(name);
+  bool fs = (nl > 3) && !strcasecmp(name + nl - 3, ".fs");
+  if(fs && !core_header_ok(name)) return "not a core for this FPGA";
+
+  core_src_t *s = pvPortMalloc(sizeof(core_src_t));
+  if(!s) return "out of memory";
+  memset(s, 0, sizeof(core_src_t));
+  s->fs = fs;
+  s->line_start = true;
+  if(f_open(&s->fil, name, FA_OPEN_EXISTING | FA_READ) != FR_OK) { vPortFree(s); return "cannot open the file"; }
+
+  const char *err = NULL;
+  if(!gowin_open() || idcode != IDCODE_GW2AR18) { err = "no GW2AR-18 on JTAG"; goto out; }
+  if(!gowin_eraseSRAM()) { err = "erasing the SRAM failed"; goto out; }
+
+  // The core that ran read its ROMs in the flash's continuous read mode,
+  // and the flash is still in it: the first command counts as an address,
+  // and the first answers are nothing -- the first board run read all
+  // three status registers as ff and missed the 1541's ROMs. So first out
+  // of that mode (ff ff), then a reset (66, 99), and the ID has to be a
+  // flash's before anything else happens.
+  { uint8_t m[2] = { 0xff, 0xff }, e[1] = { 0x66 }, r[1] = { 0x99 };
+    gowin_spi_xfer(m, NULL, sizeof(m));
+    gowin_spi_xfer(e, NULL, sizeof(e));
+    gowin_spi_xfer(r, NULL, sizeof(r));
+    vTaskDelay(pdMS_TO_TICKS(2)); }
+  { uint8_t tx[4] = { 0x9f, 0, 0, 0 }, id[4];
+    gowin_spi_xfer(tx, id, sizeof(tx));
+    if(id[1] == 0x00 || id[1] == 0xff || id[3] < 0x14 || id[3] > 0x19) {
+      snprintf(why, sizeof(why), "the flash does not answer (id %02x %02x %02x)", id[1], id[2], id[3]);
+      err = why;
+      goto out;
+    } }
+
+  gowin_flash_roms(tos, cbm);
+
+  // Does a command that only sends get into the flash? Its write enable
+  // latch (status bit 1) tells: set after WREN. If not with the exact
+  // number of bits, then with one more -- reading needs a late bit too.
+  uint8_t sr0 = gowin_flash_status(), sr1, sr2 = 0;
+  spi_tx_extra = 0;
+  gowin_flash_wren();
+  sr1 = gowin_flash_status();
+  if(!(sr1 & 0x02)) {
+    spi_tx_extra = 1;
+    gowin_flash_wren();
+    sr2 = gowin_flash_status();
+    if(!(sr2 & 0x02)) {
+      spi_tx_extra = 0;
+      snprintf(why, sizeof(why), "write enable does not take (%02x %02x %02x)", sr0, sr1, sr2);
+      err = why;
+      goto out;
+    }
+  }
+
+  // Protected? The W25Q32 has block protection bits in status register 1
+  // (BP0-2, with TB/SEC/CMP choosing the area), a lock of the status
+  // register itself (SRP0/SRP1 with the /WP pin), and on the newer ones
+  // individual block locks instead (WPS in register 3). Gowin's programmer
+  // writes this flash, so one way works: the usual ones are tried, each
+  // checked, and the result says which did it.
+  uint8_t r1 = gowin_flash_reg(0x05), r2 = gowin_flash_reg(0x35), r3 = gowin_flash_reg(0x15);
+  // all ones is no state a flash reports: then nothing is written to its
+  // registers, whatever they seem to say
+  if(r1 == 0xff || r2 == 0xff || r3 == 0xff) {
+    snprintf(why, sizeof(why), "the flash's status reads wrong (%02x %02x %02x)", r1, r2, r3);
+    err = why;
+    goto out;
+  }
+  const char *way = "none needed";
+  if(gowin_flash_protected()) {
+    way = NULL;
+    // 1. status register 1 written, non-volatile: BP0-2 and SRP0 off, the
+    // rest as it is. Register 2 -- QE, the one-time lock bits, CMP -- is
+    // never written.
+    { uint8_t tx[2] = { 0x01, r1 & ~0x9c };
+      gowin_flash_wren(); gowin_spi_xfer(tx, NULL, sizeof(tx)); gowin_flash_wait(100);
+      if(!gowin_flash_protected()) way = "sr1"; }
+    // 4. volatile, until power off
+    if(!way) { uint8_t tv[1] = { 0x50 }, tx[2] = { 0x01, 0x00 };
+      gowin_spi_xfer(tv, NULL, sizeof(tv)); gowin_spi_xfer(tx, NULL, sizeof(tx));
+      if(!gowin_flash_protected()) way = "volatile"; }
+    // 5. all individual block locks off (WPS = 1)
+    if(!way) { uint8_t tu[1] = { 0x98 };
+      gowin_flash_wren(); gowin_spi_xfer(tu, NULL, sizeof(tu)); gowin_flash_wait(100);
+      gowin_flash_unlocked_all = true;
+      if(!gowin_flash_protected()) way = "block unlock"; }
+    if(!way) {
+      snprintf(why, sizeof(why), "stays protected: sr %02x %02x %02x -> %02x %02x %02x",
+               r1, r2, r3, gowin_flash_reg(0x05), gowin_flash_reg(0x35), gowin_flash_reg(0x15));
+      err = why;
+      goto out;
+    }
+  }
+  snprintf(flash_diag, sizeof(flash_diag), "sr %02x %02x %02x, %s, %s", r1, r2, r3,
+           spi_tx_extra ? "+1 bit" : "exact", way);
+  gowin_debugf("FLASH: %s", flash_diag);
+
+  uint8_t page[256], back[256];
+  uint32_t addr = 0;
+  TickType_t t0 = xTaskGetTickCount();
+  for(;;) {
+    int n = core_read(s, page, sizeof(page));
+    if(n < 0) { err = "the file is damaged"; break; }
+    if(n == 0) break;
+    if(addr + n > CORE_FLASH_LIMIT) { err = "the core is too big"; break; }
+    if(!(addr & 0xffff)) {
+      if(!gowin_flash_erase64(addr)) {
+        snprintf(why, sizeof(why), "erasing at %06lx failed [%s]", (unsigned long)addr, flash_diag); err = why; break;
+      }
+      // erased means FF
+      uint8_t e[4];
+      gowin_flash_read(addr, e, sizeof(e));
+      if((e[0] & e[1] & e[2] & e[3]) != 0xff) {
+        snprintf(why, sizeof(why), "erase at %06lx did not take: %02x%02x%02x%02x, busy %s [%s]",
+                 (unsigned long)addr, e[0], e[1], e[2], e[3], erase_busy_seen ? "seen" : "never", flash_diag);
+        err = why; break;
+      }
+    }
+    if(!gowin_flash_page(addr, page, n)) {
+      snprintf(why, sizeof(why), "writing at %06lx failed", (unsigned long)addr); err = why; break;
+    }
+    gowin_flash_read(addr, back, n);
+    if(memcmp(page, back, n)) {
+      snprintf(why, sizeof(why), "wrong data at %06lx: %02x%02x%02x%02x not %02x%02x%02x%02x, busy %s [%s]",
+               (unsigned long)addr, back[0], back[1], back[2], back[3], page[0], page[1], page[2], page[3],
+               erase_busy_seen ? "seen" : "never", flash_diag);
+      err = why; break;
+    }
+    addr += n;
+  }
+  *written = addr;
+  gowin_debugf("FLASH: %lu bytes of %s in %lu ms%s%s", (unsigned long)addr, name,
+               (unsigned long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS),
+               err ? ", " : "", err ? err : "");
+
+out:
+  mcu_hw_jtag_tms(1, 0b11111, 5);    // out of SPI mode
+  jtag_close();
+  f_close(&s->fil);
+  vPortFree(s);
+  return err;
+}
+
 #endif // ENABLE_JTAG

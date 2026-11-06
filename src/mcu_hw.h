@@ -21,6 +21,10 @@ void mcu_hw_reset(void);
 void mcu_hw_spi_begin(void);
 unsigned char mcu_hw_spi_tx_u08(unsigned char b);
 void mcu_hw_spi_end(void);
+// hold the bus to the FPGA, CS untouched, while the FPGA itself is being
+// replaced: everybody else waits instead of talking to an empty chip
+void mcu_hw_spi_lock(void);
+void mcu_hw_spi_unlock(void);
 
 bool mcu_hw_hid_present(void);
 void mcu_hw_usb_sector_read(void *buffer, int sector, int count);

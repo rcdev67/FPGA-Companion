@@ -3,6 +3,8 @@
 
 */
 
+#include <stdio.h>
+#include <string.h>
 #include "../mcu_hw.h"
 
 #include "../config.h"
@@ -123,6 +125,7 @@ static void com_task(__attribute__((unused)) void *p ) {
 
     // and for the companion's own modem on port 1
     netdl_init();
+
 
     debugf("Entering main loop");
   

@@ -45,6 +45,11 @@ const char *netdl_get_ip(void);
 
 // requests from the menu, handled in the net task
 void netdl_request_list(void);
+// a message over the modem's status display, "Title|text"; waits up to
+// wait_ms for it to be sent, true if it was
+bool netdl_display_message(const char *msg, int wait_ms);
+// the same, sent with the first contact to the modem after start-up
+void netdl_boot_message(const char *msg);
 void netdl_request_download(int index);
 
 // state for the menu to draw
