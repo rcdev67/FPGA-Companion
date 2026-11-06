@@ -1351,6 +1351,8 @@ static void query_add(char *out, size_t size, const char *key, const char *s, si
 }
 
 static char last_saved[40];      // the last image that went back, see save_round()
+static bool save_on = false;     // ini save=, see save_round()
+static bool save_no_put = false; // the modem knows no AT+PUT
 
 static void status_query(char *q, size_t size) {
   char num[16];
@@ -1869,8 +1871,6 @@ int netdl_get_play(void) { return play_secs; }
    are never sent. */
 #define SAVE_QUIET_MS 30000
 #define SAVE_MAX      (4UL * 1024 * 1024)   // Zimodem's XPUT_MAX
-static bool save_on = false;
-static bool save_no_put = false;            // the modem knows no AT+PUT
 
 void netdl_set_save(bool on) { save_on = on; }
 bool netdl_get_save(void) { return save_on; }
