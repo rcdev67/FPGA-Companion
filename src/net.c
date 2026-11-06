@@ -41,6 +41,7 @@
 #include "menu.h"
 #include "config.h"   // for config_find_role() and the core's name
 #include "debug.h"
+#include "mcu_hw.h"   // for mcu_hw_usb_msc_present()
 
 #define NET_PORT          1
 #define NET_RX_BUF        2048    // bytes the interrupt handler may queue
@@ -63,8 +64,11 @@ static char cwd[NET_PATH_LEN];                      // the folder shown, "" at t
 static char hrefs[NET_MAX_ENTRIES][NET_HREF_LEN];   // as the server wants it in the URL
 // A link whose text starts with "> " is marked in the menu: stserve offers a
 // game sent from its catalogue in the browser that way, at the top of every
-// list. The name on the card is the link's, without the mark.
-static bool marked[NET_MAX_ENTRIES];
+// list. The name on the card is the link's, without the mark. "USB> " is a
+// game sent to the stick: it goes there whatever the dialog says.
+static uint8_t marked[NET_MAX_ENTRIES];
+// where a file without a mark goes: the SD card, or the USB stick
+static bool to_stick = false;
 static int name_count = 0;
 static uint32_t bytes_done = 0, bytes_total = 0;
 static int modem = MODEM_UNKNOWN;
@@ -1023,7 +1027,7 @@ static void url_decode(const char *in, char *out, int max) {
 // One link of the listing. Folders keep their slash and are shown with
 // it, so the list tells them apart at a glance and download() knows what
 // to do with them; ".." is the way back up.
-static void add_entry(const char *href, bool mark) {
+static void add_entry(const char *href, uint8_t mark) {
   if(name_count >= NET_MAX_ENTRIES) return;
   int hl = strlen(href);
   if(hl == 0 || hl >= NET_HREF_LEN) return;
@@ -1071,7 +1075,10 @@ static void fetch_list(void) {
       *e = '\0';
       // the link's text follows the closing quote of the href
       char *text = strchr(e + 1, '>');
-      add_entry(p, text && !strncmp(text + 1, "&gt; ", 5));
+      uint8_t mark = NET_MARK_NONE;
+      if(text && !strncmp(text + 1, "&gt; ", 5))    mark = NET_MARK_CARD;
+      if(text && !strncmp(text + 1, "USB&gt; ", 8)) mark = NET_MARK_STICK;
+      add_entry(p, mark);
       p = e + 1;
     }
   } else {
@@ -1084,7 +1091,7 @@ static void fetch_list(void) {
       if(*e) e++;
       while(end > p && (end[-1] == '\r' || end[-1] == ' ')) end--;
       *end = '\0';
-      if(*p && *p != ';' && *p != '#') add_entry(p, false);
+      if(*p && *p != ';' && *p != '#') add_entry(p, NET_MARK_NONE);
       p = e;
     }
   }
@@ -1102,17 +1109,25 @@ static void fetch_list(void) {
 
 static FIL dl_file;
 static bool dl_open;
+// The download goes to the USB stick. The stick hangs on the companion
+// itself: no core reads it, so it needs no sdc_lock(), which would only
+// hold the core's floppy up.
+static bool dl_usb;
+
+static void dl_lock(void)   { if(!dl_usb) sdc_lock(); }
+static void dl_unlock(void) { if(!dl_usb) sdc_unlock(); }
 
 static bool file_sink(const unsigned char *data, int len) {
   UINT bw = 0;
-  sdc_lock();
+  dl_lock();
   FRESULT r = f_write(&dl_file, data, len, &bw);
-  sdc_unlock();
+  dl_unlock();
   if(r != FR_OK || bw != (UINT)len) {
     // f_write's result, the bytes it managed, the sector layer's reason
     // (1/2 read busy/timeout, 3/4 write busy/timeout) and the offset
     char msg[48];
-    snprintf(msg, sizeof(msg), "SD write f%d w%u e%d @%lu", r, bw, sdc_get_last_error(), (unsigned long)bytes_done);
+    if(dl_usb) snprintf(msg, sizeof(msg), "USB write f%d w%u @%lu", r, bw, (unsigned long)bytes_done);
+    else       snprintf(msg, sizeof(msg), "SD write f%d w%u e%d @%lu", r, bw, sdc_get_last_error(), (unsigned long)bytes_done);
     net_set_message(msg);
     return false;
   }
@@ -1120,12 +1135,12 @@ static bool file_sink(const unsigned char *data, int len) {
   // commit size and cluster chain every 64 KB, so a transfer that breaks
   // off later leaves a file that is at least consistent up to here
   if((bytes_done & 0xffff) < (uint32_t)len) {
-    sdc_lock();
+    dl_lock();
     r = f_sync(&dl_file);
-    sdc_unlock();
+    dl_unlock();
     if(r != FR_OK) {
       char msg[48];
-      snprintf(msg, sizeof(msg), "SD sync f%d e%d @%lu", r, sdc_get_last_error(), (unsigned long)bytes_done);
+      snprintf(msg, sizeof(msg), "%s sync f%d e%d @%lu", dl_usb ? "USB" : "SD", r, sdc_get_last_error(), (unsigned long)bytes_done);
       net_set_message(msg);
       return false;
     }
@@ -1162,24 +1177,37 @@ static void download(int index) {
     return;
   }
 
+  // the card or the stick: a game sent to one of them from the catalogue
+  // goes there, any other file where the dialog says
+  dl_usb = (marked[index] == NET_MARK_STICK) || (marked[index] == NET_MARK_NONE && to_stick);
+  if(dl_usb && !mcu_hw_usb_msc_present()) {
+    net_set_message("No USB stick on the hub");
+    state = NET_STATE_ERROR;
+    menu_notify(MENU_EVENT_NET_UPDATE);
+    return;
+  }
+  const char *base = dl_usb ? "/usb" : CARD_MOUNTPOINT;
+
   state = NET_STATE_BUSY;
   bytes_done = bytes_total = 0;
-  snprintf(message, sizeof(message), "Loading %s", name);
+  snprintf(message, sizeof(message), "Loading %s%s", name, dl_usb ? " to USB" : "");
   menu_notify(MENU_EVENT_NET_UPDATE);
 
   char path[NET_NAME_LEN + 8];
-  snprintf(path, sizeof(path), "%s/%s", CARD_MOUNTPOINT, name);
+  snprintf(path, sizeof(path), "%s/%s", base, name);
   // written under a temporary name and renamed at the end, so a copy
-  // already on the card survives a failed attempt
-  static const char tmp_path[] = CARD_MOUNTPOINT "/NETDL.TMP";
+  // already there survives a failed attempt
+  char tmp_path[16];
+  snprintf(tmp_path, sizeof(tmp_path), "%s/NETDL.TMP", base);
 
-  sdc_lock();
+  dl_lock();
   f_unlink(tmp_path);
   FRESULT r = f_open(&dl_file, tmp_path, FA_CREATE_ALWAYS | FA_WRITE);
-  sdc_unlock();
+  dl_unlock();
   if(r != FR_OK) {
     char msg[48];
-    snprintf(msg, sizeof(msg), "Cannot create f%d e%d", r, sdc_get_last_error());
+    if(dl_usb) snprintf(msg, sizeof(msg), "Cannot create on USB f%d", r);
+    else       snprintf(msg, sizeof(msg), "Cannot create f%d e%d", r, sdc_get_last_error());
     net_set_message(msg);
     state = NET_STATE_ERROR;
     menu_notify(MENU_EVENT_NET_UPDATE);
@@ -1191,34 +1219,34 @@ static void download(int index) {
   snprintf(url, sizeof(url), "%s%s", cwd, hrefs[index]);
   bool ok = http_get(url, file_sink);            // the URL form, spaces and all encoded
 
-  sdc_lock();
+  dl_lock();
   FRESULT cr = f_close(&dl_file);
   if(cr != FR_OK) {
     // the size is written on close: without it the file is empty
-    snprintf(message, sizeof(message), "SD close f%d e%d", cr, sdc_get_last_error());
+    snprintf(message, sizeof(message), "%s close f%d e%d", dl_usb ? "USB" : "SD", cr, sdc_get_last_error());
     ok = false;
   }
   if(ok) {
     f_unlink(path);            // replace an older copy
     FRESULT rr = f_rename(tmp_path, path);
     if(rr != FR_OK) {
-      snprintf(message, sizeof(message), "SD rename f%d e%d", rr, sdc_get_last_error());
+      snprintf(message, sizeof(message), "%s rename f%d e%d", dl_usb ? "USB" : "SD", rr, sdc_get_last_error());
       ok = false;
     }
   }
-  if(!ok) f_unlink(tmp_path);  // no half files on the card
-  sdc_unlock();
+  if(!ok) f_unlink(tmp_path);  // no half files on the card or the stick
+  dl_unlock();
   dl_open = false;
 
   if(ok) {
-    snprintf(message, sizeof(message), "%s: %lu bytes", name, (unsigned long)bytes_done);
+    snprintf(message, sizeof(message), "%s: %lu bytes%s", name, (unsigned long)bytes_done, dl_usb ? " on USB" : "");
     state = NET_STATE_DONE;
   } else
     state = NET_STATE_ERROR;
 
   {
     char line[96];
-    snprintf(line, sizeof(line), "%s %s (%lu/%lu) %s", ok ? "OK  " : "FAIL", name,
+    snprintf(line, sizeof(line), "%s %s%s (%lu/%lu) %s", ok ? "OK  " : "FAIL", name, dl_usb ? " -> USB" : "",
              (unsigned long)bytes_done, (unsigned long)bytes_total, message);
     net_log(line);
   }
@@ -1466,7 +1494,9 @@ int netdl_state(void) { return state; }
 const char *netdl_message(void) { return message; }
 int netdl_entry_count(void) { return (state == NET_STATE_LIST || state == NET_STATE_DONE || state == NET_STATE_ERROR) ? name_count : 0; }
 const char *netdl_entry_name(int index) { return (index >= 0 && index < name_count) ? names[index] : ""; }
-bool netdl_entry_marked(int index) { return index >= 0 && index < name_count && marked[index]; }
+int netdl_entry_mark(int index) { return (index >= 0 && index < name_count) ? marked[index] : NET_MARK_NONE; }
+void netdl_set_to_stick(bool on) { to_stick = on; }
+bool netdl_to_stick(void) { return to_stick; }
 uint32_t netdl_bytes_done(void) { return bytes_done; }
 uint32_t netdl_bytes_total(void) { return bytes_total; }
 

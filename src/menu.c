@@ -1882,11 +1882,14 @@ static const config_custom_t net_dialog;
 // With a list, its first line fetches it again: the companion holds one
 // list per folder until it is told otherwise, and a server's collection
 // grows -- a game sent from stserve's catalogue in the browser shows up at
-// the top of the list once it is fetched again.
+// the top of the list once it is fetched again. The second line says where
+// a file goes, the SD card or the USB stick, and changes it.
+#define NET_DIALOG_TOP 2     // "Reload list" and "Save to", then the files
+
 static int net_dialog_length(void) {
-  // "Reload list" and the file list, or the single entry that loads it
+  // the two lines and the file list, or the single entry that loads it
   int n = netdl_entry_count();
-  return n ? n + 1 : 1;
+  return n ? n + NET_DIALOG_TOP : 1;
 }
 
 static void net_dialog_draw(void) {
@@ -1953,13 +1956,16 @@ static void net_dialog_draw(void) {
   }
 
   // the list, four lines, scrolled like a menu, "Reload list" first
-  for(int i=0;i<4 && i+menu_state->scroll < n+1;i++) {
+  for(int i=0;i<4 && i+menu_state->scroll < n+NET_DIALOG_TOP;i++) {
     int row = i + menu_state->scroll;
     int y = MENU_LINE_Y + (i+1)*MENU_ENTRY_H;
-    char label[NET_NAME_LEN + 3];
-    if(!row)                             snprintf(label, sizeof(label), "Reload list");
-    else if(netdl_entry_marked(row - 1)) snprintf(label, sizeof(label), "> %s", netdl_entry_name(row - 1));
-    else                                 snprintf(label, sizeof(label), "%s", netdl_entry_name(row - 1));
+    char label[NET_NAME_LEN + 6];
+    int e = row - NET_DIALOG_TOP;
+    if(row == 0)      snprintf(label, sizeof(label), "Reload list");
+    else if(row == 1) snprintf(label, sizeof(label), "Save to: %s", netdl_to_stick() ? "USB stick" : "SD card");
+    else if(netdl_entry_mark(e) == NET_MARK_CARD)  snprintf(label, sizeof(label), "> %s", netdl_entry_name(e));
+    else if(netdl_entry_mark(e) == NET_MARK_STICK) snprintf(label, sizeof(label), "USB> %s", netdl_entry_name(e));
+    else              snprintf(label, sizeof(label), "%s", netdl_entry_name(e));
     u8g2_DrawStr(&u8g2, 2, y, label);
     if(row == menu_state->selected - 1)
       u8g2_DrawButtonFrame(&u8g2, 0, y, U8G2_BTN_INV, width, 1, 1);
@@ -1969,7 +1975,16 @@ static void net_dialog_draw(void) {
 static void net_dialog_select(int selected) {
   if(netdl_state() == NET_STATE_BUSY) return;
   if(!netdl_entry_count() || selected == 1) netdl_request_list();
-  else                                      netdl_request_download(selected - 2);
+  else if(selected == 2) {
+    // the stick only when there is one; the card is always there
+    if(!netdl_to_stick() && !mcu_hw_usb_msc_present())
+      menu_draw_dialog_for("Download", "No USB stick on the hub", pdMS_TO_TICKS(2000));
+    else {
+      netdl_set_to_stick(!netdl_to_stick());
+      menu_do(MENU_EVENT_NONE);
+    }
+  } else
+    netdl_request_download(selected - 1 - NET_DIALOG_TOP);
 }
 
 // A typed letter or digit selects the first entry starting with it, the
@@ -1984,13 +1999,14 @@ static bool net_dialog_jump(uint8_t code) {
   if(code >= 'a') code -= 'a' - 'A';
 
   // start after the current entry, so the same key walks through them
-  int cur = menu_state->selected - 2;   // index of the selected entry
+  int cur = menu_state->selected - 1 - NET_DIALOG_TOP;   // index of the selected entry
+  if(cur < -1) cur = -1;                // on one of the two lines above the files
   for(int k = 1; k <= n; k++) {
     int i = (cur + k + n) % n;
     unsigned char c = (unsigned char)netdl_entry_name(i)[0];
     if(c >= 'a' && c <= 'z') c -= 'a' - 'A';
     if(c != code) continue;
-    int row = i + 1;                     // the row on the screen, after "Reload list"
+    int row = i + NET_DIALOG_TOP;        // the row on the screen, after "Reload list" and "Save to"
     menu_state->selected = row + 1;
     if(row < menu_state->scroll) menu_state->scroll = row;
     if(row > menu_state->scroll + 3) menu_state->scroll = row - 3;

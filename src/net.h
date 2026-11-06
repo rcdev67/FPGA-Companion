@@ -57,7 +57,14 @@ int netdl_state(void);
 const char *netdl_message(void);
 int netdl_entry_count(void);
 const char *netdl_entry_name(int index);
-bool netdl_entry_marked(int index);   // sent from the catalogue, shown with "> "
+// sent from the catalogue: "> " to the card, "USB> " to the stick
+#define NET_MARK_NONE   0
+#define NET_MARK_CARD   1
+#define NET_MARK_STICK  2
+int netdl_entry_mark(int index);
+// where a file without a mark goes: false the SD card, true the USB stick
+void netdl_set_to_stick(bool on);
+bool netdl_to_stick(void);
 uint32_t netdl_bytes_done(void);
 uint32_t netdl_bytes_total(void);
 const char *netdl_tail(void);   // the last characters exchanged with the modem
