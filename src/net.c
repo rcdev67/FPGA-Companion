@@ -1394,6 +1394,7 @@ static bool play_name_ok(const char *name) {
 static bool card_job_parse(char *line);
 static void card_jobs_run(void);
 static int card_job_count;        // see the SD card from the browser, below
+static char play_why[48];         // why the last question failed, for NETLOG
 
 // Ask the server, quietly. True when a game is waiting; its disks are in
 // play_names[] then. *answered tells a server that said "NONE" from one
@@ -1411,6 +1412,7 @@ static bool play_poll(bool *answered) {
   net_quiet = true;
   bool ok = http_get(path, job_sink);
   net_quiet = false;
+  if(!ok) snprintf(play_why, sizeof(play_why), "%s", message);
 
   strcpy(message, msg); strcpy(fetch_to, to); strcpy(fetch_result, res);
   fetch_rssi = rssi; fetch_have_rssi = have;
@@ -1509,7 +1511,20 @@ static bool card_in_use(const char *name) {
 // POST body to path on the server, over a plain connection: the request,
 // then only the status line of the answer. True on 200; else post_why
 // says what went wrong, for NETLOG.
+//
+// Paced: in a stream Zimodem hands every byte from the serial side to the
+// socket on its own, slower than 19200 bit/s bring them, and a request of
+// a kilobyte and more overflowed its receive buffer on the board -- the
+// server waited for the rest of the body and never answered. 32 bytes
+// every 40 ms is 800 bytes a second.
 static char post_why[64];
+
+static void post_paced(const char *data, int len) {
+  for(int o = 0; o < len; o += 32) {
+    net_write(data + o, (len - o > 32) ? 32 : len - o);
+    vTaskDelay(pdMS_TO_TICKS(40));
+  }
+}
 
 static bool http_post(const char *path, const char *body, int len) {
   char host[NET_SERVER_LEN];
@@ -1534,23 +1549,24 @@ static bool http_post(const char *path, const char *body, int len) {
                     "POST /%s%s HTTP/1.0\r\nHost: %s\r\nContent-Type: application/octet-stream\r\n"
                     "Content-Length: %d\r\nConnection: close\r\n\r\n", base, path, host, len);
   if(hn < 0 || hn >= (int)sizeof(head)) { modem_hangup(); return false; }
-  net_puts(head);
+  post_paced(head, hn);
   in_body = true;
-  for(int o = 0; o < len; o += 256)
-    net_write(body + o, (len - o > 256) ? 256 : len - o);
+  post_paced(body, len);
   in_body = false;
+  // stserve gives up on a body that stops short after 12 s and says how
+  // much came, in its status line
   int status = 0;
   char first[24] = "nothing";
   bool any = false;
   TickType_t t0 = xTaskGetTickCount();
-  while(!status && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(15000) &&
-        net_read_line(line, sizeof(line), 15000)) {
+  while(!status && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(20000) &&
+        net_read_line(line, sizeof(line), 20000)) {
     if(!any) { snprintf(first, sizeof(first), "%s", line); any = true; }
     if(!strncmp(line, "HTTP/1.", 7)) status = atoi(line + 9);
   }
   modem_hangup();
   if(!status) snprintf(post_why, sizeof(post_why), "no answer from the server, got: %s", first);
-  else        snprintf(post_why, sizeof(post_why), "the server says %d", status);
+  else        snprintf(post_why, sizeof(post_why), "the server says %.48s", line + 9);
   return status == 200;
 }
 
@@ -1962,10 +1978,25 @@ static void net_task(__attribute__((unused)) void *parms) {
     // does not know /_/job (not stserve, or an older one) every 5 minutes
     if(play_secs && server[0] && modem_ip[0] && link_state == LINK_UP && !hold_release &&
        state != NET_STATE_BUSY && (int32_t)(xTaskGetTickCount() - next_play) >= 0) {
-      if(play_round()) play_fails = 0;
-      else             play_fails++;
+      // A question that fails is mostly the modem missing one fetch: the
+      // next one comes soon, and only a server that keeps failing is
+      // asked less often. NETLOG gets the first failure of a run and the
+      // end of it, not every question.
+      if(play_round()) {
+        if(play_fails >= 3) {
+          char l[64];
+          snprintf(l, sizeof(l), "play: asking works again after %d failures", play_fails);
+          net_log(l);
+        }
+        play_fails = 0;
+      } else if(++play_fails == 3) {
+        char l[96];
+        snprintf(l, sizeof(l), "play: asking failed 3 times (%s), now once a minute", play_why);
+        net_log(l);
+      }
       next_play = xTaskGetTickCount() +
-        pdMS_TO_TICKS(play_fails >= 3 ? 300000 : play_fails ? 60000 : play_secs * 1000);
+        pdMS_TO_TICKS(play_fails >= 10 ? 300000 : play_fails >= 3 ? 60000 :
+                      play_fails ? 15000 : play_secs * 1000);
       continue;
     }
 
